@@ -1,9 +1,10 @@
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
-from keel.tools import run_tool
+from keel.tools import files, run_tool
 from keel.tools.base import ToolContext, preview_for, redact, truncate_middle
 
 
@@ -12,6 +13,19 @@ def ctx(local_sandbox):
     backend, sandbox, work = local_sandbox
     work.mkdir(parents=True, exist_ok=True)
     return ToolContext(backend, sandbox, cwd=str(work))
+
+
+@pytest.fixture(params=["rg", "fallback"])
+def search_ctx(request, ctx, monkeypatch):
+    """`ctx` with search_files on ripgrep, or on grep/find as in an image without rg."""
+    monkeypatch.setattr(files, "_NO_RG", set())
+    if request.param == "rg":
+        if shutil.which("rg") is None:
+            pytest.skip("ripgrep is not installed")
+    else:
+        monkeypatch.setattr(files, "RG", "keel-no-such-rg")
+    ctx.engine = request.param
+    return ctx
 
 
 async def call(ctx, name, **args):
@@ -66,25 +80,25 @@ async def test_patch_replace_all(ctx):
     assert not error and Path(ctx.cwd, "f.txt").read_text() == "b b\n"
 
 
-async def test_search_content_files_and_counts(ctx):
-    Path(ctx.cwd, "x.py").write_text("alpha\nbeta alpha\n")
-    Path(ctx.cwd, "y.txt").write_text("alpha\n")
-    body, _ = await call(ctx, "search_files", pattern="alph[a]", file_glob="*.py")
+async def test_search_content_files_and_counts(search_ctx):
+    Path(search_ctx.cwd, "x.py").write_text("alpha\nbeta alpha\n")
+    Path(search_ctx.cwd, "y.txt").write_text("alpha\n")
+    body, _ = await call(search_ctx, "search_files", pattern="alph[a]", file_glob="*.py")
     assert body["total_count"] == 2 and {(m["line"], m["content"]) for m in body["matches"]} == {
         (1, "alpha"), (2, "beta alpha")}
-    body, _ = await call(ctx, "search_files", pattern="alpha", output_mode="count")
+    body, _ = await call(search_ctx, "search_files", pattern="alpha", output_mode="count")
     assert body["total_count"] == 3 and sorted(body["counts"].values()) == [1, 2]
-    body, _ = await call(ctx, "search_files", pattern="alpha", output_mode="files_only")
+    body, _ = await call(search_ctx, "search_files", pattern="alpha", output_mode="files_only")
     assert body["total_count"] == 2
-    body, _ = await call(ctx, "search_files", pattern="*.txt", target="files")
+    body, _ = await call(search_ctx, "search_files", pattern="*.txt", target="files")
     assert body["total_count"] == 1 and body["files"][0].endswith("y.txt")
-    body, _ = await call(ctx, "search_files", pattern="nothing-here")
+    body, _ = await call(search_ctx, "search_files", pattern="nothing-here")
     assert body == {"matches": [], "total_count": 0}
 
 
-async def test_search_with_context_returns_text(ctx):
-    Path(ctx.cwd, "x.txt").write_text("before\nhit\nafter\n")
-    body, _ = await call(ctx, "search_files", pattern="hit", context=1)
+async def test_search_with_context_returns_text(search_ctx):
+    Path(search_ctx.cwd, "x.txt").write_text("before\nhit\nafter\n")
+    body, _ = await call(search_ctx, "search_files", pattern="hit", context=1)
     assert body["total_count"] == 1 and "before" in body["output"] and "after" in body["output"]
 
 
@@ -218,35 +232,35 @@ async def test_exec_clears_exec_id_on_error_but_keeps_it_on_cancel(ctx):
     ctx.backend = real
 
 
-async def test_search_unreadable_file_warns_but_returns_matches(ctx):
+async def test_search_unreadable_file_warns_but_returns_matches(search_ctx):
     import os
-    Path(ctx.cwd, "ok.txt").write_text("needle\n")
-    locked = Path(ctx.cwd, "locked.txt")
+    Path(search_ctx.cwd, "ok.txt").write_text("needle\n")
+    locked = Path(search_ctx.cwd, "locked.txt")
     locked.write_text("needle\n")
     locked.chmod(0)
     try:
         if os.access(locked, os.R_OK):
             pytest.skip("running with privileges that ignore file modes")
-        body, error = await call(ctx, "search_files", pattern="needle")
+        body, error = await call(search_ctx, "search_files", pattern="needle")
         assert not error and body["total_count"] == 1 and "locked.txt" in body["warning"]
-        body, error = await call(ctx, "search_files", pattern="absent")
+        body, error = await call(search_ctx, "search_files", pattern="absent")
         assert error and "Permission denied" in body["error"]
     finally:
         locked.chmod(0o600)
 
 
-async def test_search_caps_long_match_lines(ctx):
-    Path(ctx.cwd, "m.txt").write_text("needle" + "y" * 5000 + "\n")
-    body, _ = await call(ctx, "search_files", pattern="needle")
+async def test_search_caps_long_match_lines(search_ctx):
+    Path(search_ctx.cwd, "m.txt").write_text("needle" + "y" * 5000 + "\n")
+    body, _ = await call(search_ctx, "search_files", pattern="needle")
     assert len(body["matches"][0]["content"]) < 600 and "truncated" in body["matches"][0]["content"]
 
 
-async def test_search_count_and_context_honour_offset_and_limit(ctx):
+async def test_search_count_and_context_honour_offset_and_limit(search_ctx):
     for name in "abc":
-        Path(ctx.cwd, f"{name}.txt").write_text("hit\nfiller\nfiller\nfiller\nhit\n")
-    body, _ = await call(ctx, "search_files", pattern="hit", output_mode="count", limit=2, offset=1)
+        Path(search_ctx.cwd, f"{name}.txt").write_text("hit\nfiller\nfiller\nfiller\nhit\n")
+    body, _ = await call(search_ctx, "search_files", pattern="hit", output_mode="count", limit=2, offset=1)
     assert len(body["counts"]) == 2 and body["total_count"] == 6
-    body, _ = await call(ctx, "search_files", pattern="hit", context=1, limit=2, offset=1)
+    body, _ = await call(search_ctx, "search_files", pattern="hit", context=1, limit=2, offset=1)
     assert body["total_count"] == 6 and body["output"].count("hit") == 2
 
 
@@ -297,3 +311,77 @@ def test_cap_falls_back_to_a_valid_error_object():
     raw = json.dumps({"a": "x" * 50, "b": 1})
     out = json.loads(tools_base.cap_json_result(raw, 20))
     assert out["error"] == "result too large"
+
+
+# --- ripgrep ---
+
+def _tree(root: Path) -> None:
+    for rel in ("src/a.py", "build/b.py", ".cfg/c.py", ".e.py", ".git/d.py"):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("needle\n")
+    (root / ".gitignore").write_text("build/\n")
+
+
+async def test_search_skips_hidden_files_and_with_rg_gitignored_ones(search_ctx):
+    _tree(Path(search_ctx.cwd))
+    expected = ["a.py"] if search_ctx.engine == "rg" else ["a.py", "b.py"]
+    body, _ = await call(search_ctx, "search_files", pattern="needle", output_mode="files_only")
+    assert sorted(Path(f).name for f in body["files"]) == expected
+    body, _ = await call(search_ctx, "search_files", pattern="*.py", target="files")
+    assert sorted(Path(f).name for f in body["files"]) == sorted([".e.py", *expected])
+    body, _ = await call(search_ctx, "search_files", pattern="needle", file_glob="*.py", output_mode="files_only")
+    assert sorted(Path(f).name for f in body["files"]) == sorted([".e.py", *expected])
+    body, _ = await call(search_ctx, "search_files", pattern="needle", path=".cfg")
+    assert body["total_count"] == 1
+    body, _ = await call(search_ctx, "search_files", pattern="*.py", target="files", path="build")
+    assert [Path(f).name for f in body["files"]] == ["b.py"]
+
+
+async def test_search_under_a_hidden_directory(search_ctx):
+    Path(search_ctx.cwd, ".hid/w/sub").mkdir(parents=True)
+    Path(search_ctx.cwd, ".hid/w/sub/x.txt").write_text("needle\n")
+    body, error = await call(search_ctx, "search_files", pattern="needle", path=".hid/w")
+    assert not error and body["total_count"] == 1
+    body, error = await call(search_ctx, "search_files", pattern="*.txt", target="files", path=".hid/w")
+    assert not error and [Path(f).name for f in body["files"]] == ["x.txt"]
+
+
+async def test_zero_matches_point_at_hidden_or_ignored_files(search_ctx):
+    root = Path(search_ctx.cwd)
+    _tree(root)
+    for rel in (".cfg/only.py", "build/only.py", ".git/only.py"):
+        (root / rel).write_text("hidden_only\n")
+    body, error = await call(search_ctx, "search_files", pattern="hidden_only")
+    assert not error
+    if search_ctx.engine == "rg":
+        assert body["matches"] == [] and body["total_count"] == 0
+        assert "2 match(es) in 2 hidden or gitignored file(s)" in body["hint"]
+        assert ".cfg/only.py" in body["hint"] and ".git/" not in body["hint"]
+    else:
+        assert body["total_count"] == 1 and "hint" not in body
+    body, _ = await call(search_ctx, "search_files", pattern="nowhere_at_all")
+    assert body == {"matches": [], "total_count": 0}
+
+
+async def test_search_backreferences(search_ctx):
+    Path(search_ctx.cwd, "r.txt").write_text("abab\nabcd\n")
+    body, error = await call(search_ctx, "search_files", pattern=r"(ab)\1")
+    assert not error and [m["line"] for m in body["matches"]] == [1]
+
+
+async def test_search_falls_back_once_per_sandbox_without_rg(ctx, monkeypatch):
+    monkeypatch.setattr(files, "_NO_RG", set())
+    monkeypatch.setattr(files, "RG", "keel-no-such-rg")
+    programs, real = [], ctx.backend.exec
+
+    async def spy(sandbox, argv, **kwargs):
+        programs.append(argv[0])
+        return await real(sandbox, argv, **kwargs)
+    monkeypatch.setattr(ctx.backend, "exec", spy)
+    Path(ctx.cwd, "a.txt").write_text("x\n")
+    for _ in range(2):
+        body, error = await call(ctx, "search_files", pattern="x")
+        assert not error and body["total_count"] == 1
+    body, error = await call(ctx, "search_files", pattern="a.*", target="files")
+    assert not error and body["total_count"] == 1
+    assert programs == ["keel-no-such-rg", "grep", "grep", "find"]

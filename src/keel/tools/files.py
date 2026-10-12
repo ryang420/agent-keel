@@ -18,6 +18,11 @@ MAX_LINE_CHARS = 2000
 MAX_MATCH_CHARS = 500
 MAX_LINES = 2000
 SEARCH_TIMEOUT_S = 60.0
+PROBE_TIMEOUT_S = 30.0
+RG = "rg"
+# rg's own defaults (skip hidden and gitignored files) decide what is searched; --sort keeps pages stable.
+_RG = ["--no-config", "--sort", "path"]
+_NO_RG: set[str] = set()  # sandboxes, by name and policy digest, whose image lacks rg
 _MATCH = re.compile(r"^(.*?):(\d+):(.*)$")
 
 
@@ -114,6 +119,49 @@ async def patch(args: dict, ctx) -> ToolOutcome:
     return ToolOutcome(tool_json({"success": True, "diff": diff, "files_modified": [path]}))
 
 
+async def _rg(ctx, argv: list[str], timeout_s: float = SEARCH_TIMEOUT_S):
+    """rg's result, or None when the sandbox image has no rg (callers then use grep/find)."""
+    key = f"{ctx.sandbox.name}\0{ctx.sandbox.policy.digest()}"
+    if key in _NO_RG:
+        return None
+    result = await ctx.exec([RG, *argv], timeout_s=timeout_s)
+    if result.exit_code == 127:
+        _NO_RG.add(key)
+        return None
+    return result
+
+
+def _under_hidden(path: str) -> bool:
+    """Whether a component of `path` is hidden. grep and find would then skip the whole root, not only what is
+    hidden below it, so the fallbacks skip just .git there."""
+    return any(part.startswith(".") for part in path.split("/") if part not in ("", ".", ".."))
+
+
+def _split(output: str, program: str) -> tuple[list[str], list[str]]:
+    """Output lines, and the program's own warnings among them."""
+    lines = [line for line in output.splitlines() if line]
+    prefix = f"{program}: "
+    return ([line for line in lines if not line.startswith(prefix)],
+            [line for line in lines if line.startswith(prefix)])
+
+
+async def _hidden_hint(ctx, pattern: str, path: str, file_glob: str | None) -> str | None:
+    argv = [*_RG, "--hidden", "--no-ignore", "--count-matches", "--glob", "!.git"]
+    if file_glob:
+        argv += ["--glob", file_glob]
+    result = await _rg(ctx, [*argv, "--", pattern, path], PROBE_TIMEOUT_S)
+    if result is None or result.exit_code != 0:
+        return None
+    counts = [line.rpartition(":") for line in _split(result.output, "rg")[0]]
+    counts = [(name, int(number)) for name, _, number in counts if number.isdigit()]
+    if not counts:
+        return None
+    paths = ", ".join(name for name, _ in counts[:5]) + (f" (+{len(counts) - 5} more)" if len(counts) > 5 else "")
+    return (f"0 matches in visible files, but {sum(n for _, n in counts)} match(es) in {len(counts)} hidden or "
+            f"gitignored file(s): {paths}. These are skipped by default; set path to one of them, or to its "
+            "directory, to search it.")
+
+
 @tool("search_files")
 async def search_files(args: dict, ctx) -> ToolOutcome:
     pattern = require(args, "pattern", str)
@@ -122,32 +170,45 @@ async def search_files(args: dict, ctx) -> ToolOutcome:
     limit = optional_int(args, "limit", 50, minimum=1)
     offset = optional_int(args, "offset", 0, minimum=0)
     if target == "files":
-        result = await ctx.exec(["find", path, "-type", "f", "-name", pattern, "-not", "-path", "*/.git/*"],
-                                timeout_s=SEARCH_TIMEOUT_S)
-        files = [line for line in result.output.splitlines() if line and not line.startswith("find: ")]
-        return ToolOutcome(tool_json({"files": files[offset:offset + limit], "total_count": len(files)}))
+        return await _find_files(ctx, pattern, path, limit, offset)
     mode = optional_str(args, "output_mode", "content", ("content", "files_only", "count"))
     context = optional_int(args, "context", 0, minimum=0)
     file_glob = args.get("file_glob")
     if file_glob is not None and not isinstance(file_glob, str):
         raise ToolArgumentError("Argument file_glob must be a string.")
-    argv = ["grep", "-rIEH", "--exclude-dir=.git"]
+    argv = [*_RG, "--line-number", "--no-heading", "--with-filename"]
     if mode == "files_only":
-        argv.append("-l")
+        argv.append("--files-with-matches")
     elif mode == "count":
-        argv.append("-c")
+        argv.append("--count")
     else:
-        argv.append("-n")
+        argv += ["--max-columns", "2000", "--max-columns-preview"]
         if context:
             argv += ["-C", str(context)]
     if file_glob:
-        argv.append(f"--include={file_glob}")
-    result = await ctx.exec([*argv, "--", pattern, path], timeout_s=SEARCH_TIMEOUT_S)
+        argv += ["--glob", file_glob]
+    program, result = "rg", await _rg(ctx, [*argv, "--", pattern, path])
+    if result is not None and result.exit_code == 2 and "regex parse error" in result.output:
+        result = None  # e.g. a backreference, which grep -E supports
+    if result is None:
+        program = "grep"
+        # GNU grep: the last matching --include/--exclude wins, and a file matching none is kept only when the
+        # first is an --exclude. So hidden files matching file_glob are searched, as rg does.
+        include = [f"--include={file_glob}"] if file_glob else []
+        skip = ["--exclude-dir=.git"] if _under_hidden(path) else ["--exclude-dir=.*", "--exclude=.*"]
+        argv = ["grep", "-rIEH", *include, *skip, *include]
+        if mode == "files_only":
+            argv.append("-l")
+        elif mode == "count":
+            argv.append("-c")
+        else:
+            argv.append("-n")
+            if context:
+                argv += ["-C", str(context)]
+        result = await ctx.exec([*argv, "--", pattern, path], timeout_s=SEARCH_TIMEOUT_S)
     if result.exit_code not in (0, 1, 2):
         return error_result(f"Search failed: {result.output.strip()[:500]}")
-    all_lines = [line for line in result.output.splitlines() if line]
-    warnings = [line for line in all_lines if line.startswith("grep: ")]
-    lines = [line for line in all_lines if not line.startswith("grep: ")]
+    lines, warnings = _split(result.output, program)
     if mode == "files_only":
         found = {"files": lines[offset:offset + limit], "total_count": len(lines)}
     elif mode == "count":
@@ -180,6 +241,28 @@ async def search_files(args: dict, ctx) -> ToolOutcome:
     if result.exit_code == 2:
         if not found["total_count"]:
             return error_result(f"Search failed: {result.output.strip()[:500]}")
+    if warnings:
+        found["warning"] = "\n".join(warnings)[:500]
+    if program == "rg" and result.exit_code == 1:
+        hint = await _hidden_hint(ctx, pattern, path, file_glob)
+        if hint:
+            found["hint"] = hint
+    return ToolOutcome(tool_json(found))
+
+
+async def _find_files(ctx, pattern: str, path: str, limit: int, offset: int) -> ToolOutcome:
+    program, result = "rg", await _rg(ctx, [*_RG, "--files", "--glob", pattern, "--", path])
+    if result is None:
+        program = "find"
+        skip = ".git" if _under_hidden(path) else ".*"
+        result = await ctx.exec(["find", path, "-type", "d", "-name", skip, "-prune", "-o", "-type", "f", "-name",
+                                 pattern, "-print"], timeout_s=SEARCH_TIMEOUT_S)
+    if result.exit_code not in (0, 1, 2):
+        return error_result(f"Search failed: {result.output.strip()[:500]}")
+    files, warnings = _split(result.output, program)
+    if not files and (result.exit_code == 2 or program == "find" and result.exit_code == 1):
+        return error_result(f"Search failed: {result.output.strip()[:500]}")
+    found = {"files": files[offset:offset + limit], "total_count": len(files)}
     if warnings:
         found["warning"] = "\n".join(warnings)[:500]
     return ToolOutcome(tool_json(found))
