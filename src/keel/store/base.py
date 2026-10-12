@@ -1,0 +1,98 @@
+"""What the store holds, and how it fails."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from keel.models import Message, Usage
+
+ACTIVE = ("queued", "running", "stopping")
+TERMINAL = ("completed", "failed", "cancelled")
+TITLE_RANK = {"derived": 0, "llm": 1, "user": 2}
+WORKER_LOST_MESSAGE = "The worker running this run stopped responding."
+
+
+class StoreError(Exception):
+    pass
+
+
+class SessionNotFound(StoreError):
+    pass
+
+
+class SessionBusy(StoreError):
+    pass
+
+
+class TitleInUse(StoreError):
+    pass
+
+
+class UniqueViolation(Exception):
+    """Raised by a Db adapter when a unique constraint rejects a write."""
+
+
+@dataclass(frozen=True)
+class Profile:
+    id: str
+    models: list[dict]
+    sandbox: dict
+    soul: str
+    skills: list[str]
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class Session:
+    id: str
+    profile_id: str
+    title: str | None
+    title_source: str | None
+    created_at: float
+    last_active_at: float
+    message_count: int
+    system_prompt: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    cwd: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredMessage:
+    id: int
+    session_id: str
+    run_id: str | None
+    message: Message
+    created_at: float
+
+
+@dataclass(frozen=True)
+class Run:
+    id: str
+    profile_id: str
+    session_id: str
+    status: str
+    provider: str
+    model: str
+    reasoning_effort: str | None
+    input: list[dict]
+    instructions: str | None
+    output: str
+    usage: Usage
+    error_code: str | None
+    error: str | None
+    lease_owner: str | None
+    lease_expires_at: float | None
+    created_at: float
+    started_at: float | None
+    finished_at: float | None
+    current_exec_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Event:
+    run_id: str
+    seq: int
+    type: str
+    data: dict
+    at: float

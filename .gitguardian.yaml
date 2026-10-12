@@ -1,0 +1,4 @@
+version: 2
+secret:
+  ignored_paths:
+    - "tests/**"  # the tests contain fake credentials on purpose, to exercise redaction

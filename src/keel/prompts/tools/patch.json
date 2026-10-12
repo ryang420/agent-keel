@@ -1,0 +1,14 @@
+{
+  "name": "patch",
+  "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Finds a unique exact string and replaces it. Returns a unified diff.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string", "description": "File path to edit."},
+      "old_string": {"type": "string", "description": "Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness."},
+      "new_string": {"type": "string", "description": "Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text."},
+      "replace_all": {"type": "boolean", "description": "Replace all occurrences instead of requiring a unique match (default: false)", "default": false}
+    },
+    "required": ["path", "old_string", "new_string"]
+  }
+}

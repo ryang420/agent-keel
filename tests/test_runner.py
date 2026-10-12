@@ -1,0 +1,208 @@
+import asyncio
+
+import pytest
+
+from keel.events import InMemoryEventBus
+from keel.models import Completed, ToolCall, ToolCallReady, ReasoningItem, ReasoningReady, TextDelta, TextPart, Usage
+from keel.providers.base import ModelError, ProviderRegistry
+from keel.providers.fake import FakeProvider
+from keel.runner import DEFAULT_IDENTITY, RunExecutor
+from keel.titles import derive_title
+
+ITEM = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
+
+
+async def no_sleep(seconds):
+    pass
+
+
+@pytest.fixture
+async def setup(store):
+    provider = FakeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
+    return store, provider, RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep)
+
+
+async def start(store, text="What is two plus two?", session="s1", instructions="Answer briefly."):
+    await store.ensure_session("p1", session)
+    run = await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m",
+                                 reasoning_effort="low", input_parts=[{"type": "text", "text": text}],
+                                 instructions=instructions)
+    return await store.claim_run("w1", 9_999_999)
+
+
+async def test_a_completed_turn_stores_both_messages_usage_and_events(setup):
+    store, provider, executor = setup
+    provider.script = [[TextDelta("Fo"), TextDelta("ur"), ReasoningReady(ITEM), Completed(Usage(50, 5, 40, 0))]]
+    run = await start(store)
+    await executor.execute(run)
+    done = await store.get_run("p1", run.id)
+    assert (done.status, done.output, done.usage) == ("completed", "Four", Usage(50, 5, 40, 0))
+    messages = [m.message for m in await store.messages("s1")]
+    assert [m.role for m in messages] == ["user", "assistant"]
+    assert messages[0].text == "What is two plus two?" and messages[1].text == "Four"
+    assert messages[1].reasoning == (ITEM,)
+    events = await store.events_after(run.id, 0)
+    assert [e.type for e in events] == ["run.started", "message.delta", "message.delta", "run.completed"]
+    assert events[-1].data == {"output": "Four", "usage": Usage(50, 5, 40, 0).to_dict()}
+    assert (await store.get_session("p1", "s1")).title == "What is two plus two?"
+
+
+async def test_the_request_carries_identity_instructions_and_history(setup):
+    store, provider, executor = setup
+    await executor.execute(await start(store, "first"))
+    await executor.execute(await start(store, "second", instructions="Be terse."))
+    request = provider.requests[-1]
+    assert request.system == DEFAULT_IDENTITY and request.instructions == "Be terse."
+    assert [m.role for m in request.messages] == ["user", "assistant", "user"]
+    assert request.messages[-1].parts == (TextPart("second"),)
+    assert request.cache_scope == "s1" and request.reasoning_effort == "low" and request.tools == ()
+
+
+async def test_a_profile_soul_replaces_the_default_identity(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={},
+                               soul="You are a careful analyst.", skills=[])
+    await executor.execute(await start(store))
+    assert provider.requests[-1].system == "You are a careful analyst."
+
+
+async def test_a_model_error_fails_the_run(setup):
+    store, provider, executor = setup
+    provider.script = [[ModelError("bad_request", "nope")]]
+    run = await start(store)
+    await executor.execute(run)
+    failed = await store.get_run("p1", run.id)
+    assert (failed.status, failed.error_code, failed.error) == ("failed", "bad_request", "nope")
+    events = await store.events_after(run.id, 0)
+    assert events[-1].type == "run.failed" and events[-1].data == {"error_code": "bad_request", "message": "nope"}
+
+
+async def test_an_unknown_provider_fails_the_run(setup):
+    store, provider, executor = setup
+    await store.ensure_session("p1", "s9")
+    await store.create_run(profile_id="p1", session_id="s9", provider="gone", model="m", reasoning_effort=None,
+                           input_parts=[{"type": "text", "text": "x"}], instructions=None)
+    run = await store.claim_run("w1", 9_999_999)
+    await executor.execute(run)
+    assert (await store.get_run("p1", run.id)).error_code == "bad_request"
+
+
+async def test_cancelling_the_execution_cancels_the_run(setup):
+    store, provider, executor = setup
+    provider.script = [[TextDelta("par"), "hang"]]
+    run = await start(store)
+    task = asyncio.create_task(executor.execute(run))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if len(await store.events_after(run.id, 0)) >= 2:
+            break
+    task.cancel()
+    await task
+    cancelled = await store.get_run("p1", run.id)
+    assert (cancelled.status, cancelled.output) == ("cancelled", "par")
+    assert (await store.events_after(run.id, 0))[-1].type == "run.cancelled"
+
+
+def test_derived_titles_use_the_first_line_and_cut_at_a_word():
+    assert derive_title("  \n Hello world \nmore") == "Hello world"
+    long = "word " * 20
+    title = derive_title(long)
+    assert title.endswith("…") and len(title) <= 48 and " " not in title[-2:]
+    assert derive_title("   ") is None
+
+
+def test_derived_titles_never_exceed_the_limit_with_the_ellipsis():
+    for text in ("x" * 200, "ab " * 40, "a" * 47 + " " + "b" * 30, "a" * 48, "a" * 49):
+        title = derive_title(text)
+        assert len(title) <= 48, (text, title)
+
+
+def test_derived_titles_drop_control_zero_width_and_bidi_characters():
+    assert derive_title("\u200b\n\x07He\u202ello\u200b\x00 wor\ufeffld") == "Hello world"
+    assert derive_title("\u200b\u202e") is None
+
+
+async def test_a_taken_derived_title_gets_a_numbered_suffix(setup):
+    store, provider, executor = setup
+    await executor.execute(await start(store, "hi", session="s1"))
+    await executor.execute(await start(store, "hi", session="s2"))
+    await executor.execute(await start(store, "hi", session="s3"))
+    titles = [(await store.get_session("p1", s)).title for s in ("s1", "s2", "s3")]
+    assert titles == ["hi", "hi #2", "hi #3"]
+
+
+async def test_a_suffixed_title_still_fits_the_limit(setup):
+    store, provider, executor = setup
+    long = "w" * 60
+    await executor.execute(await start(store, long, session="s1"))
+    await executor.execute(await start(store, long, session="s2"))
+    titles = [(await store.get_session("p1", s)).title for s in ("s1", "s2")]
+    assert all(len(t) <= 48 for t in titles) and titles[1].endswith(" #2") and titles[0] != titles[1]
+
+
+async def test_an_unexpected_provider_error_fails_the_run_without_leaking(setup):
+    store, provider, executor = setup
+    provider.script = [[RuntimeError("secret detail")]]
+    run = await start(store)
+    await executor.execute(run)
+    failed = await store.get_run("p1", run.id)
+    assert (failed.status, failed.error_code) == ("failed", "internal_error")
+    assert "secret" not in failed.error
+    last = (await store.events_after(run.id, 0))[-1]
+    assert last.type == "run.failed" and last.data["error_code"] == "internal_error"
+
+
+async def test_a_malformed_input_part_fails_the_run(setup):
+    store, provider, executor = setup
+    await store.ensure_session("p1", "s7")
+    await store.create_run(profile_id="p1", session_id="s7", provider="fake", model="m", reasoning_effort=None,
+                           input_parts=[{"type": "audio"}], instructions=None)
+    run = await store.claim_run("w1", 9_999_999)
+    await executor.execute(run)
+    assert (await store.get_run("p1", run.id)).error_code == "internal_error"
+
+
+async def test_a_double_cancel_still_ends_the_run_cancelled(setup):
+    store, provider, executor = setup
+    provider.script = [[TextDelta("par"), "hang"]]
+    run = await start(store)
+    task = asyncio.create_task(executor.execute(run))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if len(await store.events_after(run.id, 0)) >= 2:
+            break
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await task
+    assert (await store.get_run("p1", run.id)).status == "cancelled"
+    assert (await store.events_after(run.id, 0))[-1].type == "run.cancelled"
+
+
+async def test_a_tool_call_without_tools_is_ignored_with_a_warning(setup, caplog):
+    store, provider, executor = setup
+    provider.script = [[TextDelta("ok"), ToolCallReady(ToolCall("c1", "lookup", "{}")), Completed(Usage(1, 1, 0, 0))]]
+    run = await start(store)
+    await executor.execute(run)
+    assert (await store.get_run("p1", run.id)).status == "completed"
+    assert "lookup" in caplog.text
+
+
+async def test_an_incomplete_response_still_completes_but_says_so(setup, caplog):
+    store, provider, executor = setup
+    provider.script = [[TextDelta("par"), Completed(Usage(5, 2, 0, 0), "incomplete")]]
+    with caplog.at_level("WARNING"):
+        await executor.execute(await start(store))
+    run = (await store.list_runs("p1", ("completed",)))[0]
+    assert run.status == "completed" and run.output == "par"
+    event = (await store.events_after(run.id, 0))[-1]
+    assert event.type == "run.completed" and event.data["incomplete"] is True
+    assert "incomplete" in caplog.text
+    # An ordinary completion carries no flag.
+    provider.script = [[TextDelta("x"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store, session="s2"))
+    other = [r for r in await store.list_runs("p1", ("completed",)) if r.session_id == "s2"][0]
+    assert "incomplete" not in (await store.events_after(other.id, 0))[-1].data

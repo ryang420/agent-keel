@@ -1,0 +1,10 @@
+.venv
+.git
+.superpowers
+.pytest_cache
+__pycache__
+*.pyc
+*.egg-info
+tests
+docs
+*.sqlite3

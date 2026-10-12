@@ -1,0 +1,38 @@
+# Local development: Postgres plus agent-keel, calling Bedrock with your AWS profile
+# (the ~/.aws mount is only needed for Bedrock) or an OpenAI-compatible server (KEEL_OPENAI_API_KEY).
+#   KEEL_API_KEY=dev docker compose -f docker-compose.dev.yml up --build
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: keel
+      POSTGRES_PASSWORD: ${KEEL_PG_PASSWORD:-keel}
+      POSTGRES_DB: keel
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keel"]
+      interval: 5s
+      retries: 10
+
+  keel:
+    build: .
+    # dev only: Docker Desktop's socket is root-only; deployments add the socket's group instead
+    user: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KEEL_API_KEY: ${KEEL_API_KEY:?set KEEL_API_KEY}
+      KEEL_DATABASE_URL: postgresql://keel:${KEEL_PG_PASSWORD:-keel}@postgres:5432/keel
+      KEEL_DEPLOYMENT: dev
+      KEEL_OPENAI_API_KEY: ${KEEL_OPENAI_API_KEY:-}
+      KEEL_OPENAI_BASE_URL: ${KEEL_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      KEEL_OPENAI_COMPAT: ${KEEL_OPENAI_COMPAT:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_CONFIG_FILE: /aws/config
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+    volumes:
+      - ${HOME}/.aws:/aws:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:8700:8700"

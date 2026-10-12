@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-keel"
+version = "0.2.0"
+description = "A server-side, multi-tenant agent runtime."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+keywords = ["agent", "llm", "agent-runtime", "sandbox", "docker", "sse", "multi-tenant"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "httpx>=0.27,<1",
+    "botocore>=1.34,<2",
+    "aiosqlite>=0.20,<1",
+    "asyncpg>=0.29,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ryang420/agent-keel"
+Repository = "https://github.com/ryang420/agent-keel"
+Issues = "https://github.com/ryang420/agent-keel/issues"
+Changelog = "https://github.com/ryang420/agent-keel/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+keel = ["prompts/*.md", "prompts/tools/*.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

@@ -1,0 +1,11 @@
+{
+  "name": "execute_code",
+  "description": "Run a Python script in the sandbox with python3. Use when a task needs logic, loops or data processing that would otherwise take several terminal calls, or to compute something exactly. Print your final result to stdout.\n\nEach call is a fresh process: variables and imports do not survive between calls, so write intermediate data to files when you need it later. Scripts run in the session's working directory. Limits: 5-minute timeout. Stdout over 50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "code": {"type": "string", "description": "Python code to execute. Print your final result to stdout."}
+    },
+    "required": ["code"]
+  }
+}
