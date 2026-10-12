@@ -68,7 +68,8 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 - [Sandbox](docs/guide/sandbox.md)
 - [Providers](docs/guide/providers.md)
 - [Changelog](CHANGELOG.md)
-- Design: [architecture](docs/design/2026-10-11-architecture.md), [agent loop](docs/design/2026-10-12-m2-agent-loop.md)
+- Architecture: [English](docs/architecture.md), [中文](docs/architecture_zh.md)
+- Design rationale: [architecture](docs/design/2026-10-11-architecture.md), [agent loop](docs/design/2026-10-12-m2-agent-loop.md)
 
 ## Status
 

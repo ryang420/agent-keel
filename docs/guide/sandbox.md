@@ -49,6 +49,9 @@ The image must provide `sh`, `bash`, `setsid`, `base64`, `head`, `find`, `grep`,
 `execute_code`). The container runs `sleep infinity`, so the image needs `sleep` too. Debian-based images such as
 `python:3.12-slim` have all of these.
 
+`rg` (ripgrep) is optional. With it, `search_files` is faster and also skips files ignored by `.gitignore`; without
+it, `search_files` uses `grep` and `find`, which skip only hidden directories.
+
 ## Hardening
 
 Every container is started with:

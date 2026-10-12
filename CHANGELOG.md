@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- `search_files` uses ripgrep when the sandbox image has it, and `grep`/`find` otherwise. Both skip hidden
+  directories (before, only `.git`). With ripgrep, gitignored files are skipped too, results are sorted by path, and
+  a content search with no matches adds a `hint` when hidden or gitignored files would match.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added
