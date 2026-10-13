@@ -63,6 +63,8 @@ class WorkerPool:
         self._inflight.clear()
 
     async def sweep_once(self) -> int:
+        """Fail every run whose lease expired, then kill the commands their dead workers left running. The events
+        go first so a slow sandbox cannot delay them."""
         expired = await self.store.expire_leases()
         for run in expired:
             try:
@@ -70,6 +72,8 @@ class WorkerPool:
                                          {"error_code": "worker_lost", "message": WORKER_LOST_MESSAGE})
             except Exception:
                 log.exception("could not emit run.failed for %s", run.id)
+        for run in expired:
+            await self.executor.kill_orphaned_command(run)
         return len(expired)
 
     async def _sweep(self) -> None:
