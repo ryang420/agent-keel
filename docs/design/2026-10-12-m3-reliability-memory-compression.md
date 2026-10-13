@@ -31,6 +31,8 @@ harness and an opt-in live script (§6).
 | Memory is on for every profile | arch §7 | **opt-in per profile** | Existing deployments and eval profiles must not accumulate memory between rounds (M2 design, change table). |
 | Memory needs a sandbox | implied | **independent** | Today a profile with no sandbox gets no tools. Memory is useful without one. |
 | Postgres listener reconnect, orphan removal safe for several instances | not listed | **M3** | They are what keeps the single-instance caveat in the README. |
+| Schema migrations | none (README) | **M3** | M3 changes the schema, and a consumer cannot recreate a database that holds its users' sessions. A 0.2.0 database is upgraded in place. |
+| Pruning old run events | arch §3 | **M3** | Every streamed token is a `run_events` row; the table must not grow without bound. |
 | Hermes history import | M4 | M4 | Unchanged. |
 
 Still out of M3: parallel read-only tools, scheduled jobs, approvals, web tools, the Anthropic provider and the
@@ -61,10 +63,34 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
   `worker_lost`, it makes a best-effort `kill_tree` on that exec (`ensure`, then `kill_tree`), so a command started
   by a dead worker does not run on. The column is cleared when a command ends. Failure to reach the sandbox is
   logged and does not block the sweep.
-- **Schema guard.** M3 adds columns and a table, and `CREATE TABLE IF NOT EXISTS` does not add columns to an old
-  table. A one-row `schema_version` table is written on first start. A database with tables but no version, or an
-  older one, makes the service refuse to start with a message that says to recreate it. There are still no
-  migrations (README).
+- **Schema migrations.** M3 adds columns and tables, and `CREATE TABLE IF NOT EXISTS` does not add columns to an old
+  table. M3 replaces "create if missing" with numbered migrations (below), so a 0.2.0 database is upgraded in place
+  and later releases can change the schema without a fresh database.
+- **Pruning old run events.** A maintenance task, started by the worker pool next to the sweeper, runs hourly and
+  deletes the `run_events` of runs that finished more than `KEEL_EVENT_RETENTION_DAYS` (default 7) ago, in batches
+  of 10,000 rows so one pass never holds a long transaction. The run row, its output and usage, and the session's
+  messages are kept. Streaming a pruned run sends no events and closes; a client reads the run with
+  `GET …/runs/{id}`. On several instances the passes may overlap; deleting rows that are already gone is harmless.
+
+### Schema migrations
+
+New `src/keel/store/migrations.py` holds an ordered list of migrations. Each has a version number and its SQL for
+SQLite and for Postgres. Version 1 is the 0.2.0 schema exactly as released; version 2 is M3's changes (§7).
+
+- **Version table.** `schema_version (version INTEGER NOT NULL)`, one row.
+- **At start.** `open_store` reads the version and applies every newer migration in order, each in its own
+  transaction that also writes the new version. On Postgres the whole pass runs under the advisory lock the schema
+  already uses, so instances starting together migrate once. On SQLite the transaction is `BEGIN IMMEDIATE`.
+- **Three starting states.** An empty database applies every migration from version 1, so a fresh database and an
+  upgraded one go through the same code. A database with keel's tables but no `schema_version` is a 0.2.0 database
+  and is treated as version 1. A version newer than the code knows makes the service refuse to start: a downgrade
+  is not supported.
+- **Rules.** A released migration is never edited; a change is a new migration. M3's migration only adds tables and
+  columns with defaults (`ALTER TABLE … ADD COLUMN`, which both databases run inside a transaction), so it is quick
+  on a large table, and an older instance still running during a rolling upgrade keeps working, because it reads
+  row values by column name and ignores columns it does not know.
+- **Tests.** A frozen copy of the 0.2.0 DDL builds an old database with a few rows. The test upgrades it on SQLite
+  and on Postgres and checks the rows survive and the resulting schema equals a fresh one.
 
 ### Fault-injection tests
 
@@ -182,63 +208,96 @@ break all four. M3 keeps one session and records the compaction on it.
 With no summary, history is every message as today. A second compaction summarizes the previous summary together
 with the new middle and moves `summary_tail_id` forward.
 
+`sessions` also gains `context_tokens` and `context_message_id`: the `input_tokens` the provider reported for the
+session's last model call, and the id of the newest stored message that call included. They anchor the estimate
+below across turns, and are cleared at a compaction. `compaction_failed_at` records the last failed summary call.
+
 ### New `src/keel/compress.py`
 
-Pure functions, unit-tested without a model: token estimate, boundary choice, history assembly and the
-placeholder pass.
+Pure functions, unit-tested without a model: token estimate, boundary choice, history assembly, the placeholder
+pass and the summary input.
 
-- **Boundaries.** Keep the first 3 messages and a recent tail of about 2.5% of the window, clamped to 10k–25k
-  tokens. A boundary never separates an assistant tool call from its results, and the tail starts at a user or
-  assistant message.
-- **Estimate.** The last call's `input_tokens` when the provider reported it. Otherwise characters divided by 4 plus
-  a fixed cost per image. `state.usage` is summed over a run, so the loop also keeps the last call's value.
-- **Placeholder pass.** Old tool outputs are replaced by a short placeholder in the request only, with no model
-  call. Nothing stored changes.
+- **Estimate.** `context_tokens` plus a heuristic count of the messages newer than `context_message_id`, so a large
+  tool result appended since the last call is counted before the next one. The heuristic counts an ASCII character
+  as a quarter of a token and any other character as one token (CJK text is close to one token per character, and
+  dividing all text by 4 would undercount it several times), plus a fixed cost per image. With no anchor (a new
+  session, a provider that reports no usage, or just after a compaction) the whole request is counted this way. The
+  loop updates the anchor after every main call; a summary call never updates it.
+- **Head.** The first 3 messages, extended forward until every tool call among them has its results.
+- **Tail.** A recent tail of about 2.5% of the window, clamped to 10k–25k tokens, starting at a user or assistant
+  message. A boundary never separates an assistant tool call from its results. The tail always holds at least the
+  newest assistant message with all its results (or the newest user message when that is last). When that minimum
+  is over the budget, its tool results are cut head-and-tail in the request (the existing truncation marker) until
+  the tail fits; nothing stored changes.
+- **Placeholder pass.** Outside the tail, in the request only and with no model call, each tool result over 200
+  characters is replaced by a one-line placeholder naming the tool and the size it had, and each image part becomes
+  the text `[image omitted from context]`. Nothing stored changes.
+- **Summary input.** The previous summary in full, then the middle (messages after the head and before the tail)
+  after the placeholder pass, serialized as text. When that is over 40k tokens, the middle is cut head-and-tail to
+  fit, with a marker saying how much was left out, so the summary call itself always fits the window.
 
 ### When it runs
 
-In `RunExecutor._loop`, before the model call, when the estimate reaches `KEEL_COMPRESSION_THRESHOLD` (default
+In `RunExecutor._loop`, before each model call, when the estimate reaches `KEEL_COMPRESSION_THRESHOLD` (default
 0.75) of `Capabilities.context_window`. Also when a call fails with `context_overflow` before any output, once per
 call. The steps:
 
-1. Apply the placeholder pass. If the estimate is now below the threshold, stop here.
+1. Apply the placeholder pass. If the estimate is now below the threshold, send the request and stop here.
 2. Otherwise make one summary call, with the same provider and model, no tools, and Hermes's checkpoint prompt and
    sections (the user's latest unfulfilled request verbatim, goal, completed actions, active state, decisions,
-   errors and fixes). The call runs inside the run, so stop and shutdown already cancel it.
-3. Store `summary`, `summary_head_id`, `summary_tail_id`.
+   errors and fixes) applied to the summary input. The call runs inside the run, so stop and shutdown already
+   cancel it.
+3. Store `summary`, `summary_head_id`, `summary_tail_id`, and clear the estimate anchor.
 4. Rebuild the system prompt, so the skills index, date and memory snapshot are fresh, with a new store method
    that overwrites `sessions.system_prompt`. `set_session_prompt` stays first-writer-wins.
-5. Drop reasoning items from messages before the tail when assembling history.
-6. Emit `context.compacted` with message counts and token estimates before and after.
+5. Reassemble the run's in-memory conversation from the store, so the rest of the run (and a compaction in the
+   middle of a run) sends head, summary and tail. Reasoning items on messages before the tail are dropped.
+6. Emit `context.compacted` with message counts and token estimates before and after, and the summary call's usage.
 
-If the summary call fails, the failure is logged, the run continues with the placeholders, and a persisting
-overflow fails the run with `context_overflow` as it does today.
+**Usage.** The summary call's usage is added to the run's usage, so `run.completed` reports what the run cost. The
+`context.compacted` event carries it separately, so a client can tell the two apart.
+
+**Failure.** If the summary call fails, the failure is logged, `compaction_failed_at` is set, and the run continues
+with the placeholders. For 10 minutes after a failure the threshold trigger applies only the placeholder pass and
+makes no summary call, so a broken summary does not cost every turn a failed call. The `context_overflow` trigger
+ignores this pause and tries once, since the alternative is failing the run. A persisting overflow fails the run with
+`context_overflow` as it does today.
 
 ### Cache
 
 The cache key is the hash of scope, system and tools. It changes at a compaction, because the system prompt is
-rebuilt, and is stable between compactions. A test asserts both.
+rebuilt, and is stable between compactions. A test asserts both. The invariant "a session's system prompt is built
+once and reused byte for byte" becomes "reused byte for byte between compactions".
 
 ## 6. Long-session harness
 
 - **`tests/test_long_session.py`**, in normal CI. A scripted `FakeProvider` with a small `context_window` drives
   many turns through the HTTP API. It asserts compactions fired, every transcript pairs calls with results, the
   system prompt and tool list are identical between compactions, the memory snapshot refreshes after a compaction,
-  and the full transcript is still readable.
+  and the full transcript is still readable. Separate cases cover the edges of §5:
+  - a compaction in the middle of a run, between two tool calls;
+  - a newest tool round larger than the tail budget, which is cut in the request and left whole in the store;
+  - a middle larger than the summary input limit;
+  - a compaction triggered by `context_overflow` rather than the estimate;
+  - a session with images outside the tail;
+  - mostly-CJK text, so the estimate triggers before the provider overflows;
+  - a failing summary call, then the 10-minute pause, then a successful compaction;
+  - the run's usage including the summary call.
 - **`scripts/long_session_live.py`**, opt-in with the existing `KEEL_LIVE_*` variables. It plants facts early in a
   long session, forces compactions, and asks for the facts back.
 
 ## 7. Data model changes
 
-M3 needs a fresh database (§1, schema guard).
+These are migration 2 (§1). A 0.2.0 database is upgraded at start; no data is lost.
 
 | Table | Change |
 |---|---|
 | `schema_version` | new, one row |
-| `profiles` | adds `memory` |
-| `sessions` | adds `summary`, `summary_head_id`, `summary_tail_id`, `turns_since_memory` |
+| `profiles` | adds `memory` (default false) |
+| `sessions` | adds `summary`, `summary_head_id`, `summary_tail_id`, `context_tokens`, `context_message_id`, `compaction_failed_at` (all nullable), `turns_since_memory` (default 0) |
 | `memories` | new (§4) |
 | `runs` | `current_exec_id` is now read and cleared |
+| `run_events` | rows of runs finished more than `KEEL_EVENT_RETENTION_DAYS` ago are deleted (§1) |
 
 ## 8. Configuration
 
@@ -249,12 +308,15 @@ M3 needs a fresh database (§1, schema guard).
 | `KEEL_MEMORY_CHARS` | 2200 | Limit for the `memory` target |
 | `KEEL_USER_CHARS` | 1375 | Limit for the `user` target |
 | `KEEL_BACKGROUND_LIMIT` | 4 | Concurrent background model calls per instance |
+| `KEEL_EVENT_RETENTION_DAYS` | 7 | Days a finished run's events are kept |
 
 ## 9. API changes
 
 - `PUT /v1/profiles/{p}` accepts `memory` (boolean).
 - `title_source` on sessions can now be `llm`.
-- New event `context.compacted`: `messages_before`, `messages_after`, `tokens_before`, `tokens_after`.
+- New event `context.compacted`: `messages_before`, `messages_after`, `tokens_before`, `tokens_after`, `usage` (the
+  summary call's). It is not terminal; a client that does not know it ignores it.
+- The events of a run finished more than `KEEL_EVENT_RETENTION_DAYS` ago are gone; its stream sends nothing.
 - No new routes. A read-only `GET /v1/profiles/{p}/memory` is easy to add if wanted and is left out of M3.
 
 ## 10. Testing
@@ -262,19 +324,24 @@ M3 needs a fresh database (§1, schema guard).
 - **Unit tests** cover `compress.py`, the memory store and tool, the background owner, and title parsing, all
   against the fake provider and in-memory store.
 - **Fault injection** is §1. The Docker and subprocess cases are opt-in.
-- **Postgres** (`KEEL_TEST_POSTGRES_DSN`) covers the listener reconnect by terminating the listening backend, and
-  concurrent memory writers.
+- **Postgres** (`KEEL_TEST_POSTGRES_DSN`) covers the listener reconnect by terminating the listening backend,
+  concurrent memory writers, and two instances migrating one database at once.
+- **Migrations** upgrade a frozen 0.2.0 database on both databases (§1); a database newer than the code is refused.
+- **Event pruning** deletes only events of runs finished before the cutoff, in batches, and leaves runs and
+  messages alone.
 - **Long session** is §6.
 
 ## 11. Risks
 
 - **Summary quality.** A weak summary loses facts. Mitigation: Hermes's checkpoint prompt is taken as written, the
   latest user request is kept verbatim, and the live script checks recall.
-- **Token estimates.** Providers may omit usage and images are not counted by characters. Mitigation: the
+- **Token estimates.** Providers may omit usage, images are not counted by characters, and the heuristic is rough.
+  Mitigation: the estimate is anchored to the provider's last reported count, CJK text is counted per character, the
   `context_overflow` path is a second trigger, and the threshold leaves 25% of the window as margin.
 - **Memory and prompt injection.** A page the model reads could try to write instructions into memory. Mitigation:
   the injection scan, opt-in per profile, and the volatile tier labelling memory as data about the user.
 - **Cost.** Titles, reviews and summaries are extra model calls. Mitigation: titles run once per session, reviews
   every 10 runs, the concurrency limit, and usage of background calls is logged separately.
-- **A fresh database again.** Existing deployments must recreate theirs. The release note says so and the schema
-  guard turns a silent failure into a clear one.
+- **A migration that fails halfway.** Each migration runs in one transaction with its version bump, so a failure
+  leaves the database at the previous version and the service refuses to start with the error. The release note
+  still advises a database backup before upgrading.
