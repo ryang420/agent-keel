@@ -147,6 +147,7 @@ async def test_a_run_compacts_between_two_tool_calls(store, tmp_path):
     executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
                            sleep=no_sleep, now=Ticking())
     await seed(store, 1, text="earlier")
+    await store.set_session_prompt("s1", "AN EARLIER PROMPT", "fake", "m")
     model.script = [
         [TextDelta("x" * 400_000), ToolCallReady(ToolCall("c1", "terminal", '{"command": "echo one"}')),
          Completed(Usage())],
@@ -159,7 +160,7 @@ async def test_a_run_compacts_between_two_tool_calls(store, tmp_path):
     assert (await store.get_run("p1", run.id)).status == "completed"
     assert len(model.requests) == 3 and len(model.summaries) == 1
     first, second, third = model.requests
-    assert first.system == second.system and first.tools == second.tools == third.tools
+    assert first.system == second.system == "AN EARLIER PROMPT" and first.tools == second.tools == third.tools
     assert third.system != first.system
     assert third.system == (await store.get_session("p1", "s1")).system_prompt
     assert [m.role for m in third.messages] == ["user", "assistant", "user", "user", "assistant", "tool"]
@@ -241,6 +242,35 @@ async def test_a_call_whose_newest_round_was_cut_records_no_anchor(store, tmp_pa
     assert anchors == [18_500, 2_000]
     sent = {m.tool_call_id: m.text for m in model.requests[2].messages if m.role == "tool"}
     assert sent["c1"].startswith("[terminal result omitted from context:")
+
+
+async def test_the_final_call_without_tools_records_no_anchor(store, tmp_path):
+    model = Model(40_000)
+    registry = ProviderRegistry()
+    registry.register(model)
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
+                               sandbox={"image": "local", "workdir": str(tmp_path / "work")})
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
+                           sleep=no_sleep, max_iterations=1)
+    model.script = [
+        [ToolCallReady(ToolCall("c1", "terminal", '{"command": "echo one"}')), Completed(Usage(3_000, 5, 0, 0))],
+        answer("summing up", usage=Usage(1_000, 5, 0, 0)),
+    ]
+    await executor.execute(await start(store, "go"))
+    assert model.requests[1].tools == ()
+    session = await store.get_session("p1", "s1")
+    assert (session.context_tokens, session.context_message_id) == (3_000, (await store.messages("s1"))[0].id)
+
+
+async def test_the_run_instructions_count_toward_the_threshold(parts):
+    store, model, executor, _ = parts
+    await seed(store, 3)
+    model.script = [answer()]
+    await store.ensure_session("p1", "s1")
+    await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m", reasoning_effort=None,
+                           input_parts=[{"type": "text", "text": "next"}], instructions="i" * 32_000)
+    await executor.execute(await store.claim_run("w1", 9_999_999))
+    assert len(model.summaries) == 1
 
 
 async def test_a_summary_cut_at_the_output_limit_is_not_stored(parts):

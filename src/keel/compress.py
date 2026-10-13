@@ -24,6 +24,7 @@ IMAGE_OMITTED = "[image omitted from context]"
 SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
 SUMMARY_INPUT_TOKENS = 40_000
 FILES_LIMIT = 50
+_PATH_MAX = 1_024
 FILES_HEADING = "## Files referenced"
 _CONTENT_MAX, _CONTENT_HEAD, _CONTENT_TAIL = 6_000, 4_000, 1_500
 _ARGS_MAX, _ARGS_HEAD = 1_500, 1_200
@@ -52,9 +53,11 @@ def message_tokens(message: Message) -> int:
     return total
 
 
-def base_tokens(system: str, tools: Sequence[dict]) -> int:
-    """The part of every request that is not messages: the system prompt and the tool definitions."""
-    return text_tokens(system) + sum(text_tokens(json.dumps(tool)) for tool in tools)
+def base_tokens(system: str, tools: Sequence[dict], instructions: str | None = None) -> int:
+    """The part of every request that is not messages: the system prompt, the run's instructions and the tool
+    definitions."""
+    return (text_tokens(system) + text_tokens(instructions or "")
+            + sum(text_tokens(json.dumps(tool)) for tool in tools))
 
 
 def tail_budget(window: int) -> int:
@@ -236,10 +239,10 @@ def serialize(messages: Sequence[Message]) -> str:
     return "\n\n".join(records)
 
 
-def summary_turns(previous: str | None, middle: Sequence[Message]) -> str:
+def summary_turns(previous: str | None, middle: Sequence[Message], limit: int = SUMMARY_INPUT_TOKENS) -> str:
     """The middle serialized for the summary call, cut head-and-tail so that it and the previous summary stay
-    within SUMMARY_INPUT_TOKENS."""
-    room = SUMMARY_INPUT_TOKENS - (text_tokens(previous) if previous else 0)
+    within `limit` tokens."""
+    room = limit - (text_tokens(previous) if previous else 0)
     return _cut_text(serialize(middle), max(1_000, room))
 
 
@@ -249,7 +252,8 @@ def _paths_in(text: str) -> list[str]:
 
 def collect_files(messages: Sequence[Message], previous: Sequence[str] = ()) -> list[str]:
     """File paths named in `messages`, after the previous list: the `path` argument of the file tools, and absolute
-    paths in user messages and in terminal and execute_code arguments. Deduplicated in first-seen order; the newest
+    paths in user messages and in terminal and execute_code arguments. Paths with a newline or over 1,024
+    characters are skipped and the rest redacted; a path named again moves to the newest end, and the newest
     FILES_LIMIT are kept."""
     found = list(previous)
     for message in messages:
@@ -266,7 +270,8 @@ def collect_files(messages: Sequence[Message], previous: Sequence[str] = ()) -> 
                 found.append(arguments["path"])
             elif call.name in _PATH_TEXT_ARGUMENTS and isinstance(arguments.get(_PATH_TEXT_ARGUMENTS[call.name]), str):
                 found += _paths_in(arguments[_PATH_TEXT_ARGUMENTS[call.name]])
-    return list(dict.fromkeys(path for path in found if len(path) > 1))[-FILES_LIMIT:]
+    kept = [redact(path) for path in found if 1 < len(path) <= _PATH_MAX and "\n" not in path]
+    return list(reversed(dict.fromkeys(reversed(kept))))[-FILES_LIMIT:]
 
 
 def split_files(summary: str | None) -> tuple[str | None, list[str]]:

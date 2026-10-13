@@ -43,14 +43,15 @@ class Compactor:
         """The messages to send next, and the summary call's usage (empty when none was made).
 
         Below the threshold nothing changes. At the threshold the placeholder pass is applied up to a new tail; if
-        that is enough, or summaries are paused after a failure, only the boundary is stored. Otherwise, and always
-        after a context_overflow (the estimate was wrong, so it cannot say the pass was enough), one summary call
-        condenses the middle."""
+        that is enough (judged by the heuristic scaled up by the provider's count when it counts more), or
+        summaries are paused after a failure, only a moved boundary is stored. Otherwise, and always after a
+        context_overflow (the estimate was wrong, so it cannot say the pass was enough), one summary call condenses
+        the middle."""
         budget = compress.tail_budget(window)
         limit = self.threshold * window
         items = compress.assemble(stored, context.bounds, budget)
-        tokens = compress.estimate(items, compress.base_tokens(context.system, tools), context.anchor_tokens,
-                                   context.anchor_id)
+        base = compress.base_tokens(context.system, tools, run.instructions)
+        tokens = compress.estimate(items, base, context.anchor_tokens, context.anchor_id)
         if not overflow and tokens < limit:
             return items, Usage()
         if context.bounds.summary is not None:
@@ -67,14 +68,16 @@ class Compactor:
         pruned_items = compress.assemble(stored, pruned, budget)
         now = self._now()
         paused = context.failed_at is not None and now.timestamp() - context.failed_at < FAILURE_PAUSE_SECONDS
-        enough = compress.estimate(pruned_items, compress.base_tokens(context.system, tools)) < limit
+        ratio = max(1.0, tokens / max(1, compress.estimate(items, base)))
+        enough = compress.estimate(pruned_items, base) * ratio < limit
         if not overflow and (paused or enough):
-            await self._prune(run.session_id, context, pruned)
+            if pruned.pruned_id != context.bounds.pruned_id:
+                await self._prune(run.session_id, context, pruned)
             return pruned_items, Usage()
         middle = [item.message for item in rest[:start]]
         previous, files = compress.split_files(context.bounds.summary)
-        system, prompt = compress.summary_prompt(previous, compress.summary_turns(previous, middle),
-                                                 today=f"{now:%B} {now.day}, {now.year}")
+        turns = compress.summary_turns(previous, middle, min(compress.SUMMARY_INPUT_TOKENS, window // 2))
+        system, prompt = compress.summary_prompt(previous, turns, today=f"{now:%B} {now.day}, {now.year}")
         request = ModelRequest(provider=run.provider, model=run.model, system=system,
                                messages=(Message("user", (TextPart(prompt),)),),
                                reasoning_effort=run.reasoning_effort)
@@ -96,7 +99,7 @@ class Compactor:
         compacted = compress.assemble(stored, bounds, budget)
         await self._emit(run.id, "context.compacted", {
             "messages_before": len(items), "messages_after": len(compacted), "tokens_before": tokens,
-            "tokens_after": compress.estimate(compacted, compress.base_tokens(system_prompt, tools)),
+            "tokens_after": compress.estimate(compacted, compress.base_tokens(system_prompt, tools, run.instructions)),
             "usage": usage.to_dict()})
         return compacted, usage
 

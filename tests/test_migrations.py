@@ -270,5 +270,6 @@ async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
         assert (await store.get_profile("p1")).memory is False
         session = await store.get_session("p1", "s1")
         assert session.summary is None and session.turns_since_memory == 0 and session.title == "Old chat"
+        assert session.pruned_id is None
     finally:
         await store.close()

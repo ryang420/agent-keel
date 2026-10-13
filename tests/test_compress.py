@@ -40,6 +40,8 @@ def test_an_image_has_a_fixed_cost_and_the_base_counts_system_and_tools():
     picture = Message("user", (TextPart("abcd"), ImagePart("image/png", blob_id="b1")))
     assert compress.message_tokens(picture) == compress.MESSAGE_OVERHEAD + 1 + compress.IMAGE_TOKENS
     assert compress.base_tokens("abcd", ({"a": 1},)) == 1 + 2
+    assert compress.base_tokens("abcd", ({"a": 1},), "abcd" * 10) == 1 + 2 + 10
+    assert compress.base_tokens("abcd", (), None) == 1
 
 
 def test_the_tail_budget_is_a_share_of_the_window_clamped():
@@ -188,6 +190,8 @@ def test_the_summary_input_is_capped_with_the_previous_summary_counted():
     with_previous = compress.summary_turns("p" * 40_000, middle)
     assert compress.text_tokens(with_previous) <= compress.SUMMARY_INPUT_TOKENS - 10_000 + 50
     assert compress.summary_turns(None, [user("short")]) == "[USER]: short"
+    smaller = compress.summary_turns(None, middle, limit=20_000)
+    assert compress.text_tokens(smaller) <= 20_000 + 50
 
 
 def test_files_referenced_come_from_tool_arguments_and_absolute_paths():
@@ -208,6 +212,22 @@ def test_files_referenced_come_from_tool_arguments_and_absolute_paths():
 def test_files_referenced_keep_the_newest_fifty():
     previous = [f"/p/{n}" for n in range(60)]
     assert compress.collect_files([], previous) == previous[-50:]
+
+
+def test_a_file_named_again_moves_to_the_newest_end():
+    previous = [f"/p/{n}" for n in range(50)]
+    assert compress.collect_files([assistant("", call("c1", "read_file", path="/p/0"))], previous) == (
+        previous[1:] + ["/p/0"])
+    assert compress.collect_files([user("/p/1 then /p/2 then /p/1")]) == ["/p/2", "/p/1"]
+
+
+def test_file_paths_with_a_newline_or_over_1024_characters_are_skipped_and_secrets_redacted():
+    secret = "sk-" + "a" * 24
+    messages = [assistant("", call("c1", "write_file", path="/w/a\nb.txt"),
+                          call("c2", "write_file", path="/w/" + "l" * 1_100),
+                          call("c3", "read_file", path=f"/w/{secret}.txt"),
+                          call("c4", "read_file", path="/w/ok.txt"))]
+    assert compress.collect_files(messages) == ["/w/[REDACTED].txt", "/w/ok.txt"]
 
 
 def test_the_path_pattern_is_linear_on_long_input():

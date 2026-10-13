@@ -14,6 +14,7 @@ from keel.models import Completed, ImagePart, Message, TextDelta, TextPart, Tool
 from keel.providers.base import Capabilities, ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
+from keel.sandbox.local import LocalSandbox
 from keel.worker import WorkerPool
 
 AUTH = {"Authorization": "Bearer test-key"}
@@ -21,22 +22,25 @@ PROFILE = {"models": [{"provider": "fake", "model": "m"}], "sandbox": {}, "soul"
 
 
 class Counting(FakeProvider):
-    """Counts a request with keel's heuristic, fails with context_overflow above its window, reports the count as
-    input tokens, and answers summary calls with a numbered summary."""
+    """Counts a request with keel's heuristic times `factor`, fails with context_overflow above its window, reports
+    the count as input tokens, and answers summary calls with a numbered summary."""
 
-    def __init__(self, window: int, reply: str = "r" * 8_000) -> None:
+    def __init__(self, window: int, reply: str = "r" * 8_000, factor: float = 1.0) -> None:
         super().__init__(capabilities=Capabilities(window, True, False, True, "none"))
-        self.window, self.reply = window, reply
+        self.window, self.reply, self.factor = window, reply, factor
         self.summaries: list = []
         self.main: list = []
+        self.calls: list = []  # every request that was answered, in order
         self.overflows = 0
 
     async def stream(self, request):
-        size = compress.estimate([compress.Item(None, m) for m in request.messages],
-                                 compress.base_tokens(request.system, request.tools))
+        size = int(self.factor * compress.estimate([compress.Item(None, m) for m in request.messages],
+                                                   compress.base_tokens(request.system, request.tools,
+                                                                        request.instructions)))
         if size > self.window:
             self.overflows += 1
             raise ModelError("context_overflow", f"{size} tokens is over the window")
+        self.calls.append(request)
         if request.system == prompts.text("summary_system"):
             self.summaries.append(request)
             yield TextDelta(f"SUMMARY {len(self.summaries)}")
@@ -44,6 +48,17 @@ class Counting(FakeProvider):
             self.main.append(request)
             yield TextDelta(self.reply)
         yield Completed(Usage(size, 10, 0, 0))
+
+
+def between_summaries(model: Counting) -> list[list]:
+    """The main requests grouped by the summary calls that separate them."""
+    groups: list[list] = [[]]
+    for request in model.calls:
+        if request.system == prompts.text("summary_system"):
+            groups.append([])
+        else:
+            groups[-1].append(request)
+    return [group for group in groups if group]
 
 
 async def executor_for(store, model, **options):
@@ -79,18 +94,19 @@ def assistant(text):
 
 
 @pytest.fixture
-async def service(store):
+async def service(store, tmp_path):
     model = Counting(40_000)
     registry = ProviderRegistry()
     registry.register(model)
     bus = InMemoryEventBus()
-    executor = RunExecutor(store, bus, registry)
+    executor = RunExecutor(store, bus, registry, sandbox=LocalSandbox(kill_grace_s=0.5))
     pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key="test-key", max_running=2)
     await pool.start()
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(keel)), base_url="http://keel",
                                headers=AUTH)
-    assert (await client.put("/v1/profiles/p1", json=PROFILE)).status_code == 200
+    profile = {**PROFILE, "sandbox": {"image": "local", "workdir": str(tmp_path / "work")}}
+    assert (await client.put("/v1/profiles/p1", json=profile)).status_code == 200
     yield client, model, store
     await client.aclose()
     await pool.close(drain_seconds=0.1)
@@ -117,8 +133,10 @@ async def test_a_session_many_times_the_window_keeps_working(service):
         run_ids.append(started.json()["run_id"])
     compacted = [e for run_id in run_ids for e in await store.events_after(run_id, 0) if e.type == "context.compacted"]
     assert len(compacted) >= 2 and len(model.summaries) == len(compacted) and model.overflows == 0
-    assert len({request.system for request in model.main}) == 1
-    assert len({json.dumps(request.tools) for request in model.main}) == 1
+    groups = between_summaries(model)
+    assert len(groups) == len(compacted) + 1
+    assert all(len({request.system for request in group}) == 1 for group in groups)
+    assert model.main[0].tools and len({json.dumps(request.tools) for request in model.main}) == 1
     page = (await client.get("/v1/profiles/p1/sessions/long/messages", params={"limit": 500})).json()
     assert [m["role"] for m in page["data"]] == ["user", "assistant"] * 30
     assert page["data"][0]["content"] == "turn 0 " + "u" * 4_000
@@ -181,6 +199,37 @@ async def test_images_outside_the_tail_are_sent_as_a_note(store):
     assert not any(isinstance(part, ImagePart) for message in sent for part in message.parts)
     assert [m.parts for m in sent if m.role == "user" and m.text.startswith("look")] == [
         (TextPart("look"), TextPart(compress.IMAGE_OMITTED))]
+
+
+async def test_a_provider_that_counts_more_than_the_heuristic_gets_summaries_not_repeated_pruning(store):
+    model = Counting(40_000, reply="r" * 600, factor=1.3)
+    executor = await executor_for(store, model)
+    await append(store, *[message for _ in range(20) for message in (user("t" * 4_000), assistant("a" * 4_000))])
+    writes = []
+    set_pruned, compact_session = store.set_pruned, store.compact_session
+
+    async def pruned(session_id, pruned_id, **options):
+        writes.append("pruned")
+        await set_pruned(session_id, pruned_id, **options)
+
+    async def compacted(session_id, **options):
+        writes.append("summary")
+        await compact_session(session_id, **options)
+
+    store.set_pruned, store.compact_session = pruned, compacted
+    for n in range(40):
+        await turn(store, executor, f"turn {n} " + "u" * 600)
+    assert model.summaries and model.overflows == 0
+    assert "pruned" * 3 not in "".join(writes), writes
+
+
+async def test_a_summary_call_fits_a_small_window(store):
+    model = Counting(40_000, reply="ok")
+    executor = await executor_for(store, model)
+    await append(store, *[message for _ in range(40) for message in (user("t" * 6_000), assistant("a" * 6_000))])
+    await turn(store, executor, "next")
+    assert len(model.summaries) == 1 and model.overflows == 0
+    assert compress.split_files((await store.get_session("p1", "s1")).summary)[0] == "SUMMARY 1"
 
 
 async def test_a_middle_larger_than_the_summary_input_limit_is_cut_to_fit(store):

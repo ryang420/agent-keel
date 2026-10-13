@@ -339,7 +339,8 @@ class RunExecutor:
             stored = {item.id: item.message for item in turn.stored}
             cut = any(stored.get(item.id) is not item.message for item in items[compress.round_start(items):])
             newest = max((item.id for item in items if item.id is not None), default=None)
-            if usage.input_tokens is not None and newest is not None and not cut:
+            # Nor for the final call: it sends no tool definitions, so its count is low for the calls that do.
+            if usage.input_tokens is not None and newest is not None and not cut and not final:
                 await self.store.set_context_anchor(run.session_id, usage.input_tokens, newest)
                 turn.context.anchor_tokens, turn.context.anchor_id = usage.input_tokens, newest
             return calls, reasoning, incomplete
