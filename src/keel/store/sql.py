@@ -15,51 +15,7 @@ from keel.store.base import (
     TITLE_RANK, WORKER_LOST_MESSAGE, Event, Profile, Run, Session, SessionBusy, SessionNotFound, StoredMessage,
     TitleInUse, UniqueViolation,
 )
-
-_TABLES = """
-CREATE TABLE IF NOT EXISTS profiles (
-    id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL,
-    skills TEXT NOT NULL, updated_at {real} NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, title TEXT, title_source TEXT,
-    created_at {real} NOT NULL, last_active_at {real} NOT NULL, message_count INTEGER NOT NULL DEFAULT 0,
-    system_prompt TEXT, provider TEXT, model TEXT, cwd TEXT);
-CREATE UNIQUE INDEX IF NOT EXISTS sessions_profile_title ON sessions (profile_id, title) WHERE title IS NOT NULL;
-CREATE INDEX IF NOT EXISTS sessions_profile_active ON sessions (profile_id, last_active_at);
-CREATE TABLE IF NOT EXISTS messages (
-    id {serial} PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT, role TEXT NOT NULL,
-    parts TEXT NOT NULL, tool_calls TEXT NOT NULL, tool_call_id TEXT, tool_name TEXT,
-    reasoning TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at {real} NOT NULL);
-CREATE INDEX IF NOT EXISTS messages_session ON messages (session_id, id);
-CREATE TABLE IF NOT EXISTS runs (
-    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL,
-    provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_effort TEXT, input TEXT NOT NULL,
-    instructions TEXT, output TEXT NOT NULL DEFAULT '', usage TEXT NOT NULL DEFAULT '{{}}',
-    error_code TEXT, error TEXT, lease_owner TEXT, lease_expires_at {real},
-    created_at {real} NOT NULL, started_at {real}, finished_at {real}, current_exec_id TEXT);
-CREATE INDEX IF NOT EXISTS runs_status ON runs (status, created_at);
-CREATE INDEX IF NOT EXISTS runs_session ON runs (session_id);
-CREATE UNIQUE INDEX IF NOT EXISTS runs_one_in_flight_per_session ON runs (session_id)
-    WHERE status IN ('queued', 'running', 'stopping');
-CREATE TABLE IF NOT EXISTS run_events (
-    run_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL,
-    at {real} NOT NULL, PRIMARY KEY (run_id, seq));
-CREATE TABLE IF NOT EXISTS blobs (
-    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, media_type TEXT NOT NULL,
-    data TEXT NOT NULL, created_at {real} NOT NULL);
-CREATE INDEX IF NOT EXISTS blobs_session ON blobs (session_id);
-"""
-
-# Concurrent instances starting together race on CREATE … IF NOT EXISTS; this serializes them. A multi-statement
-# script goes to asyncpg as one simple query, i.e. one transaction, so the transaction-level lock covers it all.
-_SCHEMA_LOCK = "SELECT pg_advisory_xact_lock(7312100001);\n"
-
-SCHEMAS = {
-    "sqlite": _TABLES.format(real="REAL", serial="INTEGER"),
-    "postgres": _SCHEMA_LOCK + _TABLES.format(real="DOUBLE PRECISION", serial="BIGSERIAL"),
-}
-# SQLite only auto-increments an INTEGER PRIMARY KEY when it is declared exactly that way.
-SCHEMAS["sqlite"] = SCHEMAS["sqlite"].replace("id INTEGER PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
+from keel.store.migrations import migrate
 
 _IN_FLIGHT = "('queued', 'running', 'stopping')"
 
@@ -111,7 +67,7 @@ class SqlStore:
         self.clock = clock
 
     async def init(self) -> None:
-        await self.db.executescript(SCHEMAS[self.db.dialect])
+        await migrate(self.db)
 
     async def ping(self) -> bool:
         row = await self.db.fetchrow("SELECT 1 AS ok")

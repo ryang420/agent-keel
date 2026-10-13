@@ -19,5 +19,9 @@ async def open_store(url: str, clock: Callable[[], float] = time.time) -> SqlSto
     else:
         raise ValueError(f"unsupported database URL: {url.split(':', 1)[0]}")
     store = SqlStore(db, clock=clock)
-    await store.init()
+    try:
+        await store.init()
+    except BaseException:
+        await store.close()
+        raise
     return store

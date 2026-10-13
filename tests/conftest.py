@@ -32,7 +32,8 @@ async def store(request, tmp_path, clock):
         import asyncpg
 
         conn = await asyncpg.connect(url)
-        await conn.execute("DROP TABLE IF EXISTS run_events, runs, messages, sessions, profiles, blobs")
+        await conn.execute("DROP TABLE IF EXISTS schema_version, memories, run_events, runs, messages, sessions, "
+                           "profiles, blobs")
         await conn.close()
     opened = await open_store(url, clock=clock)
     yield opened
