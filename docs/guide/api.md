@@ -44,10 +44,12 @@ Errors have one shape, with a machine-readable code:
 ```
 
 - `models`: the provider and model pairs runs may use.
-- `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means no tools.
+- `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means the sandbox tools are not offered.
 - `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
 - `skills`: the names of the skills to enable.
-- `memory`: when true, the profile opts in to long-term memory. Omitted, it is false, including when replacing a profile that had it on. Anything other than a boolean is 400 `invalid_input`.
+- `memory`: when true, the model is offered a `memory` tool (with or without a sandbox) and the system prompt
+  includes a snapshot of stored facts, frozen until that prompt is rebuilt. Omitted, it is false, including when
+  replacing a profile that had it on. Anything other than a boolean is 400 `invalid_input`.
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 

@@ -1,14 +1,18 @@
 import asyncio
+import json
 
 import pytest
 
+from keel import prompts
 from keel.background import Background
 from keel.events import InMemoryEventBus
 from keel.models import Completed, ToolCall, ToolCallReady, ReasoningItem, ReasoningReady, TextDelta, TextPart, Usage
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import DEFAULT_IDENTITY, RunExecutor
+from keel.sandbox.local import LocalSandbox
 from keel.titles import derive_title
+from keel.tools import ToolContext, run_tool
 
 ITEM = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
 
@@ -294,4 +298,54 @@ async def test_a_user_rename_during_the_call_wins(setup):
     await renaming
     session = await store.get_session("p1", "s1")
     assert (session.title, session.title_source) == ("Chosen", "user")
+
+
+async def test_memory_is_offered_without_a_sandbox(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    provider.script = [[ToolCallReady(ToolCall("c1", "memory", json.dumps(
+        {"action": "add", "target": "user", "content": "The user likes tea"}))), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    run = await start(store)
+    await store.db.execute("UPDATE sessions SET turns_since_memory = 4 WHERE id = ?", "s1")
+    await executor.execute(run)
+    assert tuple(tool["name"] for tool in provider.requests[0].tools) == ("memory",)
+    assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
+    session = await store.get_session("p1", "s1")
+    assert session.turns_since_memory == 0
+    # "tea" occurs inside "instead" in the guidance text, so the frozen snapshot is checked by the whole fact.
+    assert "The user likes tea" not in session.system_prompt and prompts.text("memory") in session.system_prompt
+    assert "USER PROFILE (who the user is)\n(empty)" in session.system_prompt
+    await executor.execute(await start(store, "later", session="s2"))
+    later = await store.get_session("p1", "s2")
+    assert "The user likes tea" in later.system_prompt
+    assert (await store.get_session("p1", "s1")).system_prompt == session.system_prompt
+
+
+async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(store, tmp_path):
+    provider = FakeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    work = tmp_path / "work"
+    work.mkdir()
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[], memory=True,
+                               sandbox={"image": "local", "workdir": str(work)})
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5), sleep=no_sleep)
+    await executor.execute(await start(store))
+    assert [tool["name"] for tool in provider.requests[0].tools] == [*prompts.TOOL_ORDER, "memory"]
+
+
+async def test_a_tool_other_than_memory_needs_a_sandbox():
+    missing = await run_tool("terminal", '{"command": "true"}', ToolContext())
+    assert missing.error and "sandbox" in missing.content
+    unavailable = await run_tool("memory", '{"target": "user", "action": "add", "content": "x"}', ToolContext())
+    assert unavailable.error and "Memory is not available." in unavailable.content
+
+
+async def test_a_profile_with_neither_still_gets_no_tools(setup):
+    store, provider, executor = setup
+    await executor.execute(await start(store))
+    assert provider.requests[0].tools == ()
 

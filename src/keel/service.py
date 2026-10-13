@@ -47,7 +47,7 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     background = Background(limit=settings.background_limit)
     executor = RunExecutor(store, bus, registry, sandbox=backend, max_iterations=settings.max_iterations,
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold,
-                          background=background)
+                          background=background, memory_chars=settings.memory_chars, user_chars=settings.user_chars)
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
                       lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key=settings.api_key,

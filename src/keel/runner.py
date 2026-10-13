@@ -8,12 +8,13 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import logging
 import time
-from typing import Callable
+from typing import Awaitable, Callable
 
 from keel import prompts
 from keel import compress
 from keel.compactor import Compactor, SessionContext
 from keel.compress import Boundaries
+from keel.memory import snapshot as memory_snapshot
 from keel.models import (
     Completed, ImagePart, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
     part_from_dict,
@@ -66,7 +67,7 @@ class _Turn:
     context: SessionContext
     tools: tuple[dict, ...]
     window: int
-    rebuild: Callable[[], str]
+    rebuild: Callable[[], Awaitable[str]]
     blobs: dict = field(default_factory=dict)  # image bytes loaded during this run, by blob id
 
 
@@ -82,12 +83,15 @@ class RunExecutor:
     def __init__(self, store, bus, providers: ProviderRegistry, *, sandbox=None, sleep=asyncio.sleep,
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None, kill_timeout_s: float = 10.0,
                  skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC),
-                 compression_threshold: float = 0.75, background=None) -> None:
+                 compression_threshold: float = 0.75, background=None, memory_chars: int = 2200,
+                 user_chars: int = 1375) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
         self.sandbox = sandbox
         self.background = background
+        self.memory_chars = memory_chars
+        self.user_chars = user_chars
         self.max_iterations = max_iterations
         self.mount_root = mount_root
         self.kill_timeout_s = kill_timeout_s
@@ -265,17 +269,33 @@ class RunExecutor:
                 except SandboxError as exc:
                     raise RunFailure("sandbox_unavailable", str(exc)) from exc
             ctx = ToolContext(self.sandbox, sandbox, cwd=(session.cwd if session and session.cwd else policy.workdir),
-                              skills=tuple(skills), on_exec=self._exec_recorder(run, state))
+                              skills=tuple(skills), on_exec=self._exec_recorder(run, state), store=self.store,
+                              profile_id=run.profile_id, session_id=run.session_id, memory_chars=self.memory_chars,
+                              user_chars=self.user_chars)
+        names: list[str] = []
+        if ctx is not None:
+            names.extend(prompts.TOOL_ORDER)
+        if profile is not None and profile.memory:
+            names.append("memory")
+        if ctx is None and names:
+            cwd = session.cwd if session and session.cwd else "/"
+            ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id, session_id=run.session_id,
+                              memory_chars=self.memory_chars, user_chars=self.user_chars)
         saved_cwd = ctx.cwd if ctx else None
 
-        def rebuild() -> str:
-            return build_system_prompt(soul=profile.soul if profile else "", model=run.model, provider=run.provider,
-                                       now=self._now(), tools=ctx is not None, skills=skills,
-                                       workdir=policy.workdir if policy else None)
+        async def rebuild() -> str:
+            snapshot = ""
+            if profile is not None and profile.memory:
+                entries = await self.store.memory_entries(run.profile_id)
+                snapshot = memory_snapshot(entries["memory"], entries["user"])
+            return build_system_prompt(
+                soul=profile.soul if profile else "", model=run.model, provider=run.provider, now=self._now(),
+                tools=bool(names), skills=skills, workdir=policy.workdir if policy else None,
+                memory=bool(profile and profile.memory), memory_snapshot=snapshot)
 
         system = session.system_prompt if session else None
         if system is None:
-            system = (await self.store.set_session_prompt(run.session_id, rebuild(), run.provider,
+            system = (await self.store.set_session_prompt(run.session_id, await rebuild(), run.provider,
                                                           run.model)).system_prompt
         stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
@@ -293,7 +313,7 @@ class RunExecutor:
             anchor_id=session.context_message_id if session else None,
             failed_at=session.compaction_failed_at if session else None)
         turn = _Turn(provider=provider, stored=stored, context=context,
-                     tools=prompts.tool_definitions() if ctx is not None else (),
+                     tools=prompts.tool_definitions(tuple(names)) if names else (),
                      window=provider.capabilities(run.model).context_window, rebuild=rebuild)
         for iteration in range(self.max_iterations + 1):
             final = iteration == self.max_iterations and bool(turn.tools)

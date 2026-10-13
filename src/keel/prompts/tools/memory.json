@@ -1,0 +1,39 @@
+{
+  "name": "memory",
+  "description": "Save a fact that is shown in future sessions. Two stores: target \"user\" is who the user is (name, role, preferences, style); target \"memory\" is your notes about the environment (conventions, tool quirks, paths). One fact goes to one store. Keep entries short. Skip task progress, one-off logs and anything already in the prompt. The snapshot in the prompt is frozen for this session; a write shows up in the next session. replace overwrites the whole entry; old_text only locates it. operations applies every change atomically, and the final text must fit the character budget.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["add", "replace", "remove"],
+        "description": "add appends a fact, replace overwrites one whole entry, remove deletes one."
+      },
+      "target": {
+        "type": "string",
+        "enum": ["memory", "user"],
+        "description": "user: who the user is. memory: notes about the environment."
+      },
+      "content": {"type": "string", "description": "The fact to store. Required for add and replace."},
+      "old_text": {
+        "type": "string",
+        "description": "Text that locates an existing entry for replace or remove. It is not stored; replace overwrites the whole entry."
+      },
+      "new_text": {"type": "string", "description": "The full replacement entry when action is replace."},
+      "operations": {
+        "type": "array",
+        "description": "Several changes applied atomically against the final character budget. If any change is refused, none are saved.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+            "content": {"type": "string"},
+            "old_text": {"type": "string"},
+            "new_text": {"type": "string"}
+          }
+        }
+      }
+    },
+    "required": ["target"]
+  }
+}

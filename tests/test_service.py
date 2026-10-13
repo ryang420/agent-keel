@@ -33,12 +33,13 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
     from keel.service import build
 
     settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
-                        compression_threshold=0.5)
+                        compression_threshold=0.5, memory_chars=100, user_chars=50)
     keel, pool, closables, backend = await build(settings)
     try:
         assert backend is None and keel.executor.sandbox is None
         assert keel.executor.background is keel.background
         assert keel.executor.compactor.threshold == 0.5
+        assert (keel.executor.memory_chars, keel.executor.user_chars) == (100, 50)
         assert pool.event_retention_s == 7 * 86_400
     finally:
         for item in closables:
