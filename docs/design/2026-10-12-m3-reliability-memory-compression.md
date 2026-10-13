@@ -223,7 +223,9 @@ pass and the summary input.
   dividing all text by 4 would undercount it several times), plus a fixed cost per image. With no anchor (a new
   session, a provider that reports no usage, or just after a compaction) the whole request is counted this way. The
   loop updates the anchor after every main call; a summary call never updates it.
-- **Head.** The first 3 messages, extended forward until every tool call among them has its results.
+- **Head.** The first 3 messages, extended forward until every tool call among them has its results. The head is
+  sent on every call and never summarized, so in the request each head message over 4k tokens (a client may paste a
+  whole file into the first message) is cut head-and-tail with the truncation marker. Nothing stored changes.
 - **Tail.** A recent tail of about 2.5% of the window, clamped to 10k–25k tokens, starting at a user or assistant
   message. A boundary never separates an assistant tool call from its results. The tail always holds at least the
   newest assistant message with all its results (or the newest user message when that is last). When that minimum
@@ -232,9 +234,17 @@ pass and the summary input.
 - **Placeholder pass.** Outside the tail, in the request only and with no model call, each tool result over 200
   characters is replaced by a one-line placeholder naming the tool and the size it had, and each image part becomes
   the text `[image omitted from context]`. Nothing stored changes.
-- **Summary input.** The previous summary in full, then the middle (messages after the head and before the tail)
+- **Summary input.** The previous summary in full except its "Files referenced" section (keel wrote it and carries
+  it over itself, below), then the middle (messages after the head and before the tail)
   after the placeholder pass, serialized as text. When that is over 40k tokens, the middle is cut head-and-tail to
   fit, with a marker saying how much was left out, so the summary call itself always fits the window.
+- **Files referenced.** File paths are collected from the middle without a model: the `path` argument of
+  `read_file`, `write_file` and `patch` calls, and absolute paths that appear in user messages (an attachment's
+  location usually arrives this way) and in `terminal` and `execute_code` arguments. The list is deduplicated, keeps
+  first-seen order, carries over the previous summary's list, and is capped at 50 entries (the newest are kept). It
+  is appended to the model's summary verbatim under a "Files referenced" heading, so a long path is never shortened
+  or misspelt by the summary call and the model can still reopen an attachment or a file it wrote. The path pattern
+  runs on model-controlled text, so it is linear-time and gets a long-input timing test.
 
 ### When it runs
 
@@ -247,7 +257,8 @@ call. The steps:
    sections (the user's latest unfulfilled request verbatim, goal, completed actions, active state, decisions,
    errors and fixes) applied to the summary input. The call runs inside the run, so stop and shutdown already
    cancel it.
-3. Store `summary`, `summary_head_id`, `summary_tail_id`, and clear the estimate anchor.
+3. Append the files referenced to the summary, then store `summary`, `summary_head_id`, `summary_tail_id`, and
+   clear the estimate anchor.
 4. Rebuild the system prompt, so the skills index, date and memory snapshot are fresh, with a new store method
    that overwrites `sessions.system_prompt`. `set_session_prompt` stays first-writer-wins.
 5. Reassemble the run's in-memory conversation from the store, so the rest of the run (and a compaction in the
@@ -280,6 +291,9 @@ once and reused byte for byte" becomes "reused byte for byte between compactions
   - a middle larger than the summary input limit;
   - a compaction triggered by `context_overflow` rather than the estimate;
   - a session with images outside the tail;
+  - an attachment path given in an early user message and a file written by a tool, both summarized away, still
+    listed verbatim under "Files referenced" after two compactions;
+  - a first user message far over the head limit, cut in the request and left whole in the store;
   - mostly-CJK text, so the estimate triggers before the provider overflows;
   - a failing summary call, then the 10-minute pause, then a successful compaction;
   - the run's usage including the summary call.
