@@ -122,8 +122,8 @@ is unchanged. A client should ignore event types it does not know.
 
 ## Sessions and messages
 
-A session is `id`, `title`, `title_source` (`derived` from the first message, or `user` after a rename),
-`created_at`, `last_active_at`, `message_count`.
+A session is `id`, `title`, `title_source` (`derived` from the first message, `llm` after the first completed run, or
+`user` after a rename), `created_at`, `last_active_at`, `message_count`.
 
 `GET .../messages` returns `{"data": [message, …], "pagination": {"limit", "offset", "returned"}}` with `limit`
 (1-500, default 200) and `offset`. With `after_id=<message id>` it returns only the later messages, without

@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from keel.background import Background
 from keel.events import InMemoryEventBus
 from keel.models import Completed, ToolCall, ToolCallReady, ReasoningItem, ReasoningReady, TextDelta, TextPart, Usage
 from keel.providers.base import ModelError, ProviderRegistry
@@ -206,3 +207,91 @@ async def test_an_incomplete_response_still_completes_but_says_so(setup, caplog)
     await executor.execute(await start(store, session="s2"))
     other = [r for r in await store.list_runs("p1", ("completed",)) if r.session_id == "s2"][0]
     assert "incomplete" not in (await store.events_after(other.id, 0))[-1].data
+
+
+def with_background(setup):
+    """`setup` builds the executor; these tests pass the background owner the fixture does not."""
+    store, provider, executor = setup
+    background = Background()
+    titled = RunExecutor(store, executor.bus, executor.providers, sleep=no_sleep, background=background)
+    return store, provider, titled, background
+
+
+async def wait_for_background(background):
+    """`asyncio.wait` rejects an empty set, and a task is removed from `_tasks` once it finishes."""
+    tasks = [task for task in background._tasks]
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=2)
+    assert not pending
+
+
+OPENING = "The pool exhausts under load"
+DONE = [TextDelta("done"), Completed(Usage(3, 1, 0, 0))]
+TITLE_OK = [TextDelta('{"title": "Pool exhausts under load"}'), Completed(Usage(3, 1, 0, 0))]
+
+
+async def test_the_first_completed_run_is_renamed_in_the_background(setup):
+    store, provider, executor, background = with_background(setup)
+    # The title step sleeps so the derived title can be read: any await after execute also runs the task.
+    provider.script = [DONE, [0.05, *TITLE_OK]]
+    run = await start(store, OPENING)
+    await executor.execute(run)
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == (OPENING, "derived")
+    events = [event.type for event in await store.events_after(run.id, 0)]
+    await wait_for_background(background)
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == ("Pool exhausts under load", "llm")
+    assert len(provider.requests) == 2
+    title_request = provider.requests[1]
+    assert title_request.tools == () and title_request.reasoning_effort == "low"
+    assert title_request.max_output_tokens == 512 and title_request.cache_scope == ""
+    assert OPENING in title_request.messages[0].text
+    assert [event.type for event in await store.events_after(run.id, 0)] == events
+    assert [message.message.role for message in await store.messages("s1")] == ["user", "assistant"]
+
+
+async def test_a_second_run_does_not_call_the_model_for_a_title(setup):
+    store, provider, executor, background = with_background(setup)
+    provider.script = [DONE, TITLE_OK, [TextDelta("again"), Completed(Usage(3, 1, 0, 0))]]
+    await executor.execute(await start(store, OPENING))
+    await wait_for_background(background)
+    titled = (await store.get_session("p1", "s1")).title
+    before = len(provider.requests)
+    await executor.execute(await start(store, "more detail"))
+    await wait_for_background(background)
+    assert len(provider.requests) == before + 1
+    assert (await store.get_session("p1", "s1")).title == titled
+
+
+async def test_a_bad_title_keeps_the_derived_one(setup):
+    store, provider, executor, background = with_background(setup)
+    provider.script = [DONE, [TextDelta("I cannot tell")]]
+    await executor.execute(await start(store, OPENING))
+    await wait_for_background(background)
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == (OPENING, "derived")
+
+
+async def test_a_user_rename_during_the_call_wins(setup):
+    store, provider, executor, background = with_background(setup)
+    provider.script = [DONE, [0.05, *TITLE_OK]]
+    await executor.execute(await start(store, OPENING))
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == (OPENING, "derived")
+
+    async def rename_once_the_title_call_starts():
+        for _ in range(100):
+            if len(provider.requests) >= 2:
+                await store.set_title("p1", "s1", "Chosen", "user")
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("the title call never started")
+
+    renaming = asyncio.create_task(rename_once_the_title_call_starts())
+    await wait_for_background(background)
+    await renaming
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == ("Chosen", "user")
+

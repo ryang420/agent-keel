@@ -44,11 +44,12 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     if settings.sandbox == "docker":
         backend = DockerSandbox(docker=settings.docker, deployment=settings.deployment,
                                 idle_seconds=settings.sandbox_idle_seconds)
+    background = Background(limit=settings.background_limit)
     executor = RunExecutor(store, bus, registry, sandbox=backend, max_iterations=settings.max_iterations,
-                          mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold)
+                          mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold,
+                          background=background)
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
                       lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0)
-    background = Background(limit=settings.background_limit)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key=settings.api_key,
                 max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root,
                 background=background)

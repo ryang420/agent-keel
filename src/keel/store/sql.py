@@ -297,6 +297,12 @@ class SqlStore:
         row = await self.db.fetchrow(f"SELECT COUNT(*) AS n FROM runs WHERE status IN {_IN_FLIGHT}")
         return int(row["n"])
 
+    async def completed_run_count(self, session_id: str, *, except_id: str) -> int:
+        row = await self.db.fetchrow(
+            "SELECT COUNT(*) AS n FROM runs WHERE session_id = ? AND status = 'completed' AND id <> ?",
+            session_id, except_id)
+        return int(row["n"])
+
     async def in_flight_profiles(self) -> set[str]:
         rows = await self.db.fetch(f"SELECT DISTINCT profile_id FROM runs WHERE status IN {_IN_FLIGHT}")
         return {row["profile_id"] for row in rows}

@@ -83,7 +83,7 @@ Everything is in `src/keel/`.
 | `tools/` | The eight tools and `run_tool`, the single entry point the loop calls. |
 | `prompt.py`, `prompts/` | The session system prompt and the prompt / tool-definition texts. |
 | `skills.py` | Skill discovery through the sandbox and the prompt index. |
-| `titles.py` | Derived session titles. |
+| `titles.py` | Session titles, derived and model-generated. |
 
 Interfaces exist only where there is more than one implementation: `Store` (SQLite, Postgres), `EventBus` (in-memory,
 Postgres), `ModelProvider` (Bedrock, OpenAI, a fake for tests), `SandboxBackend` (Docker, local). Everything else is
@@ -559,8 +559,9 @@ its users to profiles and keeps the key secret.
 
 - **Sessions** are created by the first run that names them (or get a generated id). They persist the transcript,
   the system prompt (fixed between compactions) and the working directory.
-- **Titles** come from the first user message (cleaned, bounded, and made unique with `#2` … `#9`), carry a rank
-  (`derived` < `llm` < `user`), and a user's title is never overwritten by a lower-ranked one.
+- **Titles** come from the first user message (cleaned and bounded), then from a model call after the first
+  completed run. Collisions get `#2`, `#3`, … with no cap. They carry a rank (`derived` < `llm` < `user`), and a
+  user's title is never overwritten by a lower-ranked one.
 - **Images** (PNG, JPEG, GIF, WebP; at most 4 per run, 5 MiB each, length checked before decoding) are stored as
   blobs; messages keep only a reference, and the bytes are loaded when the model request is built. A missing blob
   becomes the text `[image no longer available]`. A model without vision refuses them.

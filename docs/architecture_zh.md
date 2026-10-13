@@ -79,7 +79,7 @@ flowchart TB
 | `tools/` | 八个工具，以及循环调用的唯一入口 `run_tool`。 |
 | `prompt.py`、`prompts/` | 会话的系统提示词，以及提示词和工具定义文本。 |
 | `skills.py` | 通过沙箱发现 skill，并生成提示词里的索引。 |
-| `titles.py` | 推导会话标题。 |
+| `titles.py` | 会话标题：从首条消息推导，也可由模型生成。 |
 
 只有存在多个实现的地方才定义接口：`Store`（SQLite、Postgres）、`EventBus`（进程内、Postgres）、
 `ModelProvider`（Bedrock、OpenAI，以及测试用的 fake）、`SandboxBackend`（Docker、本地）。其余都是具体代码。
@@ -517,8 +517,8 @@ keel 不认识终端用户：**profile 是租户的单位**，由前面的产品
 ### 会话、标题与图片
 
 - **会话**由第一个指明它的 run 创建（否则会生成一个 id）。它们保存对话记录、系统提示词（两次压缩之间保持不变）和工作目录。
-- **标题**来自第一条用户消息（清理、限长，并用 `#2` … `#9` 保证唯一），带有等级（`derived` < `llm` < `user`），
-  用户设置的标题不会被低等级的标题覆盖。
+- **标题**来自第一条用户消息（清理、限长），然后在第一次完成的 run 之后由模型再取一个。重名用 `#2`、`#3`、… 区分，
+  没有上限。带有等级（`derived` < `llm` < `user`），用户设置的标题不会被低等级的标题覆盖。
 - **图片**（PNG、JPEG、GIF、WebP；每个 run 最多 4 张，每张 5 MiB，在解码前先检查长度）以 blob 存储；消息里只保留
   引用，构建模型请求时才加载字节。blob 丢失时会变成文本 `[image no longer available]`。不支持视觉的模型会拒绝图片。
 

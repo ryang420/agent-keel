@@ -24,7 +24,9 @@ from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy
 from keel.skills import discover_skills
 from keel.store.base import Event, Run, StoredMessage, TitleInUse
-from keel.titles import derive_title, title_candidates
+from keel.titles import (
+    MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
+)
 from keel.tools import ToolContext, ToolOutcome, run_tool
 from keel.tools.base import preview_for
 
@@ -80,11 +82,12 @@ class RunExecutor:
     def __init__(self, store, bus, providers: ProviderRegistry, *, sandbox=None, sleep=asyncio.sleep,
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None, kill_timeout_s: float = 10.0,
                  skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC),
-                 compression_threshold: float = 0.75) -> None:
+                 compression_threshold: float = 0.75, background=None) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
         self.sandbox = sandbox
+        self.background = background
         self.max_iterations = max_iterations
         self.mount_root = mount_root
         self.kill_timeout_s = kill_timeout_s
@@ -310,6 +313,7 @@ class RunExecutor:
                 await self._finish(run, "completed", output=output, usage=state.usage, event="run.completed",
                                    data={"output": output, "usage": state.usage.to_dict(),
                                          **({"incomplete": True} if incomplete else {})})
+                await self._maybe_title(run)
                 return
             for call in calls:
                 outcome, duration, preview = await self._call_tool(run, call, ctx, state)
@@ -454,10 +458,45 @@ class RunExecutor:
         title = derive_title(user.text)
         if not title:
             return
-        for candidate in title_candidates(title):
+        for candidate in title_candidates(title, limit=TITLE_LIMIT):
             try:
                 await self.store.set_title(run.profile_id, run.session_id, candidate, "derived")
                 return
             except TitleInUse:
                 continue
-        # Ten sessions already share this title; the model title (M3) will name this one.
+
+    async def _maybe_title(self, run: Run) -> None:
+        """After the first completed run, ask the model to name a session that still has a derived title."""
+        if self.background is None:
+            return
+        session = await self.store.get_session(run.profile_id, run.session_id)
+        if session is None or session.title_source in ("user", "llm"):
+            return
+        earlier = await self.store.completed_run_count(run.session_id, except_id=run.id)
+        if earlier:
+            return
+        text = " ".join(part.get("text", "") for part in run.input if part.get("type") == "text")[:TITLE_INPUT_CHARS]
+        if not text.strip():
+            return
+        self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}")
+
+    async def _title(self, run: Run, text: str) -> None:
+        """One model call, no tools and no events. A bad reply or a provider error leaves the derived title."""
+        provider = self.providers.get(run.provider)
+        request = ModelRequest(
+            provider=run.provider, model=run.model, system=prompts.text("title"),
+            messages=(Message("user", (TextPart(text),)),), tools=(), reasoning_effort="low",
+            max_output_tokens=512, cache_scope="")
+        chunks: list[str] = []
+        async for event in stream_with_retries(provider, request, sleep=self._sleep):
+            if isinstance(event, TextDelta):
+                chunks.append(event.text)
+        title = parse_model_title("".join(chunks))
+        if not title:
+            return
+        for candidate in title_candidates(title, limit=MODEL_TITLE_LIMIT):
+            try:
+                await self.store.set_title(run.profile_id, run.session_id, candidate, "llm")
+                return
+            except TitleInUse:
+                continue

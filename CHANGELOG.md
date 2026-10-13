@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- A session's first completed run may replace its derived title with a short model title (`title_source` `llm`).
+  A user rename still wins, and a reply that is empty, vague, or not a short title keeps the derived one. Numbered
+  suffixes (`#2`, `#3`, …) are no longer capped.
 - Best-effort background tasks for work that must not belong to a run. `KEEL_BACKGROUND_LIMIT` (default 4) caps how
   many run at once; a task past the limit is dropped and logged, and tasks are cancelled only at shutdown.
   `KEEL_MEMORY_REVIEW_TURNS` (10), `KEEL_MEMORY_CHARS` (2200) and `KEEL_USER_CHARS` (1375) are read at start.
