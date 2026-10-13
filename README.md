@@ -57,7 +57,7 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 - Sessions with stored messages, titles, and a persistent working directory.
 - Image input (PNG, JPEG, GIF, WebP) for vision-capable models.
 - Replayable SSE events and a stop endpoint that kills the running command.
-- Postgres (workers with LISTEN/NOTIFY wake-ups) or SQLite; run a single instance for now.
+- Postgres (workers with LISTEN/NOTIFY wake-ups; several instances can share one database) or SQLite (one instance).
 - Per-run limits: iteration cap, run lease, and an in-flight cap that answers 429.
 
 ## Documentation
@@ -75,7 +75,6 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 
 Pre-1.0 (0.2.0). The API and the database schema may change between releases. A database is upgraded in place at
 start (numbered migrations); a database written by a newer keel is refused. Back up the database before upgrading.
-Run a single instance for now: the Postgres LISTEN connection does not yet reconnect on its own.
 
 ## Development
 

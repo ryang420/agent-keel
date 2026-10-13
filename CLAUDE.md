@@ -70,13 +70,14 @@ CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an 
 
 ## Status and next milestone
 
-- 0.2.0 (M1 + M2) is released. Known limits: run a single instance (the Postgres LISTEN connection is not
-  reconnected); no schema migrations yet (databases are disposable between versions).
+- 0.2.0 (M1 + M2) is released. M3 so far (unreleased): numbered schema migrations, context compression, and
+  reliability (LISTEN reconnect, lease-derived database timeout, orphan removal that spares runs in flight, a lost
+  worker's command killed, run-event pruning, fault-injection tests).
 - **M3** (`docs/design/2026-10-12-m3-reliability-memory-compression.md`): numbered schema migrations (a 0.2.0
   database upgrades in place), context compression (at ~75% of the window or on `context_overflow`; the summary is
   kept in place on the same session), run-event pruning, model-generated titles (precedence user > llm > derived, `#N` on collision), the `memory` tool with
   per-session snapshots and background review, plus fault-injection tests (kill a worker, delete a sandbox, provider
   5xx) and a long-session eval. Stop and image input were already done in M2.
 - Deferred items worth picking up with M3: images are replayed in full on later turns; the final iteration-cap call
-  sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; LISTEN reconnect;
-  `schema_version` migrations; shutdown hands a running command's cleanup to the executor's cancel path.
+  sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
+  hands a running command's cleanup to the executor's cancel path.

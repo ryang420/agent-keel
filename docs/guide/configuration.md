@@ -8,14 +8,15 @@ an invalid value stops the service at start with a message naming the variable.
 | Variable | Default | Meaning |
 |---|---|---|
 | `KEEL_API_KEY` | required | The bearer key every caller sends (`Authorization: Bearer <key>`). |
-| `KEEL_DATABASE_URL` | required | `postgresql://…` (or `postgres://…`) or `sqlite:///path`. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). Run a single instance for now: the LISTEN connection does not yet reconnect on its own. |
+| `KEEL_DATABASE_URL` | required | `postgresql://…` (or `postgres://…`) or `sqlite:///path`. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). A lost LISTEN connection is reconnected with backoff; several instances can share one database. |
 | `KEEL_HOST` | `0.0.0.0` | Listen address. |
 | `KEEL_PORT` | `8700` | Listen port. If you change it, change the image's `HEALTHCHECK` too. |
 | `KEEL_WORKERS` | `4` | Runs executed at the same time by this instance. |
 | `KEEL_MAX_RUNNING` | `10` | Queued plus running runs allowed across all instances. A new run over the cap gets 429 `at_capacity`. |
-| `KEEL_LEASE_SECONDS` | `30` | Run lease. A worker renews it while it runs; a run whose lease lapses fails as `worker_lost`. |
+| `KEEL_LEASE_SECONDS` | `30` | Run lease. A worker renews it while it runs; a run whose lease lapses fails as `worker_lost`. Postgres queries time out after a third of the lease (at least 5 s), so one stalled query cannot outlast a renewal. |
 | `KEEL_MAX_ITERATIONS` | `60` | Tool iterations one run may take. After that, one final model call without tools asks for a summary (so at most N + 1 model calls). |
 | `KEEL_COMPRESSION_THRESHOLD` | `0.75` | Fraction of the model's context window at which a session is compacted before the next model call: old tool results and images are replaced by placeholders, and if that is not enough the middle of the conversation is summarized. Above 0, at most 1. |
+| `KEEL_EVENT_RETENTION_DAYS` | `7` | Days a finished run's events are kept, a positive integer. An hourly task deletes older ones (runs, their output and messages are kept). |
 
 ## Sandbox
 
@@ -25,7 +26,7 @@ an invalid value stops the service at start with a message naming the variable.
 | `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (checked about once a minute). |
 | `KEEL_SANDBOX_MOUNT_ROOT` | unset | Absolute path prefix. When set, every `mounts[].source` in a profile policy must be under it. When unset, any host path is allowed. |
 | `KEEL_DOCKER` | `docker` | The docker CLI to run. |
-| `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. At start, containers carrying this label are removed, so it must be unique per deployment that shares a Docker daemon. |
+| `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. At start, containers carrying this label are removed (except those of profiles with a run in flight), so it must be unique per deployment that shares a Docker daemon. |
 
 See [sandbox.md](sandbox.md) for the profile's sandbox policy.
 
@@ -44,4 +45,5 @@ See [providers.md](providers.md).
 ## Tests
 
 These are read by the test suite, not the service: `KEEL_TEST_DOCKER=1` (with `KEEL_TEST_DOCKER_IMAGE`),
-`KEEL_TEST_POSTGRES_DSN`, `KEEL_LIVE_BEDROCK=1`, `KEEL_LIVE_OPENAI=1`.
+`KEEL_TEST_POSTGRES_DSN`, `KEEL_TEST_SUBPROCESS=1` (starts and kills real server processes), `KEEL_LIVE_BEDROCK=1`,
+`KEEL_LIVE_OPENAI=1`.

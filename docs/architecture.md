@@ -5,8 +5,7 @@
 agent-keel as it is built today: a stateless HTTP service that runs agent loops. A client starts a **run**; a
 worker claims it, calls a model, runs the tools the model asks for inside a per-profile Docker sandbox, and commits
 every step to a database; the client follows the run as a replayable stream of events. Any number of identical
-instances can share one Postgres database (see [§15](#15-known-limits) for the single-instance caveat that applies
-today).
+instances can share one Postgres database.
 
 This page explains how the parts fit together. For how to use them, read the [guides](guide/quickstart.md); for the
 reasoning behind the design, read [design/2026-10-11-architecture.md](design/2026-10-11-architecture.md) and
@@ -232,7 +231,7 @@ refused run leaves no empty session and no orphan blob behind.
 
 ## 5. Workers, leases and recovery
 
-`WorkerPool` starts `KEEL_WORKERS` worker loops and one sweeper.
+`WorkerPool` starts `KEEL_WORKERS` worker loops, one sweeper and one maintenance task.
 
 **Claiming.** `claim_run` is one `UPDATE … WHERE id = (SELECT … WHERE status = 'queued' ORDER BY created_at LIMIT 1
 FOR UPDATE SKIP LOCKED)`. On Postgres, instances never claim the same run. A worker that finds nothing sleeps
@@ -240,7 +239,8 @@ FOR UPDATE SKIP LOCKED)`. On Postgres, instances never claim the same run. A wor
 
 **Leases.** The claim sets `lease_expires_at` to now + `KEEL_LEASE_SECONDS` (30 s). While the run executes, the
 worker wakes every third of the lease, re-reads the run, and renews the lease. The renew only succeeds for the owner
-and for a run still `running` or `stopping`.
+and for a run still `running` or `stopping`. Every Postgres query times out after a third of the lease (at least
+5 s; 10 s by default), so one stalled query cannot use up the lease of the run waiting on it.
 
 **Stop.** `POST …/stop` cancels a `queued` run on the spot (and emits `run.cancelled`), or moves a `running` run to
 `stopping` and notifies the key `stop:<run_id>`. The worker sees it through that wake-up or on its next renewal,
@@ -248,8 +248,15 @@ cancels the executor task, and the executor's cancel path does the rest: kill th
 close the open tool call, store a "cancelled" result for each tool call that has none, finish the run `cancelled`.
 
 **Dead workers.** The sweeper runs every lease interval and marks any `running` or `stopping` run whose lease has
-lapsed as `failed` with `error_code: worker_lost`, on whichever instance sweeps first. A worker whose renewal fails
-until its own deadline gives the run up to the sweeper.
+lapsed as `failed` with `error_code: worker_lost`, on whichever instance sweeps first. It emits `run.failed` for every
+expired run first, so a slow sandbox cannot delay the terminal events, and then kills the command each dead worker
+left running (it reaches the profile's container and kills the process group of `runs.current_exec_id`). The column
+is cleared whether or not the kill worked. A worker whose renewal fails until its own deadline gives the run up to
+the sweeper.
+
+**Old events.** Every hour the maintenance task deletes the events of runs finished more than
+`KEEL_EVENT_RETENTION_DAYS` (7) days ago, 10,000 rows per statement so no pass holds a long transaction. Runs, their
+output and the sessions' messages are kept. Passes on several instances may overlap; that is harmless.
 
 **Shutdown.** The pool stops claiming, gives runs in flight 4 s to finish, then fails what remains as `worker_lost`
 (not `cancelled`, which is what a user's stop looks like). The service then removes nothing: leftover sandbox
@@ -348,7 +355,8 @@ sequenceDiagram
 - **No race between reading and waiting.** The handler takes the waiter *before* reading the store, so a notify that
   lands in between is not lost.
 - **The terminal event is awaited.** The run row turns terminal slightly before its terminal event is appended; the
-  stream waits up to 5 s for it before it closes.
+  stream waits up to 5 s for it before it closes. A run that finished more than a minute ago with nothing after the
+  cursor closes the stream at once: its events were pruned, or the client is already past the terminal event.
 - **A wake-up is advisory.** A notify that fails is logged and never raised, and readers also re-read the store on a
   timeout, so the worst case of a lost notify is latency.
 
@@ -357,8 +365,9 @@ sequenceDiagram
 `InMemoryEventBus` is a dictionary of `asyncio.Event` keyed by run id (and `stop:<run id>`); it serves one instance
 and the tests. `PostgresEventBus` adds `LISTEN`/`pg_notify` on one channel (`keel_events`, the key as payload), so a
 notify on one instance wakes a reader on another. It needs two direct connections (one to listen, one to send); a
-transaction-mode pooler such as RDS Proxy pins or drops `LISTEN`. If the listen connection is lost it logs an error
-and cross-instance wake-ups fall back to polling (see [§15](#15-known-limits)).
+transaction-mode pooler such as RDS Proxy pins or drops `LISTEN`. If the listen connection is lost, cross-instance
+wake-ups fall back to polling while it is reconnected with backoff (0.5 s, doubling up to 30 s). Once it is back,
+every waiter is woken, because a notify sent meanwhile was lost; each reader then re-reads the store.
 
 ---
 
@@ -409,11 +418,14 @@ flowchart LR
   use one profile per tenant.
 - **Idle reaping.** A background task runs every 60 s and removes containers idle for `KEEL_SANDBOX_IDLE_SECONDS`
   (default 30 min) that are running nothing. The next run recreates one.
-- **Leftovers.** At start, `remove_orphans` removes every container labelled for this deployment. That is safe only
-  while one instance runs (see [§15](#15-known-limits)).
+- **Leftovers.** At start, `remove_orphans` removes the containers labelled for this deployment, except those of
+  profiles with a run queued, running or stopping on any instance, so it is safe with several instances. A run
+  claimed elsewhere between that query and `docker rm` can lose its container; the exec path recreates a vanished
+  container once. A removed idle container is recreated on its next use.
 - **Killing a command.** Stopping a run kills the command's process group inside the container: `TERM`, a 3 s grace
   period, then `KILL`, and finally the `docker exec` client itself. Killing only the client would leave the command
-  running. The id of the current command is kept in `runs.current_exec_id` for the kill.
+  running. The id of the current command is kept in `runs.current_exec_id` for the kill and cleared after it; the
+  sweeper uses it to kill a lost worker's command ([§5](#5-workers-leases-and-recovery)).
 - **Secrets stay off the command line.** Policy `env` goes through a private temporary `--env-file` (mode 0600, in a
   0700 directory, deleted right after), so values never appear in `ps`.
 
@@ -570,7 +582,7 @@ flowchart LR
 - **Development:** SQLite and, if you do not need isolation, `KEEL_SANDBOX=none` (chat only) or the host-process
   backend in tests.
 - **Scaling out** is what the design is for (stateless workers, claims with `SKIP LOCKED`, cross-instance wake-ups),
-  but see the limits below before running more than one instance.
+  and several instances can share one Postgres database (SQLite serves one instance).
 
 Configuration is entirely environment variables, validated at start (`config.py`); the list is in the
 [configuration guide](guide/configuration.md).
@@ -597,9 +609,6 @@ The reporting policy for vulnerabilities is in [SECURITY.md](../SECURITY.md).
 
 ## 15. Known limits
 
-- **Run a single instance for now.** The Postgres `LISTEN` connection does not reconnect on its own (cross-instance
-  wake-ups then fall back to polling), and `remove_orphans` at start removes every sandbox of the deployment, which
-  would break a second instance's runs.
 - **Not built:** long-term memory, scheduled jobs, approvals, web search or browsing, MCP servers, agent-written
   skills, a provider for Anthropic's own API.
 - **Postgres needs direct connections** for `LISTEN`; a transaction-mode pooler will not do.
@@ -616,6 +625,7 @@ loop on a fake provider and the host-process sandbox. Opt-in suites switch on wi
 |---|---|
 | `KEEL_TEST_POSTGRES_DSN` | the store and event-bus tests on Postgres |
 | `KEEL_TEST_DOCKER=1` | the Docker sandbox against a real daemon (`KEEL_TEST_DOCKER_IMAGE` picks the image) |
+| `KEEL_TEST_SUBPROCESS=1` | a server process killed with `SIGKILL` and restarted (fault injection) |
 | `KEEL_LIVE_BEDROCK=1` with `KEEL_TEST_DOCKER=1` | one real model run that calls `terminal` in a sandbox |
 
 CI runs the suite, the Postgres tests, the Docker sandbox tests and an image build on every push.

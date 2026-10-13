@@ -4,8 +4,7 @@
 
 本文描述 agent-keel 当前的实现：一个无状态的 HTTP 服务，负责运行 agent 循环。客户端发起一次 **run**（一次运行）；
 worker 认领它，调用模型，把模型要求的工具放进该 profile 专属的 Docker 沙箱里执行，并把每一步都写入数据库；客户端
-则以可重放的事件流跟踪这次运行。任意数量的相同实例可以共用一个 Postgres 数据库（目前适用的单实例限制见
-[§15](#15-已知限制)）。
+则以可重放的事件流跟踪这次运行。任意数量的相同实例可以共用一个 Postgres 数据库。
 
 本文解释各部分如何协作。使用方法请看[各指南](guide/quickstart.md)；设计背后的理由请看
 [design/2026-10-11-architecture.md](design/2026-10-11-architecture.md) 和
@@ -223,7 +222,7 @@ sequenceDiagram
 
 ## 5. Worker、租约与恢复
 
-`WorkerPool` 启动 `KEEL_WORKERS` 个 worker 循环和一个清扫器。
+`WorkerPool` 启动 `KEEL_WORKERS` 个 worker 循环、一个清扫器和一个维护任务。
 
 **认领。** `claim_run` 是一条 `UPDATE … WHERE id = (SELECT … WHERE status = 'queued' ORDER BY created_at LIMIT 1
 FOR UPDATE SKIP LOCKED)`。在 Postgres 上，各实例不会认领到同一个 run。worker 找不到任务时休眠 0.5 秒（或等到
@@ -231,6 +230,7 @@ FOR UPDATE SKIP LOCKED)`。在 Postgres 上，各实例不会认领到同一个 
 
 **租约。** 认领时把 `lease_expires_at` 设为当前时间加 `KEEL_LEASE_SECONDS`（30 秒）。run 执行期间，worker 每过
 租约的三分之一就醒来，重新读取 run 并续租。只有租约的持有者、且 run 仍为 `running` 或 `stopping` 时，续租才会成功。
+每条 Postgres 查询的超时是租约的三分之一（至少 5 秒；默认 10 秒），所以一条卡住的查询不会耗尽正在等它的 run 的租约。
 
 **停止。** `POST …/stop` 会立刻取消 `queued` 的 run（并发出 `run.cancelled`），或把 `running` 的 run 改为
 `stopping` 并通知键 `stop:<run_id>`。worker 通过这次唤醒或下一次续租发现它，取消执行器任务，其余交给执行器的取消
@@ -238,8 +238,13 @@ FOR UPDATE SKIP LOCKED)`。在 Postgres 上，各实例不会认领到同一个 
 `cancelled`。
 
 **worker 死亡。** 清扫器每隔一个租约周期运行一次，把租约已过期的 `running` 或 `stopping` run 标记为 `failed`，
-`error_code` 为 `worker_lost`，由最先清扫到的那个实例完成。如果某个 worker 的续租一直失败到自身的截止时间，就把该
-run 交给清扫器处理。
+`error_code` 为 `worker_lost`，由最先清扫到的那个实例完成。它先为每个过期的 run 发出 `run.failed`，这样缓慢的沙箱
+不会拖延终止事件；然后终止每个死掉的 worker 留下仍在运行的命令（找到该 profile 的容器，终止
+`runs.current_exec_id` 的进程组）。无论终止是否成功，这一列都会被清空。如果某个 worker 的续租一直失败到自身的
+截止时间，就把该 run 交给清扫器处理。
+
+**旧事件。** 维护任务每小时删除一次结束时间早于 `KEEL_EVENT_RETENTION_DAYS`（7）天的 run 的事件，每条语句删除
+10,000 行，这样每一轮都不会持有长事务。run 本身、它的输出和会话的消息都会保留。多个实例上的清理可能重叠，这无害。
 
 **关闭。** worker 池停止认领，给进行中的 run 4 秒时间完成，剩下的标记为 `worker_lost`（而不是 `cancelled`，
 `cancelled` 是用户主动停止的样子）。服务此时不清理任何容器：遗留的沙箱容器在下次启动时清理。
@@ -329,6 +334,7 @@ sequenceDiagram
   也不会因为断开连接而让某个队列被分离。
 - **读取与等待之间没有竞态。** 处理器在读取存储*之前*先取得 waiter，所以夹在中间的 notify 不会丢失。
 - **会等待终止事件。** run 行会比它的终止事件稍早一点变为终止状态；流在关闭前最多等待 5 秒来等这个事件。
+  如果 run 在一分钟之前就已结束，且游标之后没有事件，流会立即关闭：它的事件已被清理，或者客户端已经越过了终止事件。
 - **唤醒只是辅助。** notify 失败只记录日志，不会抛出；读取方还会按超时重新读取存储，所以 notify 丢失的最坏后果只是延迟。
 
 ### 总线
@@ -336,7 +342,8 @@ sequenceDiagram
 `InMemoryEventBus` 是以 run id（以及 `stop:<run id>`）为键的 `asyncio.Event` 字典，服务于单个实例和测试。
 `PostgresEventBus` 在其上增加了在一个通道（`keel_events`，键作为负载）上的 `LISTEN`/`pg_notify`，所以一个实例上的
 notify 可以唤醒另一个实例上的读取方。它需要两个直连（一个监听，一个发送）；事务模式的连接池（例如 RDS Proxy）
-会固定或丢弃 `LISTEN`。如果监听连接丢失，它会记录一条错误，跨实例的唤醒退回到轮询（见 [§15](#15-已知限制)）。
+会固定或丢弃 `LISTEN`。如果监听连接丢失，在以退避方式重连期间（0.5 秒起，每次翻倍，最多 30 秒），跨实例的唤醒
+退回到轮询。连接恢复后会唤醒所有 waiter，因为期间发出的 notify 已经丢失；每个读取方随后重新读取存储。
 
 ---
 
@@ -386,11 +393,12 @@ flowchart LR
   工作目录，但不会在容器内把一个会话与另一个会话隔离开；如果这很重要，请为每个租户使用一个 profile。
 - **空闲回收。** 后台任务每 60 秒运行一次，删除闲置达到 `KEEL_SANDBOX_IDLE_SECONDS`（默认 30 分钟）且没有命令在
   运行的容器。下一次 run 会重新创建。
-- **遗留容器。** 启动时，`remove_orphans` 会删除所有带有本部署标签的容器。这只在只运行一个实例时才安全
-  （见 [§15](#15-已知限制)）。
+- **遗留容器。** 启动时，`remove_orphans` 会删除带有本部署标签的容器，但保留那些在任一实例上有 queued、running
+  或 stopping 状态 run 的 profile 的容器，所以多个实例时也是安全的。如果某个 run 恰好在这次查询与 `docker rm`
+  之间被别的实例认领，它可能会失去容器；执行路径会把消失的容器重建一次。被删除的空闲容器会在下次使用时重建。
 - **终止命令。** 停止 run 时，会终止容器内该命令的进程组：先 `TERM`，等 3 秒宽限期，再 `KILL`，最后连
   `docker exec` 客户端本身也杀掉。只杀客户端会让命令继续运行。当前命令的 id 保存在 `runs.current_exec_id` 中，
-  供终止时使用。
+  供终止时使用，终止后清空；清扫器也用它来终止失联 worker 留下的命令（[§5](#5-worker租约与恢复)）。
 - **密钥不出现在命令行。** 策略里的 `env` 通过一个私有的临时 `--env-file` 传入（权限 0600，位于 0700 目录，用完
   立即删除），所以这些值不会出现在 `ps` 里。
 
@@ -532,8 +540,8 @@ flowchart LR
 - **目前的生产形态：** 一个 keel 容器加 Postgres，并挂载宿主机的 Docker socket 来运行沙箱。每个沙箱加入你选定的网络；
   keel 的数据库应放在沙箱无法访问的网络上。
 - **开发：** SQLite；如果不需要隔离，用 `KEEL_SANDBOX=none`（仅聊天），测试中则使用宿主进程后端。
-- **横向扩展**正是这个设计的目标（无状态 worker、用 `SKIP LOCKED` 认领、跨实例唤醒），但在运行多个实例之前，
-  请先看下面的限制。
+- **横向扩展**正是这个设计的目标（无状态 worker、用 `SKIP LOCKED` 认领、跨实例唤醒），多个实例可以
+  共用一个 Postgres 数据库（SQLite 只服务一个实例）。
 
 配置完全由环境变量提供，启动时校验（`config.py`）；变量列表见[配置指南](guide/configuration.md)。
 
@@ -558,8 +566,6 @@ flowchart LR
 
 ## 15. 已知限制
 
-- **目前只运行一个实例。** Postgres 的 `LISTEN` 连接不会自行重连（跨实例唤醒随后退回到轮询），而且启动时的
-  `remove_orphans` 会删除该部署的所有沙箱，这会破坏第二个实例上正在进行的 run。
 - **尚未实现：** 长期记忆、定时任务、审批、网页搜索或浏览、MCP 服务器、agent 自己编写的 skills、Anthropic 官方
   API 的 provider。
 - **Postgres 需要直连**以支持 `LISTEN`；事务模式的连接池不行。
@@ -576,6 +582,7 @@ flowchart LR
 |---|---|
 | `KEEL_TEST_POSTGRES_DSN` | 在 Postgres 上运行的存储和事件总线测试 |
 | `KEEL_TEST_DOCKER=1` | 针对真实守护进程的 Docker 沙箱（`KEEL_TEST_DOCKER_IMAGE` 指定镜像） |
+| `KEEL_TEST_SUBPROCESS=1` | 用 `SIGKILL` 杀掉一个服务进程再重启（故障注入） |
 | `KEEL_LIVE_BEDROCK=1` 加 `KEEL_TEST_DOCKER=1` | 一次真实的模型运行，在沙箱里调用 `terminal` |
 
 CI 在每次推送时运行测试套件、Postgres 测试、Docker 沙箱测试和镜像构建。

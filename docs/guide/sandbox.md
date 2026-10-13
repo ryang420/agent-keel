@@ -68,6 +68,16 @@ change the docker client's own environment.
 One container serves a profile and is reused across runs and sessions; if the policy changes, a new container
 replaces it once no command is running in the old one. A container idle for `KEEL_SANDBOX_IDLE_SECONDS` is removed.
 
+## Leftovers and lost workers
+
+At start, keel removes this deployment's containers (those labelled with its `KEEL_DEPLOYMENT`), except those of
+profiles with a run queued, running or stopping on any instance, so a restart does not pull a container from under
+a run another instance is executing. A removed container is created again on its next use.
+
+When a worker is lost (its instance crashed or stalled and the run's lease lapsed), the run fails as `worker_lost`
+and the command it left running is killed: keel reaches the profile's container (creating it if needed) and kills
+the command's whole process group.
+
 ## The Docker socket
 
 The service starts containers by running the docker CLI against the Docker daemon. Giving it the Docker socket is

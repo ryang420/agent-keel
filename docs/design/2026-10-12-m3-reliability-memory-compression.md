@@ -58,11 +58,16 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
   (a third of it, minimum 5 s) and documented in `docs/guide/configuration.md`.
 - **Orphan removal at start.** `remove_orphans` removes every container carrying this deployment's label, whether or
   not a run uses it. M3 asks the store for profiles with an in-flight run and leaves those containers alone. With the
-  reconnect, this removes the single-instance caveat from the README.
+  reconnect, this removes the single-instance caveat from the README. A race is accepted: a run claimed on another
+  instance between the in-flight query and `docker rm` can lose its container, and the exec path already recreates a
+  vanished container once; removing an idle profile's container is harmless (it is recreated on next use).
 - **A dead worker's command.** `runs.current_exec_id` is written and never read. When the sweeper marks a run
   `worker_lost`, it makes a best-effort `kill_tree` on that exec (`ensure`, then `kill_tree`), so a command started
   by a dead worker does not run on. The column is cleared when a command ends. Failure to reach the sandbox is
-  logged and does not block the sweep.
+  logged and does not block the sweep. The sweeper emits `run.failed` for every expired run first and only then
+  kills the commands, so a slow or unreachable sandbox never delays the terminal events; `kill_orphaned_command`
+  never raises and clears `current_exec_id` whether or not the kill worked (the run is terminal). The stop path
+  clears the column too, once it has killed the command.
 - **Schema migrations.** M3 adds columns and tables, and `CREATE TABLE IF NOT EXISTS` does not add columns to an old
   table. M3 replaces "create if missing" with numbered migrations (below), so a 0.2.0 database is upgraded in place
   and later releases can change the schema without a fresh database.
@@ -71,6 +76,10 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
   of 10,000 rows so one pass never holds a long transaction. The run row, its output and usage, and the session's
   messages are kept. Streaming a pruned run sends no events and closes; a client reads the run with
   `GET …/runs/{id}`. On several instances the passes may overlap; deleting rows that are already gone is harmless.
+  The stream closes at once, without the 5 s wait for a late terminal event, when the run is terminal, nothing
+  follows the cursor and the run finished more than 60 s ago by the store's clock (a margin well above the grace,
+  for clock skew between instances). That covers a pruned run and a client reconnecting past the terminal event.
+  The retention is a positive number of days; pruning cannot be switched off.
 
 ### Schema migrations
 
@@ -107,7 +116,9 @@ subclasses the existing tests use.
 | Container removed between two tool calls (`KEEL_TEST_DOCKER=1`) | The next call recreates the container and succeeds |
 | Server process killed with `SIGKILL` on a SQLite file, restarted (opt-in) | The run ends `worker_lost` after the lease; a new run in the same session succeeds |
 
-The Postgres CI job gains these files, and the table drop list in `tests/conftest.py` gains the new tables.
+The container case is opt-in with `KEEL_TEST_DOCKER=1`. The `SIGKILL` case starts real server processes, so it is
+opt-in with `KEEL_TEST_SUBPROCESS=1`, which CI's default test job sets. The Postgres CI job gains these files, and the
+table drop list in `tests/conftest.py` gains the new tables.
 
 ## 2. Background tasks
 

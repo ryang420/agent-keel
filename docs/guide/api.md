@@ -114,6 +114,9 @@ below. Events are stored: pass `after=<last seq>` to resume without losing or re
 
 `run.completed`, `run.failed` and `run.cancelled` are terminal.
 
+The events of a run finished more than `KEEL_EVENT_RETENTION_DAYS` ago are deleted. Streaming such a run sends
+nothing and closes; read the run itself with `GET /v1/profiles/{p}/runs/{id}`.
+
 `context.compacted` means a long session's earlier turns were summarized before a model call; the transcript itself
 is unchanged. A client should ignore event types it does not know.
 
