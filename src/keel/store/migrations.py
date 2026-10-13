@@ -80,7 +80,11 @@ CREATE TABLE memories (
 CREATE INDEX runs_finished ON runs (finished_at);
 """
 
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1), Migration(2, _V2))
+_V3 = """
+ALTER TABLE sessions ADD COLUMN pruned_id {bigint};
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1), Migration(2, _V2), Migration(3, _V3))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

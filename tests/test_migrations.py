@@ -255,6 +255,7 @@ async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
         assert (session.summary, session.summary_head_id, session.summary_tail_id) == (None, None, None)
         assert (session.context_tokens, session.context_message_id, session.compaction_failed_at) == (None, None, None)
         assert session.turns_since_memory == 0
+        assert session.pruned_id is None
         await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
                                "p1", "user", "[]", 1.0)
         assert (await store.db.fetchrow("SELECT entries FROM memories WHERE profile_id = ?", "p1"))["entries"] == "[]"

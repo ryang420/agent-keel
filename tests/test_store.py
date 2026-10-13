@@ -232,3 +232,23 @@ async def test_the_current_exec_is_recorded(store):
     assert (await store.get_run("p1", run.id)).current_exec_id == "x1"
     await store.set_current_exec(run.id, None)
     assert (await store.get_run("p1", run.id)).current_exec_id is None
+
+
+async def test_compaction_state_is_stored_and_cleared(store):
+    await store.ensure_session("p1", "s1")
+    await store.set_session_prompt("s1", "OLD", "fake", "m")
+    await store.set_context_anchor("s1", 1_234, 7)
+    session = await store.get_session("p1", "s1")
+    assert (session.context_tokens, session.context_message_id, session.pruned_id) == (1_234, 7, None)
+    await store.set_pruned("s1", 9, failed_at=55.0)
+    session = await store.get_session("p1", "s1")
+    assert (session.pruned_id, session.context_tokens, session.context_message_id) == (9, None, None)
+    assert session.compaction_failed_at == 55.0
+    await store.set_context_anchor("s1", 99, 10)
+    await store.set_pruned("s1", 11)
+    session = await store.get_session("p1", "s1")
+    assert (session.pruned_id, session.context_tokens, session.compaction_failed_at) == (11, None, 55.0)
+    await store.compact_session("s1", summary="SUM", head_id=3, tail_id=12, system_prompt="NEW")
+    session = await store.get_session("p1", "s1")
+    assert (session.summary, session.summary_head_id, session.summary_tail_id, session.pruned_id) == ("SUM", 3, 12, 12)
+    assert (session.system_prompt, session.context_tokens, session.compaction_failed_at) == ("NEW", None, None)

@@ -38,6 +38,7 @@ def _session(row: dict) -> Session:
         summary=row["summary"], summary_head_id=row["summary_head_id"], summary_tail_id=row["summary_tail_id"],
         context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
         compaction_failed_at=row["compaction_failed_at"], turns_since_memory=row["turns_since_memory"],
+        pruned_id=row["pruned_id"],
     )
 
 
@@ -137,6 +138,28 @@ class SqlStore:
 
     async def set_session_cwd(self, session_id: str, cwd: str) -> None:
         await self.db.execute("UPDATE sessions SET cwd = ? WHERE id = ?", cwd, session_id)
+
+    async def set_context_anchor(self, session_id: str, tokens: int, message_id: int) -> None:
+        """The input tokens the provider reported for the session's last model call, and the newest message in it."""
+        await self.db.execute("UPDATE sessions SET context_tokens = ?, context_message_id = ? WHERE id = ?",
+                              tokens, message_id, session_id)
+
+    async def set_pruned(self, session_id: str, pruned_id: int, *, failed_at: float | None = None) -> None:
+        """Move the placeholder boundary; the estimate anchor no longer matches what is sent, so it is cleared.
+        `failed_at` records a failed summary call."""
+        await self.db.execute(
+            "UPDATE sessions SET pruned_id = ?, context_tokens = NULL, context_message_id = NULL, "
+            "compaction_failed_at = COALESCE(?, compaction_failed_at) WHERE id = ?",
+            pruned_id, failed_at, session_id)
+
+    async def compact_session(self, session_id: str, *, summary: str, head_id: int, tail_id: int,
+                              system_prompt: str) -> None:
+        """Record a compaction. Unlike set_session_prompt, this overwrites the system prompt."""
+        await self.db.execute(
+            "UPDATE sessions SET summary = ?, summary_head_id = ?, summary_tail_id = ?, pruned_id = ?, "
+            "system_prompt = ?, context_tokens = NULL, context_message_id = NULL, compaction_failed_at = NULL "
+            "WHERE id = ?",
+            summary, head_id, tail_id, tail_id, system_prompt, session_id)
 
     async def set_title(self, profile_id: str, session_id: str, title: str, source: str) -> Session:
         async with self.db.transaction():
