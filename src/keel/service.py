@@ -35,7 +35,7 @@ def default_providers(settings: Settings) -> ProviderRegistry:
 
 
 async def build(settings: Settings, *, providers: ProviderRegistry | None = None):
-    store = await open_store(settings.database_url)
+    store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout)
     bus = PostgresEventBus(settings.database_url) if settings.is_postgres else InMemoryEventBus()
     await bus.start()
     registry = providers or default_providers(settings)

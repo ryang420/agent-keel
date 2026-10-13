@@ -78,6 +78,12 @@ class Settings:
     def is_postgres(self) -> bool:
         return self.database_url.startswith(("postgresql://", "postgres://"))
 
+    @property
+    def db_command_timeout(self) -> float:
+        """A third of the lease, at least 5 s: one stalled query must not outlast a lease renewal and get a live
+        run swept."""
+        return max(5.0, self.lease_seconds / 3)
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if env is None else env

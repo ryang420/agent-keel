@@ -87,3 +87,25 @@ async def test_openai_is_registered_only_when_a_key_is_set(tmp_path):
     finally:
         await without.aclose()
         await with_key.aclose()
+
+
+async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monkeypatch):
+    from keel import service
+
+    seen = {}
+    real = service.open_store
+
+    async def spy(url, **kwargs):
+        seen.update(kwargs)
+        return await real(url)
+
+    monkeypatch.setattr(service, "open_store", spy)
+    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
+                        lease_seconds=60)
+    keel, pool, closables, backend = await service.build(settings)
+    try:
+        assert seen == {"command_timeout": 20.0}
+    finally:
+        for item in closables:
+            close = getattr(item, "aclose", None) or getattr(item, "close")
+            await close()

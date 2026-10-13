@@ -25,3 +25,17 @@ async def test_instances_starting_together_do_not_race_on_the_schema():
     for store in stores:
         assert await store.ping()
         await store.close()
+
+
+async def test_connect_passes_the_command_timeout_to_the_pool(monkeypatch):
+    from keel.store import postgres
+
+    seen = {}
+
+    async def fake_pool(dsn, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(postgres.asyncpg, "create_pool", fake_pool)
+    await postgres.PostgresDb.connect("postgresql://unused", command_timeout=7.5)
+    assert seen["command_timeout"] == 7.5
