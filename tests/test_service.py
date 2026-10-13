@@ -109,3 +109,27 @@ async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monke
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")
             await close()
+
+
+async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_path):
+    from keel.store import open_store
+
+    db = tmp_path / "keel.sqlite3"
+    store = await open_store(f"sqlite:///{db}")
+    await store.upsert_profile("p2", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
+    await store.ensure_session("p2", "s1")
+    await store.create_run(profile_id="p2", session_id="s1", provider="fake", model="m", reasoning_effort=None,
+                           input_parts=[{"type": "text", "text": "hi"}], instructions=None)
+    await store.close()
+    log = tmp_path / "docker.log"
+    fake = tmp_path / "docker"
+    fake.write_text('#!/bin/sh\necho "$@" >> "' + str(log) + '"\n'
+                    'case "$1" in ps) printf "c1 p1\\nc2 p2\\n";; esac\nexit 0\n')
+    fake.chmod(0o755)
+    settings = Settings(api_key="k", database_url=f"sqlite:///{db}", workers=1, docker=str(fake))
+    providers = ProviderRegistry()
+    providers.register(FakeProvider())
+    app = create_service(settings, providers=providers)
+    async with app.router.lifespan_context(app):
+        pass
+    assert "rm -f c1" in log.read_text().splitlines()

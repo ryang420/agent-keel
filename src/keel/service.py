@@ -70,7 +70,7 @@ def create_service(settings: Settings | None = None, *, providers: ProviderRegis
         reaper = None
         if backend is not None:
             try:
-                removed = await backend.remove_orphans()
+                removed = await backend.remove_orphans(await keel.store.in_flight_profiles())
                 if removed:
                     log.info("removed %d sandbox containers left from an earlier start", removed)
             except Exception:
