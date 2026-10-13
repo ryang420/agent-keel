@@ -297,6 +297,10 @@ class SqlStore:
         row = await self.db.fetchrow(f"SELECT COUNT(*) AS n FROM runs WHERE status IN {_IN_FLIGHT}")
         return int(row["n"])
 
+    async def in_flight_profiles(self) -> set[str]:
+        rows = await self.db.fetch(f"SELECT DISTINCT profile_id FROM runs WHERE status IN {_IN_FLIGHT}")
+        return {row["profile_id"] for row in rows}
+
     async def active_run_for_session(self, session_id: str) -> Run | None:
         row = await self.db.fetchrow(
             f"SELECT * FROM runs WHERE session_id = ? AND status IN {_IN_FLIGHT} ORDER BY created_at LIMIT 1",
@@ -371,3 +375,19 @@ class SqlStore:
         rows = await self.db.fetch("SELECT * FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq",
                                    run_id, after_seq)
         return [_event(row) for row in rows]
+
+    async def prune_events(self, finished_before: float, finished_after: float | None = None,
+                           batch: int = 10_000) -> int:
+        """Delete the events of runs that finished before `finished_before` (and at or after `finished_after`, so a
+        regular pass does not rescan all history), `batch` rows per statement so no pass holds a long transaction.
+        Runs, their output and the session's messages are kept."""
+        bound, args = ("", ()) if finished_after is None else (" AND r.finished_at >= ?", (finished_after,))
+        total = 0
+        while True:
+            rows = await self.db.fetch(
+                "DELETE FROM run_events WHERE (run_id, seq) IN (SELECT e.run_id, e.seq FROM run_events e "
+                f"JOIN runs r ON r.id = e.run_id WHERE r.finished_at < ?{bound} LIMIT ?) RETURNING seq",
+                finished_before, *args, batch)
+            total += len(rows)
+            if len(rows) < batch:
+                return total

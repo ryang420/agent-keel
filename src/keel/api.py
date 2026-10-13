@@ -26,6 +26,7 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 _KEEPALIVE_SECONDS = 15.0
 _TERMINAL_GRACE_SECONDS = 5.0
+_FINISHED_LONG_AGO_SECONDS = 60.0
 _HEALTH_TIMEOUT_SECONDS = 3.0
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 MAX_IMAGES = 4
@@ -371,6 +372,9 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                 if run is None:
                     return
                 if run.status in ("completed", "failed", "cancelled"):
+                    if (run.finished_at is not None
+                            and keel_.store.clock() - run.finished_at > _FINISHED_LONG_AGO_SECONDS):
+                        return  # finished long ago: its events were pruned, or the terminal one is before the cursor
                     # The run row turns terminal before its terminal event is appended, so wait briefly for it.
                     loop = asyncio.get_running_loop()
                     deadline = loop.time() + _TERMINAL_GRACE_SECONDS

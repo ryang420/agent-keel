@@ -11,11 +11,13 @@ from keel.store.base import WORKER_LOST_MESSAGE
 log = logging.getLogger(__name__)
 _MAX_CLAIM_BACKOFF = 10.0
 SHUTDOWN_MESSAGE = "The service was shutting down."
+_BACKGROUND = ("keel-sweeper", "keel-maintenance")
 
 
 class WorkerPool:
     def __init__(self, store, bus, executor, *, owner: str, workers: int = 4, lease_seconds: float = 30.0,
-                 poll_seconds: float = 0.5, clock=time.time) -> None:
+                 poll_seconds: float = 0.5, clock=time.time, event_retention_s: float | None = None,
+                 maintenance_s: float = 3600.0) -> None:
         self.store = store
         self.bus = bus
         self.executor = executor
@@ -24,16 +26,21 @@ class WorkerPool:
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
+        self.event_retention_s = event_retention_s
+        self.maintenance_s = maintenance_s
         self._tasks: list[asyncio.Task] = []
         self._closing = False
         self._stop = asyncio.Event()
         self._inflight: dict[str, object] = {}
+        self._pruned_before: float | None = None  # the cutoff of the last successful prune
 
     async def start(self) -> None:
         self._closing = False
         self._stop = asyncio.Event()
         self._tasks = [asyncio.create_task(self._work(), name=f"keel-worker-{i}") for i in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._sweep(), name="keel-sweeper"))
+        if self.event_retention_s is not None:
+            self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
 
     async def close(self, drain_seconds: float = 4.0) -> None:
         """Stop claiming, give runs in flight `drain_seconds` to finish, then fail what is left as worker_lost.
@@ -43,9 +50,9 @@ class WorkerPool:
         """
         self._closing = True
         self._stop.set()
-        sweeper = [t for t in self._tasks if t.get_name() == "keel-sweeper"]
-        workers = [t for t in self._tasks if t not in sweeper]
-        for task in sweeper:
+        background = [t for t in self._tasks if t.get_name() in _BACKGROUND]
+        workers = [t for t in self._tasks if t not in background]
+        for task in background:
             task.cancel()
         if workers:
             await asyncio.wait(workers, timeout=drain_seconds)
@@ -63,6 +70,8 @@ class WorkerPool:
         self._inflight.clear()
 
     async def sweep_once(self) -> int:
+        """Fail every run whose lease expired, then kill the commands their dead workers left running. The events
+        go first so a slow sandbox cannot delay them."""
         expired = await self.store.expire_leases()
         for run in expired:
             try:
@@ -70,6 +79,8 @@ class WorkerPool:
                                          {"error_code": "worker_lost", "message": WORKER_LOST_MESSAGE})
             except Exception:
                 log.exception("could not emit run.failed for %s", run.id)
+        for run in expired:
+            await self.executor.kill_orphaned_command(run)
         return len(expired)
 
     async def _sweep(self) -> None:
@@ -79,6 +90,29 @@ class WorkerPool:
             except Exception:
                 log.exception("lease sweep failed")
             await asyncio.sleep(self.lease_seconds)
+
+    async def prune_once(self) -> int:
+        """The first pass after start scans all history; later ones only runs finished since the previous cutoff,
+        less one interval of overlap so nothing is skipped."""
+        if self.event_retention_s is None:
+            return 0
+        cutoff = self.clock() - self.event_retention_s
+        after = None if self._pruned_before is None else self._pruned_before - self.maintenance_s
+        deleted = await self.store.prune_events(cutoff, finished_after=after)
+        self._pruned_before = cutoff
+        return deleted
+
+    async def _maintain(self) -> None:
+        """Hourly: delete old run events. Passes on several instances may overlap; deleting rows already gone is
+        harmless."""
+        while not self._closing:
+            try:
+                deleted = await self.prune_once()
+                if deleted:
+                    log.info("pruned %d run events older than the retention", deleted)
+            except Exception:
+                log.exception("pruning old run events failed")
+            await self._idle(self.maintenance_s)
 
     async def _idle(self, seconds: float) -> None:
         try:

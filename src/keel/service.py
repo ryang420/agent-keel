@@ -35,7 +35,7 @@ def default_providers(settings: Settings) -> ProviderRegistry:
 
 
 async def build(settings: Settings, *, providers: ProviderRegistry | None = None):
-    store = await open_store(settings.database_url)
+    store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout)
     bus = PostgresEventBus(settings.database_url) if settings.is_postgres else InMemoryEventBus()
     await bus.start()
     registry = providers or default_providers(settings)
@@ -46,7 +46,7 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     executor = RunExecutor(store, bus, registry, sandbox=backend, max_iterations=settings.max_iterations,
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold)
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
-                      lease_seconds=settings.lease_seconds)
+                      lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key=settings.api_key,
                 max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root)
     return keel, pool, [registry, bus, store], backend
@@ -70,7 +70,7 @@ def create_service(settings: Settings | None = None, *, providers: ProviderRegis
         reaper = None
         if backend is not None:
             try:
-                removed = await backend.remove_orphans()
+                removed = await backend.remove_orphans(await keel.store.in_flight_profiles())
                 if removed:
                     log.info("removed %d sandbox containers left from an earlier start", removed)
             except Exception:

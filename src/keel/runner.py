@@ -161,9 +161,35 @@ class RunExecutor:
         for timeout in (self.kill_timeout_s, 2.0):  # the second try is the last best-effort hard kill
             try:
                 await asyncio.wait_for(self.sandbox.kill_tree(state.sandbox, state.exec_id), timeout)
-                return
             except Exception:
                 log.warning("run %s: could not kill its command", run.id, exc_info=True)
+                continue
+            state.exec_id = None
+            await self._clear_exec(run)
+            return
+
+    async def kill_orphaned_command(self, run: Run) -> None:
+        """For a run swept as worker_lost: kill the command its dead worker started, so it does not run on. Best
+        effort and never raises; the exec id is cleared either way, since the run is over. It never creates a
+        sandbox: this instance may not share the dead worker's Docker daemon, and then there is nothing to kill."""
+        if not run.current_exec_id:
+            return
+        if self.sandbox is not None:
+            try:
+                profile = await self.store.get_profile(run.profile_id)
+                if profile is not None and profile.sandbox:
+                    policy = parse_policy(profile.sandbox, self.mount_root)
+                    sandbox = self.sandbox.reference(run.profile_id, policy)
+                    await asyncio.wait_for(self.sandbox.kill_tree(sandbox, run.current_exec_id), self.kill_timeout_s)
+            except Exception:
+                log.warning("run %s: could not kill the command of its lost worker", run.id, exc_info=True)
+        await self._clear_exec(run)
+
+    async def _clear_exec(self, run: Run) -> None:
+        try:
+            await self.store.set_current_exec(run.id, None)
+        except Exception:
+            log.warning("run %s: could not clear its current command", run.id, exc_info=True)
 
     async def _close_tool(self, run: Run, state: _RunState) -> None:
         """A tool that started but was cut short gets its tool.completed (an error), best effort, so a client that

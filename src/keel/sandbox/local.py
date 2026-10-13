@@ -19,6 +19,9 @@ class LocalSandbox:
 
     async def ensure(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
         Path(policy.workdir).mkdir(parents=True, exist_ok=True)
+        return self.reference(profile_id, policy)
+
+    def reference(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
         return Sandbox(profile_id, f"local-{profile_id}", policy)
 
     async def exec(self, sandbox: Sandbox, argv: list[str], *, cwd: str, timeout_s: float, exec_id: str,

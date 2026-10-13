@@ -16,6 +16,7 @@ import os
 import shutil
 import tempfile
 import time
+from typing import Collection
 import uuid
 
 from keel.sandbox.base import (
@@ -70,6 +71,9 @@ class DockerSandbox:
 
     def container_name(self, profile_id: str) -> str:
         return "keel-sbx-" + hashlib.sha256(f"{self.deployment}\0{profile_id}".encode()).hexdigest()[:12]
+
+    def reference(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
+        return Sandbox(profile_id, self.container_name(profile_id), policy)
 
     def run_args(self, profile_id: str, policy: SandboxPolicy, env_file: str | None = None) -> list[str]:
         # Hardening mirrors the Hermes docker backend: no capabilities beyond file ownership and access, no
@@ -139,7 +143,7 @@ class DockerSandbox:
                 if created != 0:
                     raise SandboxError(f"Could not create the sandbox: {out.strip()[:300]}")
         self._last_used[name] = self.clock()
-        return Sandbox(profile_id, name, policy)
+        return self.reference(profile_id, policy)
 
     async def exec(self, sandbox: Sandbox, argv: list[str], *, cwd: str, timeout_s: float, exec_id: str,
                    env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:
@@ -239,13 +243,19 @@ class DockerSandbox:
                 removed += 1
         return removed
 
-    async def remove_orphans(self) -> int:
-        """At start: remove this deployment's containers. Safe while keel runs as a single instance (M1 README)."""
-        code, out = await self._docker("ps", "-aq", "--filter", "label=keel.managed=1",
-                                       "--filter", f"label=keel.deployment={self.deployment}")
+    async def remove_orphans(self, keep: Collection[str] = frozenset()) -> int:
+        """At start: remove this deployment's containers, except those of the profiles in `keep` (profiles with a run
+        in flight, possibly on another instance). A removed container is recreated on its next use."""
+        code, out = await self._docker("ps", "-a", "--filter", "label=keel.managed=1",
+                                       "--filter", f"label=keel.deployment={self.deployment}",
+                                       "--format", '{{.ID}} {{.Label "keel.profile"}}')
         if code != 0:
             log.warning("could not list leftover sandbox containers: %s", out.strip()[:500])
-        ids = out.split() if code == 0 else []
+        ids = []
+        for line in out.splitlines() if code == 0 else []:
+            container, _, profile = line.strip().partition(" ")
+            if container and profile not in keep:
+                ids.append(container)
         if ids:
             rm_code, rm_out = await self._docker("rm", "-f", *ids)
             if rm_code != 0:

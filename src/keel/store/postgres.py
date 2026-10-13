@@ -20,7 +20,8 @@ def to_numbered(sql: str) -> str:
     return "".join(out)
 
 
-# A stalled database must fail a query, not hang a worker or a request forever.
+# A stalled database must fail a query, not hang a worker or a request forever. The service passes a third of the
+# lease (at least 5 s), so one stalled query cannot use up the lease of the run waiting on it.
 COMMAND_TIMEOUT = 30
 CONNECT_TIMEOUT = 10
 
@@ -33,9 +34,9 @@ class PostgresDb:
         self._conn: ContextVar[asyncpg.Connection | None] = ContextVar(f"keel_pg_conn_{id(self)}", default=None)
 
     @classmethod
-    async def connect(cls, dsn: str) -> "PostgresDb":
-        return cls(await asyncpg.create_pool(dsn, min_size=1, max_size=10, command_timeout=COMMAND_TIMEOUT,
-                                                     timeout=CONNECT_TIMEOUT))
+    async def connect(cls, dsn: str, *, command_timeout: float = COMMAND_TIMEOUT) -> "PostgresDb":
+        return cls(await asyncpg.create_pool(dsn, min_size=1, max_size=10, command_timeout=command_timeout,
+                                             timeout=CONNECT_TIMEOUT))
 
     async def _call(self, method: str, sql: str, args: tuple):
         conn = self._conn.get()

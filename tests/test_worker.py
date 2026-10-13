@@ -1,4 +1,7 @@
 import asyncio
+import contextlib
+import os
+import signal
 
 import pytest
 
@@ -7,6 +10,8 @@ from keel.models import Completed, TextDelta, Usage
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
+from keel.sandbox.base import SandboxError, parse_policy
+from keel.sandbox.local import LocalSandbox
 from keel.worker import WorkerPool
 
 
@@ -279,5 +284,149 @@ async def test_a_stop_during_a_command_ends_the_run_quickly(store, tmp_path):
         await bus.notify("stop:" + run.id)
         done = await wait_for_status(store, run.id, ("cancelled",), seconds=10)
         assert done.status == "cancelled"
+        assert done.current_exec_id is None
     finally:
         await pool.close(drain_seconds=0.1)
+
+
+async def test_sweeping_kills_the_command_a_lost_worker_left_running(store, clock, tmp_path):
+    work = tmp_path / "w"
+    policy = {"image": "local", "workdir": str(work)}
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox=policy, soul="",
+                               skills=[])
+    sandbox = LocalSandbox(kill_grace_s=0.5)
+    box = await sandbox.ensure("p1", parse_policy(policy))
+    command = asyncio.create_task(sandbox.exec(box, ["sh", "-c", f"sleep 30; touch {work}/late"], cwd=str(work),
+                                               timeout_s=60, exec_id="x1"))
+    for _ in range(100):
+        if "x1" in sandbox._groups:
+            break
+        await asyncio.sleep(0.02)
+    pgid = sandbox._groups["x1"]
+    try:
+        run = await queue(store)
+        await store.claim_run("dead-worker", clock.now + 30)
+        await store.set_current_exec(run.id, "x1")
+        executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=sandbox)
+        pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+        clock.now += 31
+        assert await pool.sweep_once() == 1
+        result = await asyncio.wait_for(command, 5)
+        assert result.exit_code != 0 and not (work / "late").exists()
+        swept = await store.get_run("p1", run.id)
+        assert (swept.status, swept.error_code, swept.current_exec_id) == ("failed", "worker_lost", None)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        command.cancel()
+        await asyncio.gather(command, return_exceptions=True)
+
+
+async def test_the_sweeper_never_creates_a_sandbox(store, clock, tmp_path):
+    killed = []
+
+    class NoCreate(LocalSandbox):
+        async def ensure(self, profile_id, policy):
+            killed.append("ensure")
+            raise AssertionError("the sweeper must not create a sandbox")
+
+        async def kill_tree(self, sandbox, exec_id):
+            killed.append((sandbox.name, exec_id))
+
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
+                               sandbox={"image": "local", "workdir": str(tmp_path / "w")})
+    run = await queue(store)
+    await store.claim_run("dead-worker", clock.now + 30)
+    await store.set_current_exec(run.id, "x1")
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=NoCreate())
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+    clock.now += 31
+    assert await pool.sweep_once() == 1
+    assert killed == [("local-p1", "x1")]
+    assert not (tmp_path / "w").exists()
+
+
+async def test_a_sweep_survives_an_unreachable_sandbox(store, clock, tmp_path):
+    class Down(LocalSandbox):
+        async def kill_tree(self, sandbox, exec_id):
+            raise SandboxError("docker is down")
+
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
+                               sandbox={"image": "local", "workdir": str(tmp_path / "w")})
+    run = await queue(store)
+    await store.claim_run("dead-worker", clock.now + 30)
+    await store.set_current_exec(run.id, "x1")
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=Down())
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+    clock.now += 31
+    assert await pool.sweep_once() == 1
+    swept = await store.get_run("p1", run.id)
+    assert (swept.status, swept.current_exec_id) == ("failed", None)
+    assert [e.type for e in await store.events_after(run.id, 0)] == ["run.failed"]
+
+
+async def test_prune_once_deletes_events_older_than_the_retention(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    run = await queue(store)
+    await store.append_event(run.id, "run.started", {})
+    await store.finish_run(run.id, "completed")
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock, event_retention_s=7 * 86_400)
+    assert await pool.prune_once() == 0
+    clock.now += 8 * 86_400
+    assert await pool.prune_once() == 1
+
+
+async def test_after_a_successful_prune_the_next_scans_only_runs_finished_since(store, clock):
+    calls = []
+
+    class Spy:
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+        async def prune_events(self, finished_before, finished_after=None):
+            calls.append((finished_before, finished_after))
+            if len(calls) == 1:
+                raise RuntimeError("db blip")
+            return 0
+
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    pool = WorkerPool(Spy(), InMemoryEventBus(), executor, owner="w1", clock=clock, event_retention_s=100,
+                      maintenance_s=10)
+    with pytest.raises(RuntimeError):
+        await pool.prune_once()
+    await pool.prune_once()
+    clock.now += 10
+    await pool.prune_once()
+    assert calls == [(900, None), (900, None), (910, 890)]
+
+
+async def test_the_maintenance_task_prunes_at_start_and_stops_on_close(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    run = await queue(store)
+    await store.append_event(run.id, "run.started", {})
+    await store.finish_run(run.id, "completed")
+    clock.now += 8 * 86_400
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", workers=1, poll_seconds=0.01, clock=clock,
+                      event_retention_s=7 * 86_400)
+    await pool.start()
+    [maintenance] = [t for t in pool._tasks if t.get_name() == "keel-maintenance"]
+    try:
+        for _ in range(100):
+            if not await store.events_after(run.id, 0):
+                break
+            await asyncio.sleep(0.02)
+        assert await store.events_after(run.id, 0) == []
+    finally:
+        await asyncio.wait_for(pool.close(drain_seconds=0.1), 2)
+    assert maintenance.done() and pool._tasks == []
+
+
+async def test_prune_once_without_a_retention_deletes_nothing(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    run = await queue(store)
+    await store.append_event(run.id, "run.started", {})
+    await store.finish_run(run.id, "completed")
+    clock.now += 365 * 86_400
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+    assert await pool.prune_once() == 0
+    assert len(await store.events_after(run.id, 0)) == 1

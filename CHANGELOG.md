@@ -13,6 +13,9 @@ All notable changes to this project are documented here. The format follows
   of the window, old tool results and images are replaced by placeholders, and if that is not enough the middle of
   the conversation is summarized in place (the stored transcript is unchanged). A new `context.compacted` event
   reports it; the summary call's usage is part of the run's usage. Migration 3 adds `sessions.pruned_id`.
+- Run-event pruning: an hourly task deletes the events of runs finished more than `KEEL_EVENT_RETENTION_DAYS` (7)
+  days ago; runs and messages are kept. Streaming such a run closes at once.
+- Fault-injection tests: a lost worker, provider 5xx, sandbox failures, a vanished container and a killed server.
 
 ### Changed
 - `search_files` uses ripgrep when the sandbox image has it, and `grep`/`find` otherwise. Both skip hidden
@@ -20,6 +23,11 @@ All notable changes to this project are documented here. The format follows
   a content search with no matches adds a `hint` when hidden or gitignored files would match.
 - The system prompt's date line reads `Current date:` instead of `Conversation started:`; a compaction rebuilds the
   prompt, so the date is the build's.
+- Several instances can share one Postgres database: the LISTEN connection reconnects with backoff, start-up
+  orphan removal spares the sandboxes of profiles with a run in flight, and the sweeper kills a lost worker's
+  command when it shares that worker's Docker daemon (otherwise the command runs until its own timeout).
+- Postgres queries time out after a third of `KEEL_LEASE_SECONDS` (at least 5 s) instead of a fixed 30 s; with the
+  default 30 s lease that is 10 s.
 
 ## [0.2.0] - 2026-10-12
 
