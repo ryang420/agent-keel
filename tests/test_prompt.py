@@ -19,7 +19,7 @@ def test_the_tiers_come_in_hermes_order():
     assert prompt == "\n\n".join([
         "SOUL", prompts.text("guidance"), prompts.text("platform"),
         prompts.text("skills_header"), render_index(skills), prompts.text("skills_footer"),
-        "Conversation started: Monday, October 12, 2026 (UTC, UTC+00:00)\nModel: m1\nProvider: bedrock",
+        "Current date: Monday, October 12, 2026 (UTC, UTC+00:00)\nModel: m1\nProvider: bedrock",
         prompts.text("environment").format(workdir="/work"),
     ])
 

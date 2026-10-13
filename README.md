@@ -73,9 +73,9 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 
 ## Status
 
-Pre-1.0 (0.2.0). The API and the database schema may change between releases. There are no schema migrations
-yet: treat databases as disposable and expect a fresh one after a schema change. Run a single instance for now: the
-Postgres LISTEN connection does not yet reconnect on its own.
+Pre-1.0 (0.2.0). The API and the database schema may change between releases. A database is upgraded in place at
+start (numbered migrations); a database written by a newer keel is refused. Back up the database before upgrading.
+Run a single instance for now: the Postgres LISTEN connection does not yet reconnect on its own.
 
 ## Development
 

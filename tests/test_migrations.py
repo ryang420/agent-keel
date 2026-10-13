@@ -1,0 +1,275 @@
+import asyncio
+from contextlib import closing
+import os
+import sqlite3
+
+import pytest
+
+from keel.store import migrations, open_store
+from keel.store.db import SqliteDb
+from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
+
+ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, blobs"
+BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("KEEL_TEST_POSTGRES_DSN") else [])
+needs_postgres = pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"),
+                                    reason="needs KEEL_TEST_POSTGRES_DSN")
+
+# keel 0.2.0's schema as released (src/keel/store/sql.py at v0.2.0). Kept apart from migration 1, which must
+# reproduce it, so that an edit to migration 1 fails the schema comparison below.
+V020 = """
+CREATE TABLE IF NOT EXISTS profiles (
+    id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL,
+    skills TEXT NOT NULL, updated_at {real} NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, title TEXT, title_source TEXT,
+    created_at {real} NOT NULL, last_active_at {real} NOT NULL, message_count INTEGER NOT NULL DEFAULT 0,
+    system_prompt TEXT, provider TEXT, model TEXT, cwd TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS sessions_profile_title ON sessions (profile_id, title) WHERE title IS NOT NULL;
+CREATE INDEX IF NOT EXISTS sessions_profile_active ON sessions (profile_id, last_active_at);
+CREATE TABLE IF NOT EXISTS messages (
+    id {serial} PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT, role TEXT NOT NULL,
+    parts TEXT NOT NULL, tool_calls TEXT NOT NULL, tool_call_id TEXT, tool_name TEXT,
+    reasoning TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at {real} NOT NULL);
+CREATE INDEX IF NOT EXISTS messages_session ON messages (session_id, id);
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL,
+    provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_effort TEXT, input TEXT NOT NULL,
+    instructions TEXT, output TEXT NOT NULL DEFAULT '', usage TEXT NOT NULL DEFAULT '{{}}',
+    error_code TEXT, error TEXT, lease_owner TEXT, lease_expires_at {real},
+    created_at {real} NOT NULL, started_at {real}, finished_at {real}, current_exec_id TEXT);
+CREATE INDEX IF NOT EXISTS runs_status ON runs (status, created_at);
+CREATE INDEX IF NOT EXISTS runs_session ON runs (session_id);
+CREATE UNIQUE INDEX IF NOT EXISTS runs_one_in_flight_per_session ON runs (session_id)
+    WHERE status IN ('queued', 'running', 'stopping');
+CREATE TABLE IF NOT EXISTS run_events (
+    run_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL,
+    at {real} NOT NULL, PRIMARY KEY (run_id, seq));
+CREATE TABLE IF NOT EXISTS blobs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, media_type TEXT NOT NULL,
+    data TEXT NOT NULL, created_at {real} NOT NULL);
+CREATE INDEX IF NOT EXISTS blobs_session ON blobs (session_id);
+"""
+
+SEED = """
+INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at) VALUES ('p1', '[]', '{}', 'You help.', '[]', 1);
+INSERT INTO sessions (id, profile_id, title, title_source, created_at, last_active_at, message_count, system_prompt)
+    VALUES ('s1', 'p1', 'Old chat', 'derived', 1, 2, 1, 'sys');
+INSERT INTO messages (session_id, run_id, role, parts, tool_calls, reasoning, created_at)
+    VALUES ('s1', 'run_1', 'user', '[{"type":"text","text":"hello"}]', '[]', '[]', 1);
+INSERT INTO runs (id, profile_id, session_id, status, provider, model, input, created_at, finished_at)
+    VALUES ('run_1', 'p1', 's1', 'completed', 'fake', 'm', '[]', 1, 2);
+INSERT INTO run_events (run_id, seq, type, data, at) VALUES ('run_1', 1, 'run.completed', '{}', 2);
+"""
+
+
+async def run_script(url: str, script: str) -> None:
+    if url.startswith("sqlite:///"):
+        with closing(sqlite3.connect(url[len("sqlite:///"):])) as conn:
+            conn.executescript(script)
+        return
+    import asyncpg
+
+    conn = await asyncpg.connect(url)
+    try:
+        await conn.execute(script)
+    finally:
+        await conn.close()
+
+
+async def connect(url: str):
+    """A connection that, unlike open_store, does not migrate."""
+    if url.startswith("sqlite:///"):
+        return await SqliteDb.connect(url[len("sqlite:///"):])
+    from keel.store.postgres import PostgresDb
+
+    return await PostgresDb.connect(url)
+
+
+def v020_script(url: str) -> str:
+    if url.startswith("sqlite:///"):
+        script = V020.format(real="REAL", serial="INTEGER")
+        return script.replace("id INTEGER PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
+    return V020.format(real="DOUBLE PRECISION", serial="BIGSERIAL")
+
+
+async def empty_database(url: str) -> str:
+    """A URL for an empty database of the same kind: a new SQLite file, or the Postgres one with keel's tables
+    dropped."""
+    if url.startswith("sqlite:///"):
+        return url + "-fresh"
+    await run_script(url, f"DROP TABLE IF EXISTS {ALL_TABLES}")
+    return url
+
+
+async def schema_shape(db) -> dict:
+    """Every table's columns and every index, in a form that compares equal for equal schemas."""
+    if db.dialect == "sqlite":
+        tables = [row["name"] for row in await db.fetch(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        columns = {table: [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
+                           for r in await db.fetch(f"PRAGMA table_info({table})")] for table in tables}
+        indexes = {row["name"]: " ".join(row["sql"].split()) for row in await db.fetch(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")}
+        return {"columns": columns, "indexes": indexes}
+    columns: dict[str, list] = {}
+    for row in await db.fetch(
+            "SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_schema = current_schema() ORDER BY table_name, ordinal_position"):
+        columns.setdefault(row["table_name"], []).append(
+            (row["column_name"], row["data_type"], row["is_nullable"], row["column_default"]))
+    indexes = {row["indexname"]: row["indexdef"] for row in await db.fetch(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema()")}
+    return {"columns": columns, "indexes": indexes}
+
+
+@pytest.fixture(params=BACKENDS)
+async def db_url(request, tmp_path):
+    if request.param == "sqlite":
+        return f"sqlite:///{tmp_path / 'keel.sqlite3'}"
+    return await empty_database(os.environ["KEEL_TEST_POSTGRES_DSN"])
+
+
+async def test_a_fresh_database_reaches_the_latest_version(db_url):
+    store = await open_store(db_url)
+    try:
+        assert await schema_version(store.db) == LATEST_VERSION
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        assert (await store.ensure_session("p1", "s1")).message_count == 0
+    finally:
+        await store.close()
+
+
+async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_url):
+    await run_script(db_url, v020_script(db_url) + SEED)
+    store = await open_store(db_url)
+    try:
+        assert await schema_version(store.db) == LATEST_VERSION
+        stamped = await store.db.fetch("SELECT version FROM schema_version")
+        assert [row["version"] for row in stamped] == [LATEST_VERSION]
+        assert (await store.get_profile("p1")).soul == "You help."
+        session = await store.get_session("p1", "s1")
+        assert (session.title, session.title_source, session.system_prompt) == ("Old chat", "derived", "sys")
+        assert [stored.message.text for stored in await store.messages("s1")] == ["hello"]
+        assert (await store.get_run_by_id("run_1")).status == "completed"
+        assert [event.type for event in await store.events_after("run_1", 0)] == ["run.completed"]
+        upgraded = await schema_shape(store.db)
+    finally:
+        await store.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded
+    finally:
+        await fresh.close()
+
+
+async def test_opening_again_changes_nothing(db_url):
+    first = await open_store(db_url)
+    await first.ensure_session("p1", "s1")
+    await first.close()
+    again = await open_store(db_url)
+    try:
+        assert await schema_version(again.db) == LATEST_VERSION
+        assert await again.get_session("p1", "s1") is not None
+    finally:
+        await again.close()
+
+
+async def test_a_database_newer_than_the_code_is_refused(db_url):
+    store = await open_store(db_url)
+    await store.db.execute("UPDATE schema_version SET version = ?", LATEST_VERSION + 1)
+    await store.close()
+    with pytest.raises(SchemaTooNew):
+        await open_store(db_url)
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == LATEST_VERSION + 1
+    finally:
+        await db.close()
+
+
+async def test_a_failed_migration_leaves_the_database_at_the_version_before(db_url, monkeypatch):
+    await (await open_store(db_url)).close()
+    failing = Migration(LATEST_VERSION + 1, """
+ALTER TABLE profiles ADD COLUMN doomed INTEGER;
+CREATE TABLE doomed (id TEXT PRIMARY KEY);
+INSERT INTO no_such_table (id) VALUES ('x');
+""")
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS + (failing,))
+    monkeypatch.setattr(migrations, "LATEST_VERSION", failing.version)
+    with pytest.raises(Exception, match="no_such_table"):
+        await open_store(db_url)
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == failing.version - 1
+        shape = await schema_shape(db)
+        assert "doomed" not in shape["columns"]
+        assert "doomed" not in [column[0] for column in shape["columns"]["profiles"]]
+    finally:
+        await db.close()
+
+
+async def test_a_0_2_0_database_whose_first_start_crashed_is_completed(db_url):
+    partial = [s for s in v020_script(db_url).split(";") if "TABLE IF NOT EXISTS profiles" in s or "blobs" in s]
+    await run_script(db_url, ";".join(partial))
+    store = await open_store(db_url)
+    try:
+        assert await schema_version(store.db) == LATEST_VERSION
+        upgraded = await schema_shape(store.db)
+    finally:
+        await store.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded
+    finally:
+        await fresh.close()
+
+
+async def test_an_empty_version_table_reads_like_no_version_table(db_url):
+    await run_script(db_url, v020_script(db_url) + "CREATE TABLE schema_version (version INTEGER NOT NULL);")
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == 1
+    finally:
+        await db.close()
+
+
+@needs_postgres
+async def test_instances_starting_together_upgrade_an_old_database_once():
+    url = await empty_database(os.environ["KEEL_TEST_POSTGRES_DSN"])
+    await run_script(url, v020_script(url) + SEED)
+    stores = await asyncio.gather(*(open_store(url) for _ in range(6)))
+    try:
+        for store in stores:
+            assert await schema_version(store.db) == LATEST_VERSION
+        assert await stores[0].get_session("p1", "s1") is not None
+    finally:
+        for store in stores:
+            await store.close()
+
+
+async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
+    store = await open_store(db_url)
+    try:
+        assert (await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])).memory is False
+        session = await store.ensure_session("p1", "s1")
+        assert (session.summary, session.summary_head_id, session.summary_tail_id) == (None, None, None)
+        assert (session.context_tokens, session.context_message_id, session.compaction_failed_at) == (None, None, None)
+        assert session.turns_since_memory == 0
+        assert session.pruned_id is None
+        await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
+                               "p1", "user", "[]", 1.0)
+        assert (await store.db.fetchrow("SELECT entries FROM memories WHERE profile_id = ?", "p1"))["entries"] == "[]"
+    finally:
+        await store.close()
+
+
+async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
+    await run_script(db_url, v020_script(db_url) + SEED)
+    store = await open_store(db_url)
+    try:
+        assert (await store.get_profile("p1")).memory is False
+        session = await store.get_session("p1", "s1")
+        assert session.summary is None and session.turns_since_memory == 0 and session.title == "Old chat"
+        assert session.pruned_id is None
+    finally:
+        await store.close()

@@ -15,51 +15,7 @@ from keel.store.base import (
     TITLE_RANK, WORKER_LOST_MESSAGE, Event, Profile, Run, Session, SessionBusy, SessionNotFound, StoredMessage,
     TitleInUse, UniqueViolation,
 )
-
-_TABLES = """
-CREATE TABLE IF NOT EXISTS profiles (
-    id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL,
-    skills TEXT NOT NULL, updated_at {real} NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, title TEXT, title_source TEXT,
-    created_at {real} NOT NULL, last_active_at {real} NOT NULL, message_count INTEGER NOT NULL DEFAULT 0,
-    system_prompt TEXT, provider TEXT, model TEXT, cwd TEXT);
-CREATE UNIQUE INDEX IF NOT EXISTS sessions_profile_title ON sessions (profile_id, title) WHERE title IS NOT NULL;
-CREATE INDEX IF NOT EXISTS sessions_profile_active ON sessions (profile_id, last_active_at);
-CREATE TABLE IF NOT EXISTS messages (
-    id {serial} PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT, role TEXT NOT NULL,
-    parts TEXT NOT NULL, tool_calls TEXT NOT NULL, tool_call_id TEXT, tool_name TEXT,
-    reasoning TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at {real} NOT NULL);
-CREATE INDEX IF NOT EXISTS messages_session ON messages (session_id, id);
-CREATE TABLE IF NOT EXISTS runs (
-    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL,
-    provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_effort TEXT, input TEXT NOT NULL,
-    instructions TEXT, output TEXT NOT NULL DEFAULT '', usage TEXT NOT NULL DEFAULT '{{}}',
-    error_code TEXT, error TEXT, lease_owner TEXT, lease_expires_at {real},
-    created_at {real} NOT NULL, started_at {real}, finished_at {real}, current_exec_id TEXT);
-CREATE INDEX IF NOT EXISTS runs_status ON runs (status, created_at);
-CREATE INDEX IF NOT EXISTS runs_session ON runs (session_id);
-CREATE UNIQUE INDEX IF NOT EXISTS runs_one_in_flight_per_session ON runs (session_id)
-    WHERE status IN ('queued', 'running', 'stopping');
-CREATE TABLE IF NOT EXISTS run_events (
-    run_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL,
-    at {real} NOT NULL, PRIMARY KEY (run_id, seq));
-CREATE TABLE IF NOT EXISTS blobs (
-    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, media_type TEXT NOT NULL,
-    data TEXT NOT NULL, created_at {real} NOT NULL);
-CREATE INDEX IF NOT EXISTS blobs_session ON blobs (session_id);
-"""
-
-# Concurrent instances starting together race on CREATE … IF NOT EXISTS; this serializes them. A multi-statement
-# script goes to asyncpg as one simple query, i.e. one transaction, so the transaction-level lock covers it all.
-_SCHEMA_LOCK = "SELECT pg_advisory_xact_lock(7312100001);\n"
-
-SCHEMAS = {
-    "sqlite": _TABLES.format(real="REAL", serial="INTEGER"),
-    "postgres": _SCHEMA_LOCK + _TABLES.format(real="DOUBLE PRECISION", serial="BIGSERIAL"),
-}
-# SQLite only auto-increments an INTEGER PRIMARY KEY when it is declared exactly that way.
-SCHEMAS["sqlite"] = SCHEMAS["sqlite"].replace("id INTEGER PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
+from keel.store.migrations import migrate
 
 _IN_FLIGHT = "('queued', 'running', 'stopping')"
 
@@ -69,14 +25,21 @@ def _j(value) -> str:
 
 
 def _profile(row: dict) -> Profile:
-    return Profile(row["id"], json.loads(row["models"]), json.loads(row["sandbox"]), row["soul"],
-                   json.loads(row["skills"]), row["updated_at"])
+    return Profile(id=row["id"], models=json.loads(row["models"]), sandbox=json.loads(row["sandbox"]),
+                   soul=row["soul"], skills=json.loads(row["skills"]), updated_at=row["updated_at"],
+                   memory=bool(row["memory"]))
 
 
 def _session(row: dict) -> Session:
-    return Session(row["id"], row["profile_id"], row["title"], row["title_source"], row["created_at"],
-                   row["last_active_at"], row["message_count"], row["system_prompt"], row["provider"],
-                   row["model"], row["cwd"])
+    return Session(
+        id=row["id"], profile_id=row["profile_id"], title=row["title"], title_source=row["title_source"],
+        created_at=row["created_at"], last_active_at=row["last_active_at"], message_count=row["message_count"],
+        system_prompt=row["system_prompt"], provider=row["provider"], model=row["model"], cwd=row["cwd"],
+        summary=row["summary"], summary_head_id=row["summary_head_id"], summary_tail_id=row["summary_tail_id"],
+        context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
+        compaction_failed_at=row["compaction_failed_at"], turns_since_memory=row["turns_since_memory"],
+        pruned_id=row["pruned_id"],
+    )
 
 
 def _message(row: dict) -> StoredMessage:
@@ -111,7 +74,7 @@ class SqlStore:
         self.clock = clock
 
     async def init(self) -> None:
-        await self.db.executescript(SCHEMAS[self.db.dialect])
+        await migrate(self.db)
 
     async def ping(self) -> bool:
         row = await self.db.fetchrow("SELECT 1 AS ok")
@@ -175,6 +138,28 @@ class SqlStore:
 
     async def set_session_cwd(self, session_id: str, cwd: str) -> None:
         await self.db.execute("UPDATE sessions SET cwd = ? WHERE id = ?", cwd, session_id)
+
+    async def set_context_anchor(self, session_id: str, tokens: int, message_id: int) -> None:
+        """The input tokens the provider reported for the session's last model call, and the newest message in it."""
+        await self.db.execute("UPDATE sessions SET context_tokens = ?, context_message_id = ? WHERE id = ?",
+                              tokens, message_id, session_id)
+
+    async def set_pruned(self, session_id: str, pruned_id: int, *, failed_at: float | None = None) -> None:
+        """Move the placeholder boundary; the estimate anchor no longer matches what is sent, so it is cleared.
+        `failed_at` records a failed summary call."""
+        await self.db.execute(
+            "UPDATE sessions SET pruned_id = ?, context_tokens = NULL, context_message_id = NULL, "
+            "compaction_failed_at = COALESCE(?, compaction_failed_at) WHERE id = ?",
+            pruned_id, failed_at, session_id)
+
+    async def compact_session(self, session_id: str, *, summary: str, head_id: int, tail_id: int,
+                              system_prompt: str) -> None:
+        """Record a compaction. Unlike set_session_prompt, this overwrites the system prompt."""
+        await self.db.execute(
+            "UPDATE sessions SET summary = ?, summary_head_id = ?, summary_tail_id = ?, pruned_id = ?, "
+            "system_prompt = ?, context_tokens = NULL, context_message_id = NULL, compaction_failed_at = NULL "
+            "WHERE id = ?",
+            summary, head_id, tail_id, tail_id, system_prompt, session_id)
 
     async def set_title(self, profile_id: str, session_id: str, title: str, source: str) -> Session:
         async with self.db.transaction():

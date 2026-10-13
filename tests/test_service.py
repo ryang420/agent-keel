@@ -32,10 +32,12 @@ async def test_the_service_starts_runs_and_stops(tmp_path):
 async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
     from keel.service import build
 
-    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
+    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
+                        compression_threshold=0.5)
     keel, pool, closables, backend = await build(settings)
     try:
         assert backend is None and keel.executor.sandbox is None
+        assert keel.executor.compactor.threshold == 0.5
     finally:
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")

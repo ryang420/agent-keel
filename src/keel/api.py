@@ -46,21 +46,25 @@ class Keel:
 
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str) -> None:
+        """Carry an HTTP status, stable error code and client-facing message."""
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
+    """Build the API's standard JSON error envelope with the given HTTP status."""
     return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
 
 
 def _check_id(value: str, what: str) -> str:
+    """Return a valid identifier, or raise 400 invalid_input using what as its label."""
     if not isinstance(value, str) or not _ID.fullmatch(value):
         raise ApiError(400, "invalid_input", f"{what} must be 1–128 letters, digits, '.', '_' or '-'.")
     return value
 
 
 async def _json_body(request: Request) -> dict:
+    """Parse a JSON object body; reject malformed JSON and other values with 400 invalid_input."""
     try:
         body = await request.json()
     except ValueError:
@@ -71,6 +75,7 @@ async def _json_body(request: Request) -> dict:
 
 
 def run_json(run) -> dict:
+    """Serialize a stored run's identity, status, output, usage, errors and timestamps."""
     return {"run_id": run.id, "status": run.status, "session_id": run.session_id, "provider": run.provider,
             "model": run.model, "reasoning_effort": run.reasoning_effort, "output": run.output,
             "usage": run.usage.to_dict(), "error_code": run.error_code, "error": run.error,
@@ -78,6 +83,7 @@ def run_json(run) -> dict:
 
 
 def message_json(stored) -> dict:
+    """Serialize a stored message, including multimodal parts, tool calls and run metadata."""
     message = stored.message
     return {
         "id": stored.id, "role": message.role, "content": message.text,
@@ -90,13 +96,18 @@ def message_json(stored) -> dict:
 
 
 def session_json(session) -> dict:
+    """Serialize a session's identity, title, timestamps and message count."""
     return {"id": session.id, "title": session.title, "title_source": session.title_source,
             "created_at": session.created_at, "last_active_at": session.last_active_at,
             "message_count": session.message_count}
 
 
 def _input_parts(body: dict) -> list[dict]:
-    """The run's input as part dicts; image parts still carry their base64 data (start_run stores it as a blob)."""
+    """Validate and normalize text/image input, appending non-empty file_context as text.
+
+    Reject empty input, unsupported parts and invalid or oversized images with 400 invalid_input.
+    Image parts retain base64 data here; start_run replaces it with stored blob references.
+    """
     raw = body.get("input")
     if isinstance(raw, str):
         parts = [{"type": "text", "text": raw}]
@@ -139,28 +150,38 @@ def _input_parts(body: dict) -> list[dict]:
 
 
 def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
+    """Build the HTTP application with authentication, error handlers and all API routes.
+
+    Attach keel immediately when supplied (for example in tests); otherwise lifespan must
+    populate app.state.keel during startup. Pass lifespan through to FastAPI.
+    """
     app = FastAPI(title="agent-keel", lifespan=lifespan)
     if keel is not None:
         app.state.keel = keel
 
     def k(request: Request) -> Keel:
+        """Get the service dependencies attached to the request's application."""
         return request.app.state.keel
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, _exc: RequestValidationError):
+        """Translate FastAPI parameter validation failures into 400 invalid_input."""
         return _error(400, "invalid_input", "A query or path parameter is invalid.")
 
     @app.exception_handler(ApiError)
     async def api_error(_request: Request, exc: ApiError):
+        """Return an explicitly raised API error in the standard JSON envelope."""
         return _error(exc.status, exc.code, exc.message)
 
     @app.exception_handler(Exception)
     async def unexpected_error(_request: Request, exc: Exception):
+        """Log an unexpected exception and return a generic 500 without exposing its details."""
         log.error("unhandled error", exc_info=exc)
         return _error(500, "internal_error", "The service hit an unexpected error.")
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
+        """Require a ready service and a valid bearer service key, except on /healthz."""
         if getattr(request.app.state, "keel", None) is None:
             return _error(503, "unavailable", "The service is not ready.")
         if request.url.path != "/healthz":
@@ -172,6 +193,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz(request: Request):
+        """Check store connectivity within three seconds; return 503 if it does not answer."""
         try:
             await asyncio.wait_for(k(request).store.ping(), _HEALTH_TIMEOUT_SECONDS)
         except Exception:
@@ -180,18 +202,21 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         return {"status": "ok"}
 
     async def profile_or_404(request: Request, profile_id: str):
+        """Validate profile_id and load its profile, or raise 404 profile_not_found."""
         profile = await k(request).store.get_profile(_check_id(profile_id, "profile"))
         if profile is None:
             raise ApiError(404, "profile_not_found", "No such profile.")
         return profile
 
     async def session_or_404(request: Request, profile_id: str, session_id: str):
+        """Load a session belonging to the profile, or raise 404 session_not_found."""
         session = await k(request).store.get_session(profile_id, session_id)
         if session is None:
             raise ApiError(404, "session_not_found", "No such session.")
         return session
 
     async def run_or_404(request: Request, profile_id: str, run_id: str):
+        """Load a run belonging to the profile, or raise 404 run_not_found."""
         run = await k(request).store.get_run(profile_id, run_id)
         if run is None:
             raise ApiError(404, "run_not_found", "No such run.")
@@ -199,6 +224,11 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.put("/v1/profiles/{profile_id}")
     async def put_profile(request: Request, profile_id: str):
+        """Create or replace a profile's models, sandbox policy, persona and enabled skills.
+
+        Omitted fields reset to empty values. Validate the body and sandbox policy before
+        saving, returning 400 invalid_input on invalid configuration and the saved profile on success.
+        """
         body = await _json_body(request)
         _check_id(profile_id, "profile")
         models = [] if body.get("models") is None else body["models"]
@@ -229,6 +259,12 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.post("/v1/profiles/{profile_id}/runs", status_code=202)
     async def start_run(request: Request, profile_id: str):
+        """Queue a run and return its run_id, status and session_id with HTTP 202.
+
+        Validate the selected model and text/image input, creating a session when needed and
+        storing images as blobs. Reject busy sessions with 409 and capacity exhaustion with 429.
+        Clean up newly stored blobs if run creation fails.
+        """
         keel_ = k(request)
         body = await _json_body(request)
         profile = await profile_or_404(request, profile_id)
@@ -280,16 +316,23 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.get("/v1/profiles/{profile_id}/runs")
     async def list_runs(request: Request, profile_id: str, status: str = "active"):
+        """List profile runs matching status: 'active' or a comma-separated list of states."""
         statuses = ACTIVE if status == "active" else tuple(s for s in status.split(",") if s)
         runs = await k(request).store.list_runs(profile_id, statuses)
         return {"data": [run_json(run) for run in runs]}
 
     @app.get("/v1/profiles/{profile_id}/runs/{run_id}")
     async def get_run(request: Request, profile_id: str, run_id: str):
+        """Return a profile's run details, or 404 run_not_found when it does not exist."""
         return run_json(await run_or_404(request, profile_id, run_id))
 
     @app.post("/v1/profiles/{profile_id}/runs/{run_id}/stop")
     async def stop_run(request: Request, profile_id: str, run_id: str):
+        """Request a run's cancellation and return its current details.
+
+        Cancel queued runs immediately and emit their terminal event; notify the worker to
+        stop running work. A running run may still be stopping when this response is returned.
+        """
         keel_ = k(request)
         before = await run_or_404(request, profile_id, run_id)
         run = await keel_.store.request_stop(profile_id, run_id)
@@ -302,10 +345,16 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.get("/v1/profiles/{profile_id}/runs/{run_id}/events")
     async def run_events(request: Request, profile_id: str, run_id: str, after: int = 0):
+        """Replay events with sequence numbers greater than after, then stream live events as SSE.
+
+        Negative cursors are treated as zero. Send keepalive comments while idle and close
+        after a terminal event; disconnecting the client does not cancel the run.
+        """
         keel_ = k(request)
         await run_or_404(request, profile_id, run_id)
 
         async def frames():
+            """Yield persisted SSE frames, waiting for notifications and late terminal events."""
             cursor = max(0, after)
             while True:
                 waiter = keel_.bus.waiter(run_id)
@@ -352,12 +401,19 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.get("/v1/profiles/{profile_id}/sessions")
     async def list_sessions(request: Request, profile_id: str, limit: int = 100):
+        """List the profile's most recently active sessions, clamping limit to 1–500."""
         sessions = await k(request).store.list_sessions(profile_id, max(1, min(limit, 500)))
         return {"data": [session_json(s) for s in sessions]}
 
     @app.get("/v1/profiles/{profile_id}/sessions/{session_id}/messages")
     async def session_messages(request: Request, profile_id: str, session_id: str, limit: int = 200,
                                offset: int = 0, after_id: int | None = None):
+        """Return session messages using pagination or an incremental message-id cursor.
+
+        With after_id, return all later messages in ascending id order and ignore limit/offset.
+        Otherwise return a page of active messages in chronological order, selecting from the
+        newest end with limit clamped to 1–500 and offset to at least zero, plus pagination metadata.
+        """
         store = k(request).store
         await session_or_404(request, profile_id, session_id)
         if after_id is not None:
@@ -370,11 +426,17 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.get("/v1/profiles/{profile_id}/sessions/{session_id}/boundary")
     async def boundary(request: Request, profile_id: str, session_id: str):
+        """Return the session's latest message id as a cursor for incremental history reads."""
         await session_or_404(request, profile_id, session_id)
         return {"last_message_id": await k(request).store.last_message_id(session_id)}
 
     @app.patch("/v1/profiles/{profile_id}/sessions/{session_id}")
     async def rename(request: Request, profile_id: str, session_id: str):
+        """Set a sanitized, non-empty user title and return the updated session.
+
+        Return 400 for an invalid title, 404 for a missing session or 409 if the profile
+        already has another session with that title.
+        """
         body = await _json_body(request)
         title = sanitize_title(body.get("title") or "") if isinstance(body.get("title"), str) else ""
         if not title:
@@ -389,6 +451,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.delete("/v1/profiles/{profile_id}/sessions/{session_id}")
     async def delete(request: Request, profile_id: str, session_id: str):
+        """Delete a session; return 404 if missing or 409 if it has a run in progress."""
         store = k(request).store
         try:
             deleted = await store.delete_session(profile_id, session_id)

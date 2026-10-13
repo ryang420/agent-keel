@@ -300,6 +300,9 @@ session (`parent_session_id`); a client can show one conversation. The system pr
 rebuilt, reasoning items before the compaction point are dropped, and the cache key is scoped
 to the session lineage.
 
+Superseded by the M3 design (`2026-10-12-m3-reliability-memory-compression.md` §5): the summary
+is kept on the same session rather than in a child session, so the session id never changes.
+
 ## 9. Titles
 
 The first turn sets a derived title (first line, ≤ 48 characters). A background call asks the

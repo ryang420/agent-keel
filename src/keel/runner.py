@@ -8,8 +8,12 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import logging
 import time
+from typing import Callable
 
 from keel import prompts
+from keel import compress
+from keel.compactor import Compactor, SessionContext
+from keel.compress import Boundaries
 from keel.models import (
     Completed, ImagePart, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
     part_from_dict,
@@ -19,7 +23,7 @@ from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy
 from keel.skills import discover_skills
-from keel.store.base import Event, Run, TitleInUse
+from keel.store.base import Event, Run, StoredMessage, TitleInUse
 from keel.titles import derive_title, title_candidates
 from keel.tools import ToolContext, ToolOutcome, run_tool
 from keel.tools.base import preview_for
@@ -48,7 +52,20 @@ class _RunState:
     sandbox: object = None
     exec_id: str | None = None
     open_tool: tuple | None = None  # (call, preview, started at) of a tool that has started and not completed
+    streamed: bool = False  # the current model call has produced output, so it must not be retried
 
+
+@dataclass
+class _Turn:
+    """What every model call of one run shares."""
+
+    provider: object
+    stored: list[StoredMessage]  # the session's messages, kept in step with what the run appends
+    context: SessionContext
+    tools: tuple[dict, ...]
+    window: int
+    rebuild: Callable[[], str]
+    blobs: dict = field(default_factory=dict)  # image bytes loaded during this run, by blob id
 
 
 def _unanswered(stored_messages, run_id: str | None = None) -> list[ToolCall]:
@@ -62,7 +79,8 @@ def _unanswered(stored_messages, run_id: str | None = None) -> list[ToolCall]:
 class RunExecutor:
     def __init__(self, store, bus, providers: ProviderRegistry, *, sandbox=None, sleep=asyncio.sleep,
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None, kill_timeout_s: float = 10.0,
-                 skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC)) -> None:
+                 skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC),
+                 compression_threshold: float = 0.75) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
@@ -76,6 +94,7 @@ class RunExecutor:
         self._clock = clock
         # (profile, policy digest, enabled skills) -> (expires at, discovered skills): later turns skip discovery
         self._skills_cache: dict[tuple, tuple[float, list]] = {}
+        self.compactor = Compactor(store, threshold=compression_threshold, sleep=sleep, now=now, emit=self.emit)
 
     async def emit(self, run_id: str, type_: str, data: dict) -> Event:
         event = await self.store.append_event(run_id, type_, data)
@@ -219,54 +238,37 @@ class RunExecutor:
             ctx = ToolContext(self.sandbox, sandbox, cwd=(session.cwd if session and session.cwd else policy.workdir),
                               skills=tuple(skills), on_exec=self._exec_recorder(run, state))
         saved_cwd = ctx.cwd if ctx else None
+
+        def rebuild() -> str:
+            return build_system_prompt(soul=profile.soul if profile else "", model=run.model, provider=run.provider,
+                                       now=self._now(), tools=ctx is not None, skills=skills,
+                                       workdir=policy.workdir if policy else None)
+
         system = session.system_prompt if session else None
         if system is None:
-            built = build_system_prompt(soul=profile.soul if profile else "", model=run.model, provider=run.provider,
-                                        now=self._now(), tools=ctx is not None, skills=skills,
-                                        workdir=policy.workdir if policy else None)
-            system = (await self.store.set_session_prompt(run.session_id, built, run.provider, run.model)).system_prompt
-        stored_messages = await self.store.messages(run.session_id)
+            system = (await self.store.set_session_prompt(run.session_id, rebuild(), run.provider,
+                                                          run.model)).system_prompt
+        stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
         # before this turn so the request pairs every call.
-        orphans = _unanswered(stored_messages)
+        orphans = _unanswered(stored)
         if orphans:
             await self._append_synthetic(run, orphans, strict=True)  # an unpaired call must not be sent
-            stored_messages = await self.store.messages(run.session_id)
-        history = [stored.message for stored in stored_messages]
+            stored = await self.store.messages(run.session_id)
         user = Message("user", tuple(part_from_dict(part) for part in run.input))
-        await self.store.append_message(run.session_id, run.id, user)
+        stored.append(await self.store.append_message(run.session_id, run.id, user))
         await self._title_from(run, user)
-        conversation = await self._with_images([*history, user])
-        tools = prompts.tool_definitions() if ctx is not None else ()
+        context = SessionContext(
+            bounds=Boundaries.of(session), system=system,
+            anchor_tokens=session.context_tokens if session else None,
+            anchor_id=session.context_message_id if session else None,
+            failed_at=session.compaction_failed_at if session else None)
+        turn = _Turn(provider=provider, stored=stored, context=context,
+                     tools=prompts.tool_definitions() if ctx is not None else (),
+                     window=provider.capabilities(run.model).context_window, rebuild=rebuild)
         for iteration in range(self.max_iterations + 1):
-            final = iteration == self.max_iterations and bool(tools)
-            messages = [*conversation]
-            if final:
-                messages.append(Message("user", (TextPart(prompts.MAX_ITERATIONS_REQUEST),)))
-            request = ModelRequest(
-                provider=run.provider, model=run.model, system=system, messages=tuple(messages),
-                instructions=run.instructions, tools=() if final else tools,
-                reasoning_effort=run.reasoning_effort, cache_scope=run.session_id,
-            )
-            state.text = []
-            calls, reasoning, incomplete = [], [], False
-            async for event in stream_with_retries(provider, request, sleep=self._sleep):
-                if isinstance(event, TextDelta):
-                    state.text.append(event.text)
-                    await self.emit(run.id, "message.delta", {"text": event.text})
-                elif isinstance(event, ReasoningReady):
-                    reasoning.append(event.item)
-                elif isinstance(event, ToolCallReady):
-                    if request.tools:
-                        calls.append(event.call)
-                    else:
-                        log.warning("run %s: the model called %r but no tools were offered; ignoring it",
-                                    run.id, event.call.name)
-                elif isinstance(event, Completed):
-                    state.usage = state.usage + event.usage
-                    if event.status == "incomplete":
-                        incomplete = True
-                        log.warning("run %s: the model response was incomplete", run.id)
+            final = iteration == self.max_iterations and bool(turn.tools)
+            calls, reasoning, incomplete = await self._model_call(run, turn, state, final=final)
             output = "".join(state.text)
             assistant = Message("assistant", (TextPart(output),) if output else (), tool_calls=tuple(calls),
                                 reasoning=tuple(reasoning))
@@ -274,11 +276,10 @@ class RunExecutor:
             # answered. A failed commit (not a cancel) means nothing was committed, so nothing is pending.
             state.pending = list(calls)
             try:
-                await self.store.append_message(run.session_id, run.id, assistant)
+                stored.append(await self.store.append_message(run.session_id, run.id, assistant))
             except Exception:
                 state.pending = []
                 raise
-            conversation.append(assistant)
             if not calls:
                 await self._finish(run, "completed", output=output, usage=state.usage, event="run.completed",
                                    data={"output": output, "usage": state.usage.to_dict(),
@@ -291,11 +292,10 @@ class RunExecutor:
                 # so whether this append committed before an exception or cancel does not matter.
                 state.pending.pop(0)
                 try:
-                    await self.store.append_message(run.session_id, run.id, result)
+                    stored.append(await self.store.append_message(run.session_id, run.id, result))
                 except Exception:
                     state.pending.insert(0, call)
                     raise
-                conversation.append(result)
                 state.open_tool = None
                 await self.emit(run.id, "tool.completed", {"tool_call_id": call.id, "tool": call.name,
                                                            "duration_s": duration, "error": outcome.error,
@@ -304,6 +304,71 @@ class RunExecutor:
                     await self.store.set_session_cwd(run.session_id, ctx.cwd)
                     saved_cwd = ctx.cwd
         raise AssertionError("unreachable: the final iteration offers no tools")
+
+    async def _model_call(self, run: Run, turn: _Turn, state: _RunState, *,
+                          final: bool) -> tuple[list[ToolCall], list, bool]:
+        """One model call over the assembled history. The compactor runs first, and once more when the call fails
+        with context_overflow before any output; the call is then retried once."""
+        items, spent = await self.compactor.prepare(run, turn.provider, turn.stored, turn.context, tools=turn.tools,
+                                                    window=turn.window, rebuild=turn.rebuild)
+        state.usage = state.usage + spent
+        retried = False
+        while True:
+            messages = await self._with_images([item.message for item in items], turn.blobs)
+            if final:
+                messages.append(Message("user", (TextPart(prompts.MAX_ITERATIONS_REQUEST),)))
+            request = ModelRequest(
+                provider=run.provider, model=run.model, system=turn.context.system, messages=tuple(messages),
+                instructions=run.instructions, tools=() if final else turn.tools,
+                reasoning_effort=run.reasoning_effort, cache_scope=run.session_id,
+            )
+            try:
+                calls, reasoning, incomplete, usage = await self._stream(run, turn.provider, request, state)
+            except ModelError as error:
+                if error.code != "context_overflow" or retried or state.streamed:
+                    raise
+                retried, before = True, items
+                items, spent = await self.compactor.prepare(run, turn.provider, turn.stored, turn.context,
+                                                            tools=turn.tools, window=turn.window,
+                                                            rebuild=turn.rebuild, overflow=True)
+                state.usage = state.usage + spent
+                if items == before:
+                    raise
+                continue
+            # No anchor when the newest round was cut: later calls send that round whole, so the count would be low.
+            stored = {item.id: item.message for item in turn.stored}
+            cut = any(stored.get(item.id) is not item.message for item in items[compress.round_start(items):])
+            newest = max((item.id for item in items if item.id is not None), default=None)
+            # Nor for the final call: it sends no tool definitions, so its count is low for the calls that do.
+            if usage.input_tokens is not None and newest is not None and not cut and not final:
+                await self.store.set_context_anchor(run.session_id, usage.input_tokens, newest)
+                turn.context.anchor_tokens, turn.context.anchor_id = usage.input_tokens, newest
+            return calls, reasoning, incomplete
+
+    async def _stream(self, run: Run, provider, request: ModelRequest,
+                      state: _RunState) -> tuple[list[ToolCall], list, bool, Usage]:
+        state.text, state.streamed = [], False
+        calls, reasoning, incomplete, usage = [], [], False, Usage()
+        async for event in stream_with_retries(provider, request, sleep=self._sleep):
+            state.streamed = True
+            if isinstance(event, TextDelta):
+                state.text.append(event.text)
+                await self.emit(run.id, "message.delta", {"text": event.text})
+            elif isinstance(event, ReasoningReady):
+                reasoning.append(event.item)
+            elif isinstance(event, ToolCallReady):
+                if request.tools:
+                    calls.append(event.call)
+                else:
+                    log.warning("run %s: the model called %r but no tools were offered; ignoring it",
+                                run.id, event.call.name)
+            elif isinstance(event, Completed):
+                usage = usage + event.usage
+                state.usage = state.usage + event.usage
+                if event.status == "incomplete":
+                    incomplete = True
+                    log.warning("run %s: the model response was incomplete", run.id)
+        return calls, reasoning, incomplete, usage
 
     async def _skills(self, profile_id: str, sandbox, policy, enabled: list[str]) -> list:
         key = (profile_id, policy.digest(), tuple(enabled))
@@ -336,17 +401,21 @@ class RunExecutor:
                 log.warning("run %s: could not record the current command", run.id, exc_info=True)
         return record
 
-    async def _with_images(self, messages: list[Message]) -> list[Message]:
-        """Load the bytes of stored image references; an image whose blob is gone becomes a text note."""
-        ids = [part.blob_id for message in messages for part in message.parts
-               if isinstance(part, ImagePart) and part.blob_id and not part.data_b64]
-        if not ids:
+    async def _with_images(self, messages: list[Message], cache: dict) -> list[Message]:
+        """Load the bytes of stored image references, each once per run; an image whose blob is gone becomes a
+        text note."""
+        wanted = {part.blob_id for message in messages for part in message.parts
+                  if isinstance(part, ImagePart) and part.blob_id and not part.data_b64}
+        if not wanted:
             return list(messages)
-        blobs = await self.store.get_blobs(ids)
+        missing = [blob_id for blob_id in wanted if blob_id not in cache]
+        if missing:
+            found = await self.store.get_blobs(missing)
+            cache.update({blob_id: found.get(blob_id) for blob_id in missing})
 
         def load(part):
             if isinstance(part, ImagePart) and part.blob_id and not part.data_b64:
-                found = blobs.get(part.blob_id)
+                found = cache.get(part.blob_id)
                 return ImagePart(found[0], found[1], part.blob_id) if found else TextPart("[image no longer available]")
             return part
 

@@ -20,7 +20,7 @@ def build_system_prompt(*, soul: str, model: str, provider: str, now: datetime, 
     parts = [identity, prompts.text("guidance"), prompts.text("platform")]
     if skills:
         parts += [prompts.text("skills_header"), render_index(skills), prompts.text("skills_footer")]
-    parts.append(f"Conversation started: {now:%A}, {now:%B} {now.day}, {now.year} (UTC, UTC+00:00)\n"
+    parts.append(f"Current date: {now:%A}, {now:%B} {now.day}, {now.year} (UTC, UTC+00:00)\n"
                  f"Model: {model}\nProvider: {provider}")
     parts.append(prompts.text("environment").format(workdir=workdir or "/"))
     return "\n\n".join(parts)

@@ -40,6 +40,7 @@ class Profile:
     soul: str
     skills: list[str]
     updated_at: float
+    memory: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,14 @@ class Session:
     provider: str | None = None
     model: str | None = None
     cwd: str | None = None
+    summary: str | None = None
+    summary_head_id: int | None = None
+    summary_tail_id: int | None = None
+    context_tokens: int | None = None
+    context_message_id: int | None = None
+    compaction_failed_at: float | None = None
+    turns_since_memory: int = 0
+    pruned_id: int | None = None
 
 
 @dataclass(frozen=True)

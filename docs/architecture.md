@@ -75,6 +75,7 @@ Everything is in `src/keel/`.
 | `api.py` | FastAPI app: auth middleware, routes, error envelope, the SSE stream. |
 | `worker.py` | `WorkerPool`: claim, lease renewal, stop handling, lease sweeper, drain on shutdown. |
 | `runner.py` | `RunExecutor`: the agent loop and the cancel / failure clean-up paths. |
+| `compress.py`, `compactor.py` | Context compression: the pure estimate, boundaries, request assembly and summary input; when a run compacts and what it stores. |
 | `models.py` | Provider-neutral types: `Message`, parts, `ToolCall`, `ModelRequest`, `Usage`, model events. |
 | `store/` | `Store` over a `Db` adapter: `sql.py` (all queries, both dialects), `db.py` (SQLite), `postgres.py`. |
 | `events.py` | `InMemoryEventBus`, `PostgresEventBus`. |
@@ -114,10 +115,17 @@ erDiagram
         text profile_id
         text title "unique per profile"
         text title_source "derived, llm, user"
-        text system_prompt "built once, then frozen"
+        text system_prompt "rebuilt only at a compaction"
         text provider
         text model
         text cwd "working directory carried between turns"
+        text summary "the latest compaction"
+        bigint summary_head_id "last head message"
+        bigint summary_tail_id "first tail message"
+        bigint pruned_id "placeholder boundary"
+        int context_tokens "last reported input tokens"
+        bigint context_message_id "newest message that count included"
+        real compaction_failed_at "last failed summary, pauses retries"
     }
     messages {
         bigint id PK "orders the transcript"
@@ -165,8 +173,10 @@ Rules the schema enforces:
 - **Events are numbered per run.** `(run_id, seq)` is the primary key; `append_event` takes `MAX(seq) + 1` inside a
   transaction and retries up to three times on a unique violation.
 
-The same SQL (`?` placeholders) runs on SQLite and Postgres. The Postgres schema takes an advisory lock while it is
-created so several instances starting together do not race. There are no migrations yet.
+The same SQL (`?` placeholders) runs on SQLite and Postgres. The schema is created and upgraded by numbered
+migrations (`store/migrations.py`) at start: each runs in its own transaction under a Postgres advisory lock, so
+several instances starting together migrate once. A database from 0.2.0 is upgraded in place; one written by a newer
+keel is refused.
 
 ---
 
@@ -284,6 +294,17 @@ Properties worth knowing:
   and an added request to summarise, so the user gets an answer instead of an error. That request is not stored.
 - **Reasoning is replayed.** The provider's reasoning items are stored on the assistant message and sent back in the
   order the provider expects. A provider that rejects them (`invalid_reasoning`) is retried once without them.
+- **Long sessions are compacted in place.** Before each model call the loop estimates the request: the input tokens
+  the provider reported for the last call, plus a heuristic for newer messages (a quarter of a token per ASCII
+  character, one per other character). At `KEEL_COMPRESSION_THRESHOLD` (0.75) of the context window, tool results
+  over 200 characters and images before a recent tail are replaced by one-line placeholders, and the reasoning items
+  there are dropped. If that is not enough (judged by the heuristic, scaled up when the provider counts more),
+  one summary call condenses the middle, and the request becomes the first messages (each cut to about 4,000
+  tokens), the summary and the tail. The same happens once when a call fails with `context_overflow`, and the call
+  is retried. Nothing stored is deleted: `GET …/messages` returns the whole transcript, and the session records only
+  the summary and its boundaries. The system prompt is rebuilt at a compaction and reused byte for byte until the
+  next one. A summary call that fails, or is cut off at the output limit, is not stored, and the threshold retries
+  it only after 10 minutes.
 - **A working directory follows the session.** `terminal` reports the directory it ended in; the executor saves it on
   the session and starts the next turn there.
 - **The skills list is cached** for 60 s per (profile, policy digest, enabled skills), and an empty result is not
@@ -443,13 +464,13 @@ system prompt. The model loads a skill's full text with `skill_view` only when i
 
 ## 10. The system prompt
 
-Built **once per session** and stored in `sessions.system_prompt`, so every later turn sends a byte-identical prefix,
-which is what makes provider-side prompt caching work. In order, stable first:
+Built **once per session** (and again only at a compaction, §6) and stored in `sessions.system_prompt`, so every
+later turn sends a byte-identical prefix, which is what makes provider-side prompt caching work. In order, stable first:
 
 1. **Identity** — the profile's `soul`, or `You are a helpful assistant.`
 2. **Guidance** and **platform** texts (tool use and environment rules).
 3. **Skills** header, index and footer, when there are skills.
-4. **Volatile context** — the date the conversation started, the model and the provider.
+4. **Volatile context** — the current date (as of the build, so refreshed at a compaction), the model and the provider.
 5. **Environment** — the working directory.
 
 Without tools the prompt is the identity alone. Per-run `instructions` (text a client sends with each run) are a
@@ -520,7 +541,7 @@ its users to profiles and keeps the key secret.
 ### Sessions, titles and images
 
 - **Sessions** are created by the first run that names them (or get a generated id). They persist the transcript,
-  the frozen system prompt and the working directory.
+  the system prompt (fixed between compactions) and the working directory.
 - **Titles** come from the first user message (cleaned, bounded, and made unique with `#2` … `#9`), carry a rank
   (`derived` < `llm` < `user`), and a user's title is never overwritten by a lower-ranked one.
 - **Images** (PNG, JPEG, GIF, WebP; at most 4 per run, 5 MiB each, length checked before decoding) are stored as
@@ -579,8 +600,6 @@ The reporting policy for vulnerabilities is in [SECURITY.md](../SECURITY.md).
 - **Run a single instance for now.** The Postgres `LISTEN` connection does not reconnect on its own (cross-instance
   wake-ups then fall back to polling), and `remove_orphans` at start removes every sandbox of the deployment, which
   would break a second instance's runs.
-- **No schema migrations.** The schema is created if missing; a release that changes it needs a fresh database.
-- **No context compression.** A conversation that outgrows the model's window ends a run with `context_overflow`.
 - **Not built:** long-term memory, scheduled jobs, approvals, web search or browsing, MCP servers, agent-written
   skills, a provider for Anthropic's own API.
 - **Postgres needs direct connections** for `LISTEN`; a transaction-mode pooler will not do.

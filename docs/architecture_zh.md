@@ -71,6 +71,7 @@ flowchart TB
 | `api.py` | FastAPI 应用：认证中间件、路由、错误信封、SSE 流。 |
 | `worker.py` | `WorkerPool`：认领、续租、处理停止、租约清扫、关闭时排空。 |
 | `runner.py` | `RunExecutor`：agent 循环，以及取消和失败的清理路径。 |
+| `compress.py`、`compactor.py` | 上下文压缩：纯函数部分（估算、边界、请求组装和摘要输入）；以及 run 何时压缩、存储什么。 |
 | `models.py` | 与 provider 无关的类型：`Message`、各类 part、`ToolCall`、`ModelRequest`、`Usage`、模型事件。 |
 | `store/` | 基于 `Db` 适配器的 `Store`：`sql.py`（两种方言的全部查询）、`db.py`（SQLite）、`postgres.py`。 |
 | `events.py` | `InMemoryEventBus`、`PostgresEventBus`。 |
@@ -109,10 +110,17 @@ erDiagram
         text profile_id
         text title "在同一 profile 内唯一"
         text title_source "derived、llm、user"
-        text system_prompt "构建一次，之后冻结"
+        text system_prompt "只在压缩时重建"
         text provider
         text model
         text cwd "跨轮保留的工作目录"
+        text summary "最近一次压缩的摘要"
+        bigint summary_head_id "最后一条头部消息"
+        bigint summary_tail_id "第一条尾部消息"
+        bigint pruned_id "占位符边界"
+        int context_tokens "上次报告的输入 token 数"
+        bigint context_message_id "该计数包含的最新一条消息"
+        real compaction_failed_at "上次摘要失败的时间，暂停重试"
     }
     messages {
         bigint id PK "决定对话记录的顺序"
@@ -159,8 +167,9 @@ erDiagram
   `404 session_not_found`。
 - **事件按 run 编号。** `(run_id, seq)` 是主键；`append_event` 在事务内取 `MAX(seq) + 1`，遇到唯一约束冲突最多重试三次。
 
-同一套 SQL（`?` 占位符）同时跑在 SQLite 和 Postgres 上。创建 Postgres schema 时会取一个 advisory lock，
-避免多个实例同时启动时互相竞争。目前没有迁移（migration）机制。
+同一套 SQL（`?` 占位符）同时跑在 SQLite 和 Postgres 上。schema 在启动时由编号迁移（`store/migrations.py`）
+创建和升级：每个迁移在自己的事务里、持有 Postgres advisory lock 执行，多个实例同时启动时只会迁移一次。0.2.0 的
+数据库会原地升级；由更新版本 keel 写入的数据库会被拒绝。
 
 ---
 
@@ -273,6 +282,13 @@ flowchart TB
   要求，让用户得到答案而不是错误。这条要求不会被存储。
 - **推理项会被回放。** provider 的推理项存放在 assistant 消息上，并按 provider 期望的顺序回传。若 provider 拒绝
   它们（`invalid_reasoning`），会去掉推理项重试一次。
+- **长会话会原地压缩。** 每次调用模型之前，循环会估算请求的大小：provider 为上一次调用报告的输入 token 数，加上
+  对更新消息的启发式估算（每个 ASCII 字符算四分之一个 token，其他字符各算一个）。达到上下文窗口的
+  `KEEL_COMPRESSION_THRESHOLD`（0.75）时，最近尾部之前超过 200 个字符的工具结果和图片会被替换成一行占位符，那里的
+  推理项也会被丢弃。如果这还不够（用启发式估算判断；provider 计得更多时按比例放大），就发起一次摘要调用来浓缩
+  中间部分，请求随之变成开头几条消息（每条截到约 4,000 个 token）、摘要和尾部。调用以 `context_overflow` 失败时也会这样做一次，然后重试该调用。存储的内容不会被删除：`GET …/messages` 返回
+  完整的对话记录，会话只记录摘要及其边界。系统提示词在压缩时重建，在下一次压缩之前逐字节复用。摘要调用失败或在
+  输出上限处被截断时不会被存储，阈值触发要在 10 分钟之后才会重试。
 - **工作目录跟随会话。** `terminal` 会报告命令结束时所在的目录；执行器把它保存在会话上，下一轮从那里开始。
 - **skills 列表有缓存**：按（profile、策略摘要、启用的 skills）缓存 60 秒；空结果不缓存，因为它可能是一次失败的列举。
 
@@ -420,13 +436,13 @@ skill 是一个带有 `SKILL.md` 的目录，其 front matter 包含名称和描
 
 ## 10. 系统提示词
 
-每个会话**只构建一次**，保存在 `sessions.system_prompt` 里，所以之后每一轮发送的前缀都逐字节相同，这正是 provider
-端提示词缓存能起作用的前提。顺序如下，稳定的内容在前：
+每个会话**只构建一次**（只在压缩时重建，见 §6），保存在 `sessions.system_prompt` 里，所以之后每一轮发送的前缀都
+逐字节相同，这正是 provider 端提示词缓存能起作用的前提。顺序如下，稳定的内容在前：
 
 1. **身份** — profile 的 `soul`，或 `You are a helpful assistant.`
 2. **指导**与**平台**文本（工具使用和环境规则）。
 3. **Skills** 的页眉、索引和页脚（有 skills 时）。
-4. **易变的上下文** — 对话开始的日期、模型和 provider。
+4. **易变的上下文** — 当前日期（构建时的日期，压缩时随之刷新）、模型和 provider。
 5. **环境** — 工作目录。
 
 没有工具时，提示词只有身份这一部分。每次 run 的 `instructions`（客户端随每次 run 发送的文本）是模型请求中的独立字段，
@@ -490,7 +506,7 @@ keel 不认识终端用户：**profile 是租户的单位**，由前面的产品
 
 ### 会话、标题与图片
 
-- **会话**由第一个指明它的 run 创建（否则会生成一个 id）。它们保存对话记录、冻结的系统提示词和工作目录。
+- **会话**由第一个指明它的 run 创建（否则会生成一个 id）。它们保存对话记录、系统提示词（两次压缩之间保持不变）和工作目录。
 - **标题**来自第一条用户消息（清理、限长，并用 `#2` … `#9` 保证唯一），带有等级（`derived` < `llm` < `user`），
   用户设置的标题不会被低等级的标题覆盖。
 - **图片**（PNG、JPEG、GIF、WebP；每个 run 最多 4 张，每张 5 MiB，在解码前先检查长度）以 blob 存储；消息里只保留
@@ -544,8 +560,6 @@ flowchart LR
 
 - **目前只运行一个实例。** Postgres 的 `LISTEN` 连接不会自行重连（跨实例唤醒随后退回到轮询），而且启动时的
   `remove_orphans` 会删除该部署的所有沙箱，这会破坏第二个实例上正在进行的 run。
-- **没有 schema 迁移。** schema 缺失时会被创建；如果某个版本改了 schema，就需要一个全新的数据库。
-- **没有上下文压缩。** 超出模型窗口的对话会以 `context_overflow` 结束 run。
 - **尚未实现：** 长期记忆、定时任务、审批、网页搜索或浏览、MCP 服务器、agent 自己编写的 skills、Anthropic 官方
   API 的 provider。
 - **Postgres 需要直连**以支持 `LISTEN`；事务模式的连接池不行。
