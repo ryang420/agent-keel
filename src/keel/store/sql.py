@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import Callable
 
+from keel.memory import apply_entries
 from keel.models import (
     Message, Usage, part_from_dict, part_to_dict, reasoning_from_dict, reasoning_to_dict,
     tool_call_from_dict, tool_call_to_dict,
@@ -86,17 +87,49 @@ class SqlStore:
     # profiles
 
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
-                             skills: list[str]) -> Profile:
+                             skills: list[str], memory: bool = False) -> Profile:
         await self.db.execute(
-            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET models = excluded.models, sandbox = excluded.sandbox, "
-            "soul = excluded.soul, skills = excluded.skills, updated_at = excluded.updated_at",
-            profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock())
+            "soul = excluded.soul, skills = excluded.skills, updated_at = excluded.updated_at, "
+            "memory = excluded.memory",
+            profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory))
         return await self.get_profile(profile_id)
 
     async def get_profile(self, profile_id: str) -> Profile | None:
         row = await self.db.fetchrow("SELECT * FROM profiles WHERE id = ?", profile_id)
         return _profile(row) if row else None
+
+    # memory
+
+    async def apply_memory(self, profile_id: str, target: str, limit: int, ops: list[dict]) -> dict:
+        """Read, modify and write one target in a single transaction (a row lock on Postgres)."""
+        if target not in ("memory", "user"):
+            return {"success": False, "error": "target must be memory or user.", "entries": []}
+        async with self.db.transaction():
+            await self.db.execute(
+                "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, '[]', ?) "
+                "ON CONFLICT (profile_id, target) DO NOTHING",
+                profile_id, target, self.clock())
+            lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
+            row = await self.db.fetchrow(
+                f"SELECT entries FROM memories WHERE profile_id = ? AND target = ?{lock}", profile_id, target)
+            current = json.loads(row["entries"])
+            updated, result = apply_entries(current, ops, limit)
+            if result["success"] and updated != current:
+                await self.db.execute(
+                    "UPDATE memories SET entries = ?, updated_at = ? WHERE profile_id = ? AND target = ?",
+                    _j(updated), self.clock(), profile_id, target)
+            return result
+
+    async def memory_entries(self, profile_id: str) -> dict[str, list[str]]:
+        rows = await self.db.fetch("SELECT target, entries FROM memories WHERE profile_id = ?", profile_id)
+        found = {row["target"]: json.loads(row["entries"]) for row in rows}
+        return {"memory": found.get("memory", []), "user": found.get("user", [])}
+
+    async def reset_memory_turns(self, session_id: str) -> None:
+        await self.db.execute("UPDATE sessions SET turns_since_memory = 0 WHERE id = ?", session_id)
 
     # sessions
 

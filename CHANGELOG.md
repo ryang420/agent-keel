@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `PUT /v1/profiles/{id}` accepts `memory` (a boolean). Omitting it stores false, including when replacing a
+  profile that had memory on. Memory entries for a profile are written in one transaction.
 - A session's first completed run may replace its derived title with a short model title (`title_source` `llm`).
   A user rename still wins, and a reply that is empty, vague, or not a short title keeps the derived one. Numbered
   suffixes (`#2`, `#3`, …) are no longer capped.

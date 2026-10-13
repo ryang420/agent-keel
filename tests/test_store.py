@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from keel.models import ImagePart, Message, ReasoningItem, TextPart, ToolCall, Usage
@@ -16,8 +18,12 @@ async def make_run(store, session_id="s1", profile_id="p1"):
 async def test_profiles_upsert_and_read(store):
     first = await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="You help.", skills=["a"])
     assert first.models == MODELS and first.soul == "You help." and first.skills == ["a"]
+    assert first.memory is False
+    remembered = await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="You help.", skills=["a"],
+                                            memory=True)
+    assert remembered.memory is True
     second = await store.upsert_profile("p1", models=[], sandbox={"image": "x"}, soul="", skills=[])
-    assert second.models == [] and second.sandbox == {"image": "x"}
+    assert second.models == [] and second.sandbox == {"image": "x"} and second.memory is False
     assert await store.get_profile("missing") is None
 
 
@@ -314,3 +320,47 @@ async def test_pruning_with_a_lower_bound_keeps_the_events_of_runs_finished_befo
     assert len(await store.events_after(runs[0].id, 0)) == 3
     assert await store.events_after(runs[1].id, 0) == []
     assert await store.prune_events(1200, finished_after=1000) == 3
+
+
+async def test_memory_writes_are_a_transaction(store):
+    await store.apply_memory("p1", "memory", 100, [{"action": "add", "content": "one"}])
+    await store.apply_memory("p1", "memory", 100, [{"action": "add", "content": "two"}])
+    assert await store.memory_entries("p1") == {"memory": ["one", "two"], "user": []}
+
+    await asyncio.gather(
+        store.apply_memory("p2", "memory", 100, [{"action": "add", "content": "left"}]),
+        store.apply_memory("p2", "memory", 100, [{"action": "add", "content": "right"}]))
+    assert sorted((await store.memory_entries("p2"))["memory"]) == ["left", "right"]
+
+    # The row already exists, and the read pauses, so the two adds overlap. A lost update keeps only one of them.
+    await store.apply_memory("p3", "memory", 100, [{"action": "add", "content": "base"}])
+    original = store.db.fetchrow
+
+    async def pausing(sql, *args):
+        row = await original(sql, *args)
+        if "FROM memories" in sql:
+            await asyncio.sleep(0.1)
+        return row
+
+    store.db.fetchrow = pausing
+    try:
+        await asyncio.gather(
+            store.apply_memory("p3", "memory", 100, [{"action": "add", "content": "left"}]),
+            store.apply_memory("p3", "memory", 100, [{"action": "add", "content": "right"}]))
+    finally:
+        store.db.fetchrow = original
+    assert sorted((await store.memory_entries("p3"))["memory"]) == ["base", "left", "right"]
+
+
+async def test_a_failed_batch_stores_nothing(store):
+    result = await store.apply_memory("p1", "memory", 1, [
+        {"action": "add", "content": "a"}, {"action": "add", "content": "b"}])
+    assert result["success"] is False and result["entries"] == []
+    assert await store.memory_entries("p1") == {"memory": [], "user": []}
+
+
+async def test_reset_memory_turns_zeroes_the_counter(store):
+    await store.ensure_session("p1", "s1")
+    await store.db.execute("UPDATE sessions SET turns_since_memory = 7 WHERE id = ?", "s1")
+    await store.reset_memory_turns("s1")
+    assert (await store.get_session("p1", "s1")).turns_since_memory == 0

@@ -415,6 +415,17 @@ async def test_no_blob_is_left_behind_when_a_later_step_fails(service, monkeypat
     assert puts and await store.get_blobs(puts) == {}
 
 
+async def test_profile_memory_is_a_boolean_and_omitted_means_false(service):
+    client, _, _ = service
+    enabled = await client.put("/v1/profiles/p1", json={"memory": True, **PROFILE})
+    assert enabled.status_code == 200 and enabled.json()["memory"] is True
+    cleared = await client.put("/v1/profiles/p1", json=PROFILE)
+    assert cleared.status_code == 200 and cleared.json()["memory"] is False
+    bad = await client.put("/v1/profiles/p1", json={"memory": "yes", **PROFILE})
+    assert bad.status_code == 400 and bad.json()["error"]["code"] == "invalid_input"
+    assert bad.json()["error"]["message"] == "memory must be a boolean."
+
+
 async def test_the_stream_of_a_pruned_run_closes_at_once(service):
     client, _, store = service
     await client.put("/v1/profiles/p1", json=PROFILE)

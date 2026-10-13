@@ -38,7 +38,8 @@ Errors have one shape, with a machine-readable code:
   "models": [{"provider": "bedrock", "model": "openai.gpt-6-luna"}],
   "sandbox": {"image": "python:3.12-slim", "workdir": "/work"},
   "soul": "You are a careful data assistant.",
-  "skills": ["my-skill"]
+  "skills": ["my-skill"],
+  "memory": false
 }
 ```
 
@@ -46,8 +47,9 @@ Errors have one shape, with a machine-readable code:
 - `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means no tools.
 - `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
 - `skills`: the names of the skills to enable.
+- `memory`: when true, the profile opts in to long-term memory. Omitted, it is false, including when replacing a profile that had it on. Anything other than a boolean is 400 `invalid_input`.
 
-The response echoes `id`, `models`, `sandbox`, `soul`, `skills` and `updated_at`.
+The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 
 ## Starting a run
 
