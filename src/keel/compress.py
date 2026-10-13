@@ -11,7 +11,7 @@ from typing import Sequence
 from keel import prompts
 from keel.models import ImagePart, Message, TextPart
 from keel.store.base import Session, StoredMessage
-from keel.tools.base import truncate_middle
+from keel.tools.base import cap_json_result, truncate_middle
 
 MESSAGE_OVERHEAD = 4
 IMAGE_TOKENS = 1_600
@@ -122,7 +122,8 @@ def _cut_text(text: str, max_tokens: int) -> str:
     tokens = text_tokens(text)
     if tokens <= max_tokens:
         return text
-    return truncate_middle(text, max(1, len(text) * max_tokens // tokens))
+    cut = truncate_middle(text, max(1, len(text) * max_tokens // tokens))
+    return cut if len(cut) < len(text) else text
 
 
 def cut_message(message: Message, max_tokens: int) -> Message:
@@ -133,6 +134,16 @@ def cut_message(message: Message, max_tokens: int) -> Message:
     parts = tuple(TextPart(_cut_text(part.text, max_tokens * text_tokens(part.text) // total))
                   if isinstance(part, TextPart) and part.text else part for part in message.parts)
     return replace(message, parts=parts)
+
+
+def cut_head(message: Message) -> Message:
+    """A head message once there is a summary: text cut to about HEAD_MESSAGE_TOKENS, each call's arguments brought
+    under the same size and kept valid JSON, images replaced by a note, and reasoning dropped."""
+    cut = cut_message(message, HEAD_MESSAGE_TOKENS)
+    parts = tuple(TextPart(IMAGE_OMITTED) if isinstance(part, ImagePart) else part for part in cut.parts)
+    calls = tuple(replace(call, arguments=cap_json_result(call.arguments, HEAD_MESSAGE_TOKENS * 4))
+                  for call in cut.tool_calls)
+    return replace(cut, parts=parts, tool_calls=calls, reasoning=())
 
 
 def summary_message(summary: str) -> Message:
@@ -157,15 +168,14 @@ def _fit_newest_round(items: list[Item], budget: int) -> list[Item]:
 
 def assemble(stored: Sequence[StoredMessage], bounds: Boundaries, budget: int) -> list[Item]:
     """What is sent for a session's stored messages. With no boundary, every message as stored. Otherwise the head
-    (each message cut to HEAD_MESSAGE_TOKENS once there is a summary), the summary as a user message, the rest with
+    (each message through `cut_head` once there is a summary), the summary as a user message, the rest with
     the placeholder pass below `pruned_id`, and the newest round cut to the tail budget."""
     if not bounds.active:
         return [Item(item.id, item.message) for item in stored]
     if bounds.summary is not None:
         head = [item for item in stored if item.id <= bounds.head_id]
         rest = [item for item in stored if item.id >= bounds.tail_id]
-        items = [Item(item.id, replace(cut_message(item.message, HEAD_MESSAGE_TOKENS), reasoning=()))
-                 for item in head]
+        items = [Item(item.id, cut_head(item.message)) for item in head]
         items.append(Item(None, summary_message(bounds.summary)))
     else:
         end = head_end(stored)

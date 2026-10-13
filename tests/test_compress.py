@@ -66,8 +66,9 @@ def test_the_tail_fits_its_budget_and_never_splits_a_call_from_its_result():
 
 
 def test_the_placeholder_pass_replaces_long_tool_results_and_images():
-    assert (compress.placeholder(result("c1", "y" * 201, name="read_file")).text
-            == "[read_file result omitted from context: 201 characters]")
+    long = compress.placeholder(result("c1", "y" * 201, name="read_file"))
+    assert long.text == "[read_file result omitted from context: 201 characters]"
+    assert (long.tool_call_id, long.tool_name) == ("c1", "read_file")
     short = result("c2", "y" * 200)
     assert compress.placeholder(short) == short
     picture = Message("user", (TextPart("see"), ImagePart("image/png", blob_id="b1")))
@@ -107,6 +108,33 @@ def test_with_a_summary_a_head_message_over_the_limit_is_cut_in_the_request_only
     assert "OUTPUT TRUNCATED" in first and compress.text_tokens(first) <= compress.HEAD_MESSAGE_TOKENS + 50
     assert messages[0].message.text == "q" * 40_000
     assert compress.assemble(messages, compress.Boundaries(pruned_id=4), 10_000)[0].message == messages[0].message
+
+
+def test_with_a_summary_head_call_arguments_are_capped_as_json_and_images_become_notes():
+    big_call = call("c1", "write_file", path="/w/a.txt", content="c" * 40_000)
+    picture = Message("user", (TextPart("see"), ImagePart("image/png", blob_id="b1")))
+    messages = stored(picture, assistant("", big_call), result("c1", "ok", name="write_file"), assistant("d"),
+                      user("e"))
+    items = compress.assemble(messages, compress.Boundaries("S", 3, 4, 4), 10_000)
+    sent = items[1].message.tool_calls[0]
+    assert sent.id == "c1" and len(sent.arguments) < 16_100 and json.loads(sent.arguments)["path"] == "/w/a.txt"
+    assert items[0].message.parts == (TextPart("see"), TextPart(compress.IMAGE_OMITTED))
+    unchanged = compress.assemble(messages, compress.Boundaries(pruned_id=4), 10_000)
+    assert [item.message for item in unchanged[:3]] == [item.message for item in messages[:3]]
+
+
+def test_with_a_summary_head_messages_lose_their_reasoning():
+    item = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
+    messages = stored(user("a"), Message("assistant", (TextPart("b"),), reasoning=(item,)), user("c"),
+                      assistant("d"), user("e"))
+    items = compress.assemble(messages, compress.Boundaries("S", 3, 4, 4), 10_000)
+    assert items[1].message.reasoning == () and items[1].message.text == "b"
+
+
+def test_cutting_a_message_never_lengthens_a_short_part():
+    message = Message("user", (TextPart("x" * 40_000), TextPart("0123456789")))
+    cut = compress.cut_message(message, 1_000)
+    assert "OUTPUT TRUNCATED" in cut.parts[0].text and cut.parts[1] == TextPart("0123456789")
 
 
 def test_a_newest_round_over_the_tail_budget_is_cut_in_the_request_only():
