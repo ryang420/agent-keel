@@ -442,7 +442,7 @@ skill 是一个带有 `SKILL.md` 的目录，其 front matter 包含名称和描
 1. **身份** — profile 的 `soul`，或 `You are a helpful assistant.`
 2. **指导**与**平台**文本（工具使用和环境规则）。
 3. **Skills** 的页眉、索引和页脚（有 skills 时）。
-4. **易变的上下文** — 对话开始的日期、模型和 provider。
+4. **易变的上下文** — 当前日期（构建时的日期，压缩时随之刷新）、模型和 provider。
 5. **环境** — 工作目录。
 
 没有工具时，提示词只有身份这一部分。每次 run 的 `instructions`（客户端随每次 run 发送的文本）是模型请求中的独立字段，

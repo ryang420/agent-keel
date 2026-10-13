@@ -470,7 +470,7 @@ later turn sends a byte-identical prefix, which is what makes provider-side prom
 1. **Identity** — the profile's `soul`, or `You are a helpful assistant.`
 2. **Guidance** and **platform** texts (tool use and environment rules).
 3. **Skills** header, index and footer, when there are skills.
-4. **Volatile context** — the date the conversation started, the model and the provider.
+4. **Volatile context** — the current date (as of the build, so refreshed at a compaction), the model and the provider.
 5. **Environment** — the working directory.
 
 Without tools the prompt is the identity alone. Per-run `instructions` (text a client sends with each run) are a
