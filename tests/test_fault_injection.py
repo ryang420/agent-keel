@@ -20,14 +20,16 @@ from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import CANCELLED_TOOL_RESULT, RunExecutor
-from keel.sandbox.base import SandboxError
+from keel.sandbox.base import SandboxError, parse_policy
 from keel.sandbox.local import LocalSandbox
+from keel.store import open_store
 from keel.worker import WorkerPool
 
 needs_docker = pytest.mark.skipif(os.environ.get("KEEL_TEST_DOCKER") != "1", reason="set KEEL_TEST_DOCKER=1")
 needs_subprocess = pytest.mark.skipif(os.environ.get("KEEL_TEST_SUBPROCESS") != "1",
                                       reason="set KEEL_TEST_SUBPROCESS=1")
 IMAGE = os.environ.get("KEEL_TEST_DOCKER_IMAGE", "python:3.12-slim")
+TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 
 
 async def no_sleep(seconds):
@@ -77,6 +79,13 @@ async def consistent(store, session="s1"):
     return messages
 
 
+async def one_terminal_event(store, run_id):
+    """The run's terminal event, after checking it has exactly one."""
+    terminal = [e for e in await store.events_after(run_id, 0) if e.type in TERMINAL_EVENTS]
+    assert len(terminal) == 1, f"{run_id} has terminal events {[e.type for e in terminal]}"
+    return terminal[0]
+
+
 class Dying:
     """The store as a worker sees it when it dies: once `dead` is set, every call fails."""
 
@@ -103,28 +112,47 @@ async def test_a_worker_that_dies_mid_command_is_swept_its_command_killed_and_th
     worker_a = RunExecutor(dying, InMemoryEventBus(), registry, sandbox=sandbox, sleep=no_sleep)
     run = await start(store, owner="worker-a", lease_until=clock.now + 30)
     abandoned = asyncio.create_task(worker_a.execute(run))
-    for _ in range(250):
-        current = await store.get_run_by_id(run.id)
-        if current.current_exec_id and sandbox._groups:
-            break
-        await asyncio.sleep(0.02)
-    assert current.current_exec_id
-    dying.dead = True
-    clock.now += 31
-    pool_b = WorkerPool(store, InMemoryEventBus(), executor, owner="worker-b", clock=clock)
-    assert await pool_b.sweep_once() == 1
-    await asyncio.wait_for(abandoned, 10)  # its command was killed, so worker A's stalled tool call returned
-    lost = await store.get_run("p1", run.id)
-    assert (lost.status, lost.error_code, lost.current_exec_id) == ("failed", "worker_lost", None)
-    await asyncio.sleep(0.2)
-    assert not (work / "late").exists()
-    provider.script = [answer("recovered")]
-    nxt = await start(store, "again")
-    await executor.execute(nxt)
-    assert (await store.get_run("p1", nxt.id)).output == "recovered"
-    messages = await consistent(store)
-    assert [m.role for m in messages] == ["user", "assistant", "tool", "user", "assistant"]
-    assert messages[2].text == CANCELLED_TOOL_RESULT
+    try:
+        for _ in range(250):
+            current = await store.get_run_by_id(run.id)
+            if current.current_exec_id and sandbox._groups:
+                break
+            await asyncio.sleep(0.02)
+        assert current.current_exec_id
+        pgid = sandbox._groups[current.current_exec_id]
+        dying.dead = True
+        clock.now += 31
+        pool_b = WorkerPool(store, InMemoryEventBus(), executor, owner="worker-b", clock=clock)
+        assert await pool_b.sweep_once() == 1
+        await asyncio.wait_for(abandoned, 10)  # its command was killed, so worker A's stalled tool call returned
+        lost = await store.get_run("p1", run.id)
+        assert (lost.status, lost.error_code, lost.current_exec_id) == ("failed", "worker_lost", None)
+        assert (await one_terminal_event(store, run.id)).data["error_code"] == "worker_lost"  # the sweeper's
+        assert await group_gone(pgid)
+        provider.script = [answer("recovered")]
+        nxt = await start(store, "again")
+        await executor.execute(nxt)
+        assert (await store.get_run("p1", nxt.id)).output == "recovered"
+        assert (await one_terminal_event(store, nxt.id)).type == "run.completed"
+        messages = await consistent(store)
+        assert [m.role for m in messages] == ["user", "assistant", "tool", "user", "assistant"]
+        assert messages[2].text == CANCELLED_TOOL_RESULT
+    finally:
+        abandoned.cancel()
+        await asyncio.gather(abandoned, return_exceptions=True)
+        local = await sandbox.ensure("p1", parse_policy({"image": "local", "workdir": str(work)}))
+        for exec_id in list(sandbox._groups):
+            await sandbox.kill_tree(local, exec_id)
+
+
+async def group_gone(pgid, seconds=5.0):
+    for _ in range(int(seconds / 0.05)):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        await asyncio.sleep(0.05)
+    return False
 
 
 async def test_three_provider_5xx_fail_the_run_and_the_next_turn_works(parts):
@@ -138,6 +166,8 @@ async def test_three_provider_5xx_fail_the_run_and_the_next_turn_works(parts):
     nxt = await start(store, "again")
     await executor.execute(nxt)
     assert (await store.get_run("p1", nxt.id)).output == "back"
+    assert (await one_terminal_event(store, run.id)).type == "run.failed"
+    assert (await one_terminal_event(store, nxt.id)).type == "run.completed"
     assert [m.role for m in await consistent(store)] == ["user", "user", "assistant"]
 
 
@@ -149,6 +179,7 @@ async def test_two_provider_5xx_then_success_complete_and_count_usage_once(parts
     done = await store.get_run("p1", run.id)
     assert (done.status, done.output, done.usage) == ("completed", "fine", Usage(10, 2, 0, 0))
     assert len(provider.requests) == 3
+    assert (await one_terminal_event(store, run.id)).type == "run.completed"
     await consistent(store)
 
 
@@ -163,6 +194,8 @@ async def test_a_provider_failing_after_output_is_not_retried_and_the_next_turn_
     nxt = await start(store, "again")
     await executor.execute(nxt)
     assert (await store.get_run("p1", nxt.id)).output == "next"
+    assert (await one_terminal_event(store, run.id)).type == "run.failed"
+    assert (await one_terminal_event(store, nxt.id)).type == "run.completed"
     await consistent(store)
 
 
@@ -186,6 +219,7 @@ async def test_a_sandbox_call_that_fails_once_becomes_a_tool_error_and_the_run_c
     run = await start(store)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).output == "done"
+    assert (await one_terminal_event(store, run.id)).type == "run.completed"
     results = [m for m in await consistent(store) if m.role == "tool"]
     assert "sandbox is unavailable" in results[0].text
     assert json.loads(results[1].text)["output"] == "two"
@@ -216,6 +250,7 @@ async def test_a_container_removed_between_two_tool_calls_is_recreated(store):
         run = await start(store)
         await executor.execute(run)
         assert (await store.get_run("p1", run.id)).output == "done"
+        assert (await one_terminal_event(store, run.id)).type == "run.completed"
         results = [m for m in await consistent(store) if m.role == "tool"]
         second = json.loads(results[1].text)
         assert second["exit_code"] == 0 and second["output"] == "two"
@@ -248,8 +283,10 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-async def wait_healthy(client, seconds=20.0):
+async def wait_healthy(client, server, seconds=20.0):
     for _ in range(int(seconds / 0.1)):
+        if server.poll() is not None:
+            raise AssertionError(f"the server exited with {server.returncode}")
         try:
             if (await client.get("/healthz")).status_code == 200:
                 return
@@ -281,7 +318,7 @@ async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_contin
     try:
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", headers={"Authorization": "Bearer k"},
                                      timeout=10) as client:
-            await wait_healthy(client)
+            await wait_healthy(client, server)
             await client.put("/v1/profiles/p1", json={"models": [{"provider": "fake", "model": "m"}]})
             payload = {"input": "hi", "session_id": "s1", "provider": "fake", "model": "m"}
             run_id = (await client.post("/v1/profiles/p1/runs", json=payload)).json()["run_id"]
@@ -289,7 +326,7 @@ async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_contin
             server.send_signal(signal.SIGKILL)
             server.wait(10)
             server = spawn("ok")
-            await wait_healthy(client)
+            await wait_healthy(client, server)
             lost = await wait_status(client, run_id, {"failed"})
             assert lost["error_code"] == "worker_lost"
             again = {**payload, "input": "again"}
@@ -298,3 +335,10 @@ async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_contin
     finally:
         server.kill()
         server.wait(10)
+    store = await open_store(f"sqlite:///{db}")
+    try:
+        assert (await one_terminal_event(store, run_id)).data["error_code"] == "worker_lost"
+        assert (await one_terminal_event(store, nxt)).type == "run.completed"
+        assert [m.role for m in await consistent(store)] == ["user", "user", "assistant"]
+    finally:
+        await store.close()
