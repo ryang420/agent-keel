@@ -255,17 +255,20 @@ async def test_compaction_state_is_stored_and_cleared(store):
 
 
 async def test_in_flight_profiles_are_those_with_a_queued_or_running_run(store):
-    for profile in ("p1", "p2", "p3"):
+    for profile in ("p1", "p2", "p3", "p4"):
         await store.upsert_profile(profile, models=[], sandbox={}, soul="", skills=[])
         await store.ensure_session(profile, "s-" + profile)
     runs = {}
-    for profile in ("p1", "p2", "p3"):
+    for profile in ("p1", "p2", "p3", "p4"):
         runs[profile] = await store.create_run(profile_id=profile, session_id="s-" + profile, provider="fake",
                                                model="m", reasoning_effort=None,
                                                input_parts=[{"type": "text", "text": "hi"}], instructions=None)
     await store.claim_run("w1", 9_999_999)  # one of them is now running, which is still in flight
     await store.finish_run(runs["p3"].id, "completed")
-    assert await store.in_flight_profiles() == {"p1", "p2"}
+    while (await store.get_run("p4", runs["p4"].id)).status != "running":
+        assert await store.claim_run("w1", 9_999_999) is not None
+    assert (await store.request_stop("p4", runs["p4"].id)).status == "stopping"
+    assert await store.in_flight_profiles() == {"p1", "p2", "p4"}
 
 
 async def test_pruning_deletes_only_events_of_runs_finished_before_the_cutoff(store, clock):
@@ -293,3 +296,21 @@ async def test_pruning_deletes_only_events_of_runs_finished_before_the_cutoff(st
     assert (old.status, old.output) == ("completed", "old")
     assert len(await store.messages("s1")) == 1
     assert await store.prune_events(1050) == 0
+
+
+async def test_pruning_with_a_lower_bound_keeps_the_events_of_runs_finished_before_it(store, clock):
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+    runs = []
+    for session in ("s1", "s2"):
+        await store.ensure_session("p1", session)
+        runs.append(await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m",
+                                           reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                           instructions=None))
+        for _ in range(3):
+            await store.append_event(runs[-1].id, "message.delta", {"text": "x"})
+        await store.finish_run(runs[-1].id, "completed")  # at 1000, then at 1100
+        clock.now += 100
+    assert await store.prune_events(1200, finished_after=1050, batch=2) == 3
+    assert len(await store.events_after(runs[0].id, 0)) == 3
+    assert await store.events_after(runs[1].id, 0) == []
+    assert await store.prune_events(1200, finished_after=1000) == 3

@@ -376,6 +376,30 @@ async def test_prune_once_deletes_events_older_than_the_retention(store, clock):
     assert await pool.prune_once() == 1
 
 
+async def test_after_a_successful_prune_the_next_scans_only_runs_finished_since(store, clock):
+    calls = []
+
+    class Spy:
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+        async def prune_events(self, finished_before, finished_after=None):
+            calls.append((finished_before, finished_after))
+            if len(calls) == 1:
+                raise RuntimeError("db blip")
+            return 0
+
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    pool = WorkerPool(Spy(), InMemoryEventBus(), executor, owner="w1", clock=clock, event_retention_s=100,
+                      maintenance_s=10)
+    with pytest.raises(RuntimeError):
+        await pool.prune_once()
+    await pool.prune_once()
+    clock.now += 10
+    await pool.prune_once()
+    assert calls == [(900, None), (900, None), (910, 890)]
+
+
 async def test_the_maintenance_task_prunes_at_start_and_stops_on_close(store, clock):
     executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
     run = await queue(store)

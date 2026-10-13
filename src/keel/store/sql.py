@@ -376,15 +376,18 @@ class SqlStore:
                                    run_id, after_seq)
         return [_event(row) for row in rows]
 
-    async def prune_events(self, finished_before: float, batch: int = 10_000) -> int:
-        """Delete the events of runs that finished before `finished_before`, `batch` rows per statement so no pass
-        holds a long transaction. Runs, their output and the session's messages are kept."""
+    async def prune_events(self, finished_before: float, finished_after: float | None = None,
+                           batch: int = 10_000) -> int:
+        """Delete the events of runs that finished before `finished_before` (and at or after `finished_after`, so a
+        regular pass does not rescan all history), `batch` rows per statement so no pass holds a long transaction.
+        Runs, their output and the session's messages are kept."""
+        bound, args = ("", ()) if finished_after is None else (" AND r.finished_at >= ?", (finished_after,))
         total = 0
         while True:
             rows = await self.db.fetch(
                 "DELETE FROM run_events WHERE (run_id, seq) IN (SELECT e.run_id, e.seq FROM run_events e "
-                "JOIN runs r ON r.id = e.run_id WHERE r.finished_at < ? LIMIT ?) RETURNING seq",
-                finished_before, batch)
+                f"JOIN runs r ON r.id = e.run_id WHERE r.finished_at < ?{bound} LIMIT ?) RETURNING seq",
+                finished_before, *args, batch)
             total += len(rows)
             if len(rows) < batch:
                 return total

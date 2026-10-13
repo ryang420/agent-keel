@@ -32,6 +32,7 @@ class WorkerPool:
         self._closing = False
         self._stop = asyncio.Event()
         self._inflight: dict[str, object] = {}
+        self._pruned_before: float | None = None  # the cutoff of the last successful prune
 
     async def start(self) -> None:
         self._closing = False
@@ -91,9 +92,15 @@ class WorkerPool:
             await asyncio.sleep(self.lease_seconds)
 
     async def prune_once(self) -> int:
+        """The first pass after start scans all history; later ones only runs finished since the previous cutoff,
+        less one interval of overlap so nothing is skipped."""
         if self.event_retention_s is None:
             return 0
-        return await self.store.prune_events(self.clock() - self.event_retention_s)
+        cutoff = self.clock() - self.event_retention_s
+        after = None if self._pruned_before is None else self._pruned_before - self.maintenance_s
+        deleted = await self.store.prune_events(cutoff, finished_after=after)
+        self._pruned_before = cutoff
+        return deleted
 
     async def _maintain(self) -> None:
         """Hourly: delete old run events. Passes on several instances may overlap; deleting rows already gone is
