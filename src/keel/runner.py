@@ -11,6 +11,7 @@ import time
 from typing import Callable
 
 from keel import prompts
+from keel import compress
 from keel.compactor import Compactor, SessionContext
 from keel.compress import Boundaries
 from keel.models import (
@@ -237,6 +238,7 @@ class RunExecutor:
             ctx = ToolContext(self.sandbox, sandbox, cwd=(session.cwd if session and session.cwd else policy.workdir),
                               skills=tuple(skills), on_exec=self._exec_recorder(run, state))
         saved_cwd = ctx.cwd if ctx else None
+
         def rebuild() -> str:
             return build_system_prompt(soul=profile.soul if profile else "", model=run.model, provider=run.provider,
                                        now=self._now(), tools=ctx is not None, skills=skills,
@@ -333,8 +335,11 @@ class RunExecutor:
                 if items == before:
                     raise
                 continue
+            # No anchor when the newest round was cut: later calls send that round whole, so the count would be low.
+            stored = {item.id: item.message for item in turn.stored}
+            cut = any(stored.get(item.id) is not item.message for item in items[compress.round_start(items):])
             newest = max((item.id for item in items if item.id is not None), default=None)
-            if usage.input_tokens is not None and newest is not None:
+            if usage.input_tokens is not None and newest is not None and not cut:
                 await self.store.set_context_anchor(run.session_id, usage.input_tokens, newest)
                 turn.context.anchor_tokens, turn.context.anchor_id = usage.input_tokens, newest
             return calls, reasoning, incomplete

@@ -212,6 +212,84 @@ async def test_a_failed_summary_pauses_summaries_for_ten_minutes(parts):
     assert len(model.summaries) == 2 and session.summary == "SUMMARY" and session.compaction_failed_at is None
 
 
+async def test_a_call_whose_newest_round_was_cut_records_no_anchor(store, tmp_path):
+    model = Model(40_000)
+    registry = ProviderRegistry()
+    registry.register(model)
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
+                               sandbox={"image": "local", "workdir": str(tmp_path / "work")})
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
+                           sleep=no_sleep)
+    anchors = []
+    record = store.set_context_anchor
+
+    async def spy(session_id, tokens, message_id):
+        anchors.append(tokens)
+        await record(session_id, tokens, message_id)
+
+    store.set_context_anchor = spy
+    await seed(store, 2, text="earlier")
+    await store.set_pruned("s1", (await store.messages("s1"))[-1].id)
+    huge = ToolCall("c1", "terminal", json.dumps({"command": "python3 -c \"print('z' * 60000)\""}))
+    model.script = [
+        [ToolCallReady(huge), Completed(Usage(18_500, 5, 0, 0))],
+        [ToolCallReady(ToolCall("c2", "terminal", '{"command": "echo two"}')), Completed(Usage(28_600, 5, 0, 0))],
+        answer("finished", usage=Usage(2_000, 5, 0, 0)),
+    ]
+    await executor.execute(await start(store, "go"))
+    assert len(model.requests) == 3 and model.summaries == []
+    assert anchors == [18_500, 2_000]
+    sent = {m.tool_call_id: m.text for m in model.requests[2].messages if m.role == "tool"}
+    assert sent["c1"].startswith("[terminal result omitted from context:")
+
+
+async def test_a_summary_cut_at_the_output_limit_is_not_stored(parts):
+    store, model, executor, now = parts
+    await seed(store, 8)
+    model.summary_script = [[TextDelta("PART"), Completed(SUMMARY_USAGE, "incomplete")]]
+    model.script = [answer()]
+    run = await start(store)
+    await executor.execute(run)
+    session = await store.get_session("p1", "s1")
+    assert (await store.get_run("p1", run.id)).status == "completed"
+    assert session.summary is None and session.pruned_id is not None
+    assert session.compaction_failed_at == now.value.timestamp()
+
+
+async def test_an_overflow_after_output_is_not_retried(parts):
+    store, model, executor, _ = parts
+    await seed(store, 8, text="b" * 4_000)
+    model.script = [[TextDelta("partial"), ModelError("context_overflow", "too long")], answer("after")]
+    run = await start(store)
+    await executor.execute(run)
+    done = await store.get_run("p1", run.id)
+    assert (done.status, done.error_code) == ("failed", "context_overflow")
+    assert len(model.requests) == 1 and model.summaries == []
+
+
+async def test_an_overflow_whose_summary_fails_retries_with_placeholders(parts):
+    store, model, executor, now = parts
+    await seed(store, 1, text="hi")
+    await store.append_message("s1", None, Message("user", (TextPart("read five files"),)))
+    for n in range(5):
+        call = ToolCall(f"c{n}", "read_file", json.dumps({"path": f"/w/{n}.txt"}))
+        await store.append_message("s1", None, Message("assistant", tool_calls=(call,)))
+        await store.append_message("s1", None, Message("tool", (TextPart("r" * 16_000),), tool_call_id=f"c{n}",
+                                                       tool_name="read_file"))
+    await store.append_message("s1", None, Message("assistant", (TextPart("read them"),)))
+    model.summary_script = [[ModelError("bad_request", "no")]]
+    model.script = [[ModelError("context_overflow", "too long")], answer("after")]
+    run = await start(store)
+    await executor.execute(run)
+    done = await store.get_run("p1", run.id)
+    assert (done.status, done.output) == ("completed", "after")
+    assert len(model.summaries) == 1 and len(model.requests) == 2
+    sent = [m.text for m in model.requests[1].messages if m.role == "tool"]
+    assert sent[:3] == ["[read_file result omitted from context: 16,000 characters]"] * 3
+    assert sent[3:] == ["r" * 16_000] * 2
+    assert (await store.get_session("p1", "s1")).compaction_failed_at == now.value.timestamp()
+
+
 async def test_the_reported_input_tokens_anchor_the_next_estimate(parts):
     store, model, executor, _ = parts
     model.script = [answer(usage=Usage(1_234, 5, 0, 0))]

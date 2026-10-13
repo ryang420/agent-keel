@@ -108,10 +108,13 @@ class Compactor:
             context.failed_at = failed_at
 
     async def _summarize(self, provider, request: ModelRequest) -> tuple[str, Usage]:
-        text, usage = [], Usage()
+        """The summary text and the call's usage; the text is empty when the summary was cut at the output limit,
+        so a truncated summary is never stored."""
+        text, usage, incomplete = [], Usage(), False
         async for event in stream_with_retries(provider, request, sleep=self._sleep):
             if isinstance(event, TextDelta):
                 text.append(event.text)
             elif isinstance(event, Completed):
                 usage = usage + event.usage
-        return "".join(text).strip(), usage
+                incomplete = incomplete or event.status == "incomplete"
+        return ("" if incomplete else "".join(text).strip()), usage

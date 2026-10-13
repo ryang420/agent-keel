@@ -161,10 +161,15 @@ def summary_message(summary: str) -> Message:
     return Message("user", (TextPart(f"{prompts.text('summary_prefix')}\n\n{summary}\n\n{SUMMARY_END}"),))
 
 
+def round_start(items: Sequence[Item]) -> int:
+    """Where the newest round starts: the index of the newest user or assistant item; 0 when there is none."""
+    return max((index for index, item in enumerate(items) if item.message.role != "tool"), default=0)
+
+
 def _fit_newest_round(items: list[Item], budget: int) -> list[Item]:
     """Cut the tool results of the newest round (the newest user or assistant message and what follows) so the
     round fits `budget`."""
-    start = max((index for index, item in enumerate(items) if item.message.role != "tool"), default=0)
+    start = round_start(items)
     results = [index for index in range(start, len(items)) if items[index].message.role == "tool"]
     used = sum(message_tokens(item.message) for item in items[start:])
     if used <= budget or not results:
