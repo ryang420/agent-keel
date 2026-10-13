@@ -371,6 +371,8 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                 if run is None:
                     return
                 if run.status in ("completed", "failed", "cancelled"):
+                    if run.finished_at is not None and keel_.store.clock() - run.finished_at > _TERMINAL_GRACE_SECONDS:
+                        return  # finished long ago: its terminal event was sent before the cursor, or pruned
                     # The run row turns terminal before its terminal event is appended, so wait briefly for it.
                     loop = asyncio.get_running_loop()
                     deadline = loop.time() + _TERMINAL_GRACE_SECONDS

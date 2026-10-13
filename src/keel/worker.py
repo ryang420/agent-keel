@@ -11,11 +11,13 @@ from keel.store.base import WORKER_LOST_MESSAGE
 log = logging.getLogger(__name__)
 _MAX_CLAIM_BACKOFF = 10.0
 SHUTDOWN_MESSAGE = "The service was shutting down."
+_BACKGROUND = ("keel-sweeper", "keel-maintenance")
 
 
 class WorkerPool:
     def __init__(self, store, bus, executor, *, owner: str, workers: int = 4, lease_seconds: float = 30.0,
-                 poll_seconds: float = 0.5, clock=time.time) -> None:
+                 poll_seconds: float = 0.5, clock=time.time, event_retention_s: float | None = None,
+                 maintenance_s: float = 3600.0) -> None:
         self.store = store
         self.bus = bus
         self.executor = executor
@@ -24,6 +26,8 @@ class WorkerPool:
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
+        self.event_retention_s = event_retention_s
+        self.maintenance_s = maintenance_s
         self._tasks: list[asyncio.Task] = []
         self._closing = False
         self._stop = asyncio.Event()
@@ -34,6 +38,8 @@ class WorkerPool:
         self._stop = asyncio.Event()
         self._tasks = [asyncio.create_task(self._work(), name=f"keel-worker-{i}") for i in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._sweep(), name="keel-sweeper"))
+        if self.event_retention_s is not None:
+            self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
 
     async def close(self, drain_seconds: float = 4.0) -> None:
         """Stop claiming, give runs in flight `drain_seconds` to finish, then fail what is left as worker_lost.
@@ -43,9 +49,9 @@ class WorkerPool:
         """
         self._closing = True
         self._stop.set()
-        sweeper = [t for t in self._tasks if t.get_name() == "keel-sweeper"]
-        workers = [t for t in self._tasks if t not in sweeper]
-        for task in sweeper:
+        background = [t for t in self._tasks if t.get_name() in _BACKGROUND]
+        workers = [t for t in self._tasks if t not in background]
+        for task in background:
             task.cancel()
         if workers:
             await asyncio.wait(workers, timeout=drain_seconds)
@@ -83,6 +89,21 @@ class WorkerPool:
             except Exception:
                 log.exception("lease sweep failed")
             await asyncio.sleep(self.lease_seconds)
+
+    async def prune_once(self) -> int:
+        return await self.store.prune_events(self.clock() - self.event_retention_s)
+
+    async def _maintain(self) -> None:
+        """Hourly: delete old run events. Passes on several instances may overlap; deleting rows already gone is
+        harmless."""
+        while not self._closing:
+            try:
+                deleted = await self.prune_once()
+                if deleted:
+                    log.info("pruned %d run events older than the retention", deleted)
+            except Exception:
+                log.exception("pruning old run events failed")
+            await self._idle(self.maintenance_s)
 
     async def _idle(self, seconds: float) -> None:
         try:

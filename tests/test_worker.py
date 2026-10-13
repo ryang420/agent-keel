@@ -329,3 +329,34 @@ async def test_a_sweep_survives_an_unreachable_sandbox(store, clock, tmp_path):
     swept = await store.get_run("p1", run.id)
     assert (swept.status, swept.current_exec_id) == ("failed", None)
     assert [e.type for e in await store.events_after(run.id, 0)] == ["run.failed"]
+
+
+async def test_prune_once_deletes_events_older_than_the_retention(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    run = await queue(store)
+    await store.append_event(run.id, "run.started", {})
+    await store.finish_run(run.id, "completed")
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock, event_retention_s=7 * 86_400)
+    assert await pool.prune_once() == 0
+    clock.now += 8 * 86_400
+    assert await pool.prune_once() == 1
+
+
+async def test_the_maintenance_task_prunes_at_start_and_stops_on_close(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    run = await queue(store)
+    await store.append_event(run.id, "run.started", {})
+    await store.finish_run(run.id, "completed")
+    clock.now += 8 * 86_400
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", workers=1, poll_seconds=0.01, clock=clock,
+                      event_retention_s=7 * 86_400)
+    await pool.start()
+    try:
+        for _ in range(100):
+            if not await store.events_after(run.id, 0):
+                break
+            await asyncio.sleep(0.02)
+        assert await store.events_after(run.id, 0) == []
+    finally:
+        await asyncio.wait_for(pool.close(drain_seconds=0.1), 2)
+    assert all(t.done() for t in asyncio.all_tasks() if t.get_name() == "keel-maintenance")

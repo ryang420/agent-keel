@@ -266,3 +266,30 @@ async def test_in_flight_profiles_are_those_with_a_queued_or_running_run(store):
     await store.claim_run("w1", 9_999_999)  # one of them is now running, which is still in flight
     await store.finish_run(runs["p3"].id, "completed")
     assert await store.in_flight_profiles() == {"p1", "p2"}
+
+
+async def test_pruning_deletes_only_events_of_runs_finished_before_the_cutoff(store, clock):
+    from keel.models import Message, TextPart
+
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+    runs = []
+    for session in ("s1", "s2", "s3"):
+        await store.ensure_session("p1", session)
+        runs.append(await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m",
+                                           reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                           instructions=None))
+        await store.append_message(session, runs[-1].id, Message("user", (TextPart("hi"),)))
+    for run in runs:
+        for _ in range(5):
+            await store.append_event(run.id, "message.delta", {"text": "x"})
+    await store.finish_run(runs[0].id, "completed", output="old")  # finished at 1000
+    clock.now += 100
+    await store.finish_run(runs[1].id, "completed", output="new")  # finished at 1100; runs[2] is still queued
+    assert await store.prune_events(1050, batch=2) == 5
+    assert await store.events_after(runs[0].id, 0) == []
+    assert len(await store.events_after(runs[1].id, 0)) == 5
+    assert len(await store.events_after(runs[2].id, 0)) == 5
+    old = await store.get_run("p1", runs[0].id)
+    assert (old.status, old.output) == ("completed", "old")
+    assert len(await store.messages("s1")) == 1
+    assert await store.prune_events(1050) == 0

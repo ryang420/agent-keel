@@ -391,3 +391,14 @@ async def test_no_blob_is_left_behind_when_a_later_step_fails(service, monkeypat
     with pytest.raises(RuntimeError):
         await send(client, text=[image])
     assert puts and await store.get_blobs(puts) == {}
+
+
+async def test_the_stream_of_a_pruned_run_closes_at_once(service):
+    client, _, store = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    run_id = (await send(client)).json()["run_id"]
+    await settle(client, run_id)
+    store.clock.now += 8 * 86_400
+    assert await store.prune_events(store.clock() - 7 * 86_400) > 0
+    response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 2)
+    assert response.status_code == 200 and response.text == ""

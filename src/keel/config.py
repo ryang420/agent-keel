@@ -63,6 +63,7 @@ class Settings:
     aws_region: str = "us-east-1"
     max_iterations: int = 60
     compression_threshold: float = 0.75
+    event_retention_days: int = 7
     sandbox: str = "docker"
     sandbox_idle_seconds: float = 1800.0
     sandbox_mount_root: str | None = None
@@ -116,6 +117,7 @@ class Settings:
             aws_region=(env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1").strip(),
             max_iterations=_positive_int(env, "KEEL_MAX_ITERATIONS", 60),
             compression_threshold=_fraction(env, "KEEL_COMPRESSION_THRESHOLD", 0.75),
+            event_retention_days=_positive_int(env, "KEEL_EVENT_RETENTION_DAYS", 7),
             sandbox=sandbox,
             sandbox_idle_seconds=_positive_float(env, "KEEL_SANDBOX_IDLE_SECONDS", 1800.0),
             sandbox_mount_root=mount_root,

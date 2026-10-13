@@ -89,3 +89,10 @@ def test_the_compression_threshold_is_a_fraction_of_the_window():
 @pytest.mark.parametrize(("lease", "timeout"), [("30", 10.0), ("9", 5.0), ("90", 30.0)])
 def test_the_database_command_timeout_is_a_third_of_the_lease(lease, timeout):
     assert Settings.from_env({**BASE, "KEEL_LEASE_SECONDS": lease}).db_command_timeout == timeout
+
+
+def test_event_retention_defaults_to_seven_days_and_must_be_positive():
+    assert Settings.from_env(BASE).event_retention_days == 7
+    assert Settings.from_env({**BASE, "KEEL_EVENT_RETENTION_DAYS": "30"}).event_retention_days == 30
+    with pytest.raises(ValueError, match="KEEL_EVENT_RETENTION_DAYS"):
+        Settings.from_env({**BASE, "KEEL_EVENT_RETENTION_DAYS": "0"})
