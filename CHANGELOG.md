@@ -44,6 +44,10 @@ All notable changes to this project are documented here. The format follows
 - Postgres queries time out after a third of `KEEL_LEASE_SECONDS` (at least 5 s) instead of a fixed 30 s; with the
   default 30 s lease that is 10 s.
 
+### Fixed
+- The `memory` tool writes only when the profile's memory flag is on. A sandboxed run can still call it when it was
+  not offered; that call is an error and stores nothing.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added

@@ -344,6 +344,25 @@ async def test_a_tool_other_than_memory_needs_a_sandbox():
     assert unavailable.error and "Memory is not available." in unavailable.content
 
 
+async def test_memory_refuses_a_write_when_the_profile_flag_is_off(store, local_sandbox):
+    """A sandboxed run always puts the store on the context, and the model can call memory even when it was not
+    offered. The handler re-reads the profile and writes only when memory is on."""
+    backend, sandbox, _work = local_sandbox
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}],
+                               sandbox={"image": "local", "workdir": str(_work)}, soul="", skills=[], memory=False)
+    await store.ensure_session("p1", "s1")
+    ctx = ToolContext(backend, sandbox, cwd=str(_work), store=store, profile_id="p1", session_id="s1")
+    refused = await run_tool("memory", '{"action":"add","target":"memory","content":"secret fact"}', ctx)
+    assert refused.error
+    assert (await store.memory_entries("p1"))["memory"] == []
+
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}],
+                               sandbox={"image": "local", "workdir": str(_work)}, soul="", skills=[], memory=True)
+    saved = await run_tool("memory", '{"action":"add","target":"memory","content":"secret fact"}', ctx)
+    assert saved.error is False
+    assert (await store.memory_entries("p1"))["memory"] == ["secret fact"]
+
+
 async def test_a_profile_with_neither_still_gets_no_tools(setup):
     store, provider, executor = setup
     await executor.execute(await start(store))

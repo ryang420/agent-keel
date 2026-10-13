@@ -9,6 +9,9 @@ from keel.tools.base import ToolContext, ToolOutcome, error_result, tool, tool_j
 async def memory(args: dict, ctx: ToolContext) -> ToolOutcome:
     if ctx.store is None or not ctx.profile_id:
         return error_result("Memory is not available.")
+    profile = await ctx.store.get_profile(ctx.profile_id)
+    if profile is None or not profile.memory:
+        return error_result("Memory is not available.")
     target = args.get("target") or "memory"
     limit = ctx.user_chars if target == "user" else ctx.memory_chars
     ops = args.get("operations")

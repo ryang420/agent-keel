@@ -109,7 +109,7 @@ erDiagram
     profiles {
         text id PK
         text models "allow-list: provider + model"
-        text sandbox "policy JSON, empty = no tools"
+        text sandbox "policy JSON, empty = no sandbox tools; memory is separate and follows the flag"
         text soul "the persona"
         text skills "enabled skill names"
         bool memory "off when omitted"

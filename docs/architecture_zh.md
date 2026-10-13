@@ -104,7 +104,7 @@ erDiagram
     profiles {
         text id PK
         text models "允许列表：provider + model"
-        text sandbox "策略 JSON，为空表示没有工具"
+        text sandbox "策略 JSON，为空表示没有沙箱工具；memory 另计，跟随 profile 开关"
         text soul "人设"
         text skills "启用的 skill 名称"
         bool memory "省略则为关"
