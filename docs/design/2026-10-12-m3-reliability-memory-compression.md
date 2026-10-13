@@ -244,12 +244,15 @@ pass and the summary input.
   the text `[image omitted from context]`. Nothing stored changes.
 - **Summary input.** The previous summary in full except its "Files referenced" section (keel wrote it and carries
   it over itself, below), then the middle (messages after the head and before the tail)
-  after the placeholder pass, serialized as text. When that is over 40k tokens, the middle is cut head-and-tail to
-  fit, with a marker saying how much was left out, so the summary call itself always fits the window.
+  after the placeholder pass, serialized as text. When that is over 40k tokens, or half the context window if that
+  is smaller, the middle is cut head-and-tail to fit, with a marker saying how much was left out, so the summary
+  call itself always fits the window.
 - **Files referenced.** File paths are collected from the middle without a model: the `path` argument of
   `read_file`, `write_file` and `patch` calls, and absolute paths that appear in user messages (an attachment's
-  location usually arrives this way) and in `terminal` and `execute_code` arguments. The list is deduplicated, keeps
-  first-seen order, carries over the previous summary's list, and is capped at 50 entries (the newest are kept). It
+  location usually arrives this way) and in `terminal` and `execute_code` arguments. A path with a newline or over
+  1,024 characters is skipped, and each path is redacted like the summary input. The list carries over the previous
+  summary's list, is deduplicated with a path named again moving to the newest end, and is capped at 50 entries
+  (the most recently named are kept). It
   is appended to the model's summary verbatim under a "Files referenced" heading, so a long path is never shortened
   or misspelt by the summary call and the model can still reopen an attachment or a file it wrote. The path pattern
   runs on model-controlled text, so it is linear-time and gets a long-input timing test.
@@ -261,8 +264,10 @@ In `RunExecutor._loop`, before each model call, when the estimate reaches `KEEL_
 call. The steps:
 
 1. Apply the placeholder pass. If the estimate is now below the threshold, send the request and stop here (this
-   stores `pruned_id`). After a `context_overflow` this shortcut is skipped: the estimate was wrong, so it cannot
-   show the pass was enough.
+   stores `pruned_id` when it moved). The heuristic estimate after the pass is scaled by how much more the provider
+   counted than the heuristic for the same request before it (never scaled down), so a provider that counts code
+   or JSON high does not prune on every call without ever summarizing. After a `context_overflow` this shortcut is
+   skipped: the estimate was wrong, so it cannot show the pass was enough.
 2. Otherwise make one summary call, with the same provider and model, no tools, and Hermes's checkpoint prompt and
    sections (the user's latest unfulfilled request verbatim, goal, completed actions, active state, decisions,
    errors and fixes) applied to the summary input. The call runs inside the run, so stop and shutdown already

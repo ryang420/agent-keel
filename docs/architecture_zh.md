@@ -119,6 +119,8 @@ erDiagram
         bigint summary_tail_id "第一条尾部消息"
         bigint pruned_id "占位符边界"
         int context_tokens "上次报告的输入 token 数"
+        bigint context_message_id "该计数包含的最新一条消息"
+        real compaction_failed_at "上次摘要失败的时间，暂停重试"
     }
     messages {
         bigint id PK "决定对话记录的顺序"
@@ -282,9 +284,9 @@ flowchart TB
   它们（`invalid_reasoning`），会去掉推理项重试一次。
 - **长会话会原地压缩。** 每次调用模型之前，循环会估算请求的大小：provider 为上一次调用报告的输入 token 数，加上
   对更新消息的启发式估算（每个 ASCII 字符算四分之一个 token，其他字符各算一个）。达到上下文窗口的
-  `KEEL_COMPRESSION_THRESHOLD`（0.75）时，最近尾部之前超过 200 个字符的工具结果和图片会被替换成一行占位符。如果
-  这还不够，就发起一次摘要调用来浓缩中间部分，请求随之变成开头几条消息（每条截到约 4,000 个 token）、摘要和尾部。
-  调用以 `context_overflow` 失败时也会这样做一次，然后重试该调用。存储的内容不会被删除：`GET …/messages` 返回
+  `KEEL_COMPRESSION_THRESHOLD`（0.75）时，最近尾部之前超过 200 个字符的工具结果和图片会被替换成一行占位符，那里的
+  推理项也会被丢弃。如果这还不够（用启发式估算判断；provider 计得更多时按比例放大），就发起一次摘要调用来浓缩
+  中间部分，请求随之变成开头几条消息（每条截到约 4,000 个 token）、摘要和尾部。调用以 `context_overflow` 失败时也会这样做一次，然后重试该调用。存储的内容不会被删除：`GET …/messages` 返回
   完整的对话记录，会话只记录摘要及其边界。系统提示词在压缩时重建，在下一次压缩之前逐字节复用。摘要调用失败或在
   输出上限处被截断时不会被存储，阈值触发要在 10 分钟之后才会重试。
 - **工作目录跟随会话。** `terminal` 会报告命令结束时所在的目录；执行器把它保存在会话上，下一轮从那里开始。

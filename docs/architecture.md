@@ -124,6 +124,8 @@ erDiagram
         bigint summary_tail_id "first tail message"
         bigint pruned_id "placeholder boundary"
         int context_tokens "last reported input tokens"
+        bigint context_message_id "newest message that count included"
+        real compaction_failed_at "last failed summary, pauses retries"
     }
     messages {
         bigint id PK "orders the transcript"
@@ -295,7 +297,8 @@ Properties worth knowing:
 - **Long sessions are compacted in place.** Before each model call the loop estimates the request: the input tokens
   the provider reported for the last call, plus a heuristic for newer messages (a quarter of a token per ASCII
   character, one per other character). At `KEEL_COMPRESSION_THRESHOLD` (0.75) of the context window, tool results
-  over 200 characters and images before a recent tail are replaced by one-line placeholders. If that is not enough,
+  over 200 characters and images before a recent tail are replaced by one-line placeholders, and the reasoning items
+  there are dropped. If that is not enough (judged by the heuristic, scaled up when the provider counts more),
   one summary call condenses the middle, and the request becomes the first messages (each cut to about 4,000
   tokens), the summary and the tail. The same happens once when a call fails with `context_overflow`, and the call
   is retried. Nothing stored is deleted: `GET …/messages` returns the whole transcript, and the session records only
