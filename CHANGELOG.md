@@ -25,7 +25,7 @@ All notable changes to this project are documented here. The format follows
   prompt, so the date is the build's.
 - Several instances can share one Postgres database: the LISTEN connection reconnects with backoff, start-up
   orphan removal spares the sandboxes of profiles with a run in flight, and the sweeper kills a lost worker's
-  command.
+  command when it shares that worker's Docker daemon (otherwise the command runs until its own timeout).
 - Postgres queries time out after a third of `KEEL_LEASE_SECONDS` (at least 5 s) instead of a fixed 30 s; with the
   default 30 s lease that is 10 s.
 

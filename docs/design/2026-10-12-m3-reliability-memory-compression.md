@@ -62,8 +62,10 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
   instance between the in-flight query and `docker rm` can lose its container, and the exec path already recreates a
   vanished container once; removing an idle profile's container is harmless (it is recreated on next use).
 - **A dead worker's command.** `runs.current_exec_id` is written and never read. When the sweeper marks a run
-  `worker_lost`, it makes a best-effort `kill_tree` on that exec (`ensure`, then `kill_tree`), so a command started
-  by a dead worker does not run on. The column is cleared when a command ends. Failure to reach the sandbox is
+  `worker_lost`, it makes a best-effort `kill_tree` on that exec (on the handle from `reference`, which creates
+  nothing), so a command started by a dead worker does not run on. The kill reaches the command only when the
+  sweeping instance shares the lost worker's Docker daemon (or host, for the local sandbox); otherwise the command
+  runs until its own timeout. The column is cleared when a command ends. Failure to reach the sandbox is
   logged and does not block the sweep. The sweeper emits `run.failed` for every expired run first and only then
   kills the commands, so a slow or unreachable sandbox never delays the terminal events; `kill_orphaned_command`
   never raises and clears `current_exec_id` whether or not the kill worked (the run is terminal). The stop path
@@ -75,7 +77,9 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
   deletes the `run_events` of runs that finished more than `KEEL_EVENT_RETENTION_DAYS` (default 7) ago, in batches
   of 10,000 rows so one pass never holds a long transaction. The run row, its output and usage, and the session's
   messages are kept. Streaming a pruned run sends no events and closes; a client reads the run with
-  `GET …/runs/{id}`. On several instances the passes may overlap; deleting rows that are already gone is harmless.
+  `GET …/runs/{id}`. The first pass after start is unbounded; later ones only look at runs finished since the
+  previous cutoff less one interval, so a pass does not rescan all history. On several instances the passes may
+  overlap; deleting rows that are already gone is harmless.
   The stream closes at once, without the 5 s wait for a late terminal event, when the run is terminal, nothing
   follows the cursor and the run finished more than 60 s ago by the store's clock (a margin well above the grace,
   for clock skew between instances). That covers a pruned run and a client reconnecting past the terminal event.

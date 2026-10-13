@@ -250,13 +250,17 @@ close the open tool call, store a "cancelled" result for each tool call that has
 **Dead workers.** The sweeper runs every lease interval and marks any `running` or `stopping` run whose lease has
 lapsed as `failed` with `error_code: worker_lost`, on whichever instance sweeps first. It emits `run.failed` for every
 expired run first, so a slow sandbox cannot delay the terminal events, and then kills the command each dead worker
-left running (it reaches the profile's container and kills the process group of `runs.current_exec_id`). The column
-is cleared whether or not the kill worked. A worker whose renewal fails until its own deadline gives the run up to
+left running (it reaches the profile's container and kills the process group of `runs.current_exec_id`; it never
+creates a container). The kill reaches the command only when the sweeping instance shares the lost worker's Docker
+daemon (or host, for the local sandbox); otherwise the command runs until its own timeout. The column is cleared
+whether or not the kill worked. A worker whose renewal fails until its own deadline gives the run up to
 the sweeper.
 
 **Old events.** Every hour the maintenance task deletes the events of runs finished more than
 `KEEL_EVENT_RETENTION_DAYS` (7) days ago, 10,000 rows per statement so no pass holds a long transaction. Runs, their
-output and the sessions' messages are kept. Passes on several instances may overlap; that is harmless.
+output and the sessions' messages are kept. The first pass after start scans all finished runs; later ones only
+those finished since the previous cutoff (less one hour of overlap). Passes on several instances may overlap; that is
+harmless.
 
 **Shutdown.** The pool stops claiming, gives runs in flight 4 s to finish, then fails what remains as `worker_lost`
 (not `cancelled`, which is what a user's stop looks like). The service then removes nothing: leftover sandbox
@@ -333,7 +337,8 @@ Properties worth knowing:
 ## 7. Events and streaming
 
 Every state change of a run is a row in `run_events`. The types are `run.started`, `message.delta`, `tool.started`,
-`tool.completed`, `run.completed`, `run.failed` and `run.cancelled`; the last three are terminal.
+`tool.completed`, `context.compacted`, `run.completed`, `run.failed` and `run.cancelled`; the last three are
+terminal.
 
 ```mermaid
 sequenceDiagram

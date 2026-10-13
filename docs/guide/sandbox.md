@@ -75,8 +75,9 @@ profiles with a run queued, running or stopping on any instance, so a restart do
 a run another instance is executing. A removed container is created again on its next use.
 
 When a worker is lost (its instance crashed or stalled and the run's lease lapsed), the run fails as `worker_lost`
-and the command it left running is killed: keel reaches the profile's container (creating it if needed) and kills
-the command's whole process group.
+and the command it left running is killed: keel reaches the profile's container and kills the command's whole
+process group. This works only when the instance that notices shares the lost worker's Docker daemon (or host, for
+the local sandbox); otherwise the command runs until its own timeout. The sweep never creates a container.
 
 ## The Docker socket
 

@@ -240,11 +240,13 @@ FOR UPDATE SKIP LOCKED)`。在 Postgres 上，各实例不会认领到同一个 
 **worker 死亡。** 清扫器每隔一个租约周期运行一次，把租约已过期的 `running` 或 `stopping` run 标记为 `failed`，
 `error_code` 为 `worker_lost`，由最先清扫到的那个实例完成。它先为每个过期的 run 发出 `run.failed`，这样缓慢的沙箱
 不会拖延终止事件；然后终止每个死掉的 worker 留下仍在运行的命令（找到该 profile 的容器，终止
-`runs.current_exec_id` 的进程组）。无论终止是否成功，这一列都会被清空。如果某个 worker 的续租一直失败到自身的
+`runs.current_exec_id` 的进程组；它从不创建容器）。只有当清扫的实例与丢失的 worker 共用同一个 Docker daemon
+（本地沙箱则是同一台主机）时，才能终止该命令；否则命令会一直运行到它自己的超时。无论终止是否成功，这一列都会被清空。如果某个 worker 的续租一直失败到自身的
 截止时间，就把该 run 交给清扫器处理。
 
 **旧事件。** 维护任务每小时删除一次结束时间早于 `KEEL_EVENT_RETENTION_DAYS`（7）天的 run 的事件，每条语句删除
-10,000 行，这样每一轮都不会持有长事务。run 本身、它的输出和会话的消息都会保留。多个实例上的清理可能重叠，这无害。
+10,000 行，这样每一轮都不会持有长事务。run 本身、它的输出和会话的消息都会保留。启动后的第一轮扫描所有已结束的
+run；之后每一轮只扫描上一轮截止时间之后结束的 run（再重叠一小时）。多个实例上的清理可能重叠，这无害。
 
 **关闭。** worker 池停止认领，给进行中的 run 4 秒时间完成，剩下的标记为 `worker_lost`（而不是 `cancelled`，
 `cancelled` 是用户主动停止的样子）。服务此时不清理任何容器：遗留的沙箱容器在下次启动时清理。
@@ -313,7 +315,7 @@ flowchart TB
 ## 7. 事件与流式传输
 
 run 的每一次状态变化都是 `run_events` 中的一行。事件类型有 `run.started`、`message.delta`、`tool.started`、
-`tool.completed`、`run.completed`、`run.failed` 和 `run.cancelled`；最后三个是终止事件。
+`tool.completed`、`context.compacted`、`run.completed`、`run.failed` 和 `run.cancelled`；最后三个是终止事件。
 
 ```mermaid
 sequenceDiagram
