@@ -82,6 +82,9 @@ class PostgresEventBus(InMemoryEventBus):
             conn.terminate()
             raise
         conn.add_termination_listener(self._on_listen_lost)
+        if conn.is_closed():
+            conn.terminate()
+            raise ConnectionError("the LISTEN connection closed while starting")
         return conn
 
     def _on_notify(self, connection, pid, channel, payload: str) -> None:
@@ -103,7 +106,7 @@ class PostgresEventBus(InMemoryEventBus):
             try:
                 conn = await self._connect_listener()
             except Exception:
-                log.warning("LISTEN reconnect failed; retrying in %.1fs", delay, exc_info=True)
+                log.warning("LISTEN reconnect failed; retrying in %.1fs", delay, exc_info=delay == self.RECONNECT_MIN)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.RECONNECT_MAX)
                 continue
