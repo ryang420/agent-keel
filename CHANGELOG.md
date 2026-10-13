@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format follows
 ### Added
 - Numbered schema migrations: a database is upgraded in place at start, and a 0.2.0 database keeps its data. A
   database written by a newer keel is refused. Migration 2 adds the tables and columns M3 uses.
+- Context compression: a session can outgrow the model's context window. At `KEEL_COMPRESSION_THRESHOLD` (0.75)
+  of the window, old tool results and images are replaced by placeholders, and if that is not enough the middle of
+  the conversation is summarized in place (the stored transcript is unchanged). A new `context.compacted` event
+  reports it; the summary call's usage is part of the run's usage. Migration 3 adds `sessions.pruned_id`.
 
 ### Changed
 - `search_files` uses ripgrep when the sandbox image has it, and `grep`/`find` otherwise. Both skip hidden

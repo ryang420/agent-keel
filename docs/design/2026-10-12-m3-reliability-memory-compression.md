@@ -212,6 +212,10 @@ with the new middle and moves `summary_tail_id` forward.
 session's last model call, and the id of the newest stored message that call included. They anchor the estimate
 below across turns, and are cleared at a compaction. `compaction_failed_at` records the last failed summary call.
 
+`pruned_id` (migration 3) is the placeholder boundary: stored messages below it, other than the head, are sent with
+the placeholder pass. It moves only when a trigger fires, so what is sent, and its cached prefix, stay the same
+between triggers. A compaction sets it to the tail start.
+
 ### New `src/keel/compress.py`
 
 Pure functions, unit-tested without a model: token estimate, boundary choice, history assembly, the placeholder
@@ -222,15 +226,19 @@ pass and the summary input.
   as a quarter of a token and any other character as one token (CJK text is close to one token per character, and
   dividing all text by 4 would undercount it several times), plus a fixed cost per image. With no anchor (a new
   session, a provider that reports no usage, or just after a compaction) the whole request is counted this way. The
-  loop updates the anchor after every main call; a summary call never updates it.
+  loop updates the anchor after every main call, except one whose newest round was cut to the tail budget (later
+  calls send that round whole, so the provider's count would be too low); a summary call never updates it.
 - **Head.** The first 3 messages, extended forward until every tool call among them has its results. The head is
   sent on every call and never summarized, so in the request each head message over 4k tokens (a client may paste a
-  whole file into the first message) is cut head-and-tail with the truncation marker. Nothing stored changes.
+  whole file into the first message) is cut head-and-tail with the truncation marker once the session has a summary
+  (a short session is sent whole). The same pass caps each tool call's arguments at about 4k tokens, kept valid
+  JSON, replaces images by `[image omitted from context]` and drops reasoning. Nothing stored changes. The head is
+  never given the placeholder pass.
 - **Tail.** A recent tail of about 2.5% of the window, clamped to 10k–25k tokens, starting at a user or assistant
   message. A boundary never separates an assistant tool call from its results. The tail always holds at least the
-  newest assistant message with all its results (or the newest user message when that is last). When that minimum
-  is over the budget, its tool results are cut head-and-tail in the request (the existing truncation marker) until
-  the tail fits; nothing stored changes.
+  newest assistant message with all its results (or the newest user message when that is last). Whenever the
+  session has a summary or a placeholder boundary, the newest round's tool results are cut head-and-tail in the
+  request (the existing truncation marker) until the round fits the tail budget; nothing stored changes.
 - **Placeholder pass.** Outside the tail, in the request only and with no model call, each tool result over 200
   characters is replaced by a one-line placeholder naming the tool and the size it had, and each image part becomes
   the text `[image omitted from context]`. Nothing stored changes.
@@ -252,7 +260,9 @@ In `RunExecutor._loop`, before each model call, when the estimate reaches `KEEL_
 0.75) of `Capabilities.context_window`. Also when a call fails with `context_overflow` before any output, once per
 call. The steps:
 
-1. Apply the placeholder pass. If the estimate is now below the threshold, send the request and stop here.
+1. Apply the placeholder pass. If the estimate is now below the threshold, send the request and stop here (this
+   stores `pruned_id`). After a `context_overflow` this shortcut is skipped: the estimate was wrong, so it cannot
+   show the pass was enough.
 2. Otherwise make one summary call, with the same provider and model, no tools, and Hermes's checkpoint prompt and
    sections (the user's latest unfulfilled request verbatim, goal, completed actions, active state, decisions,
    errors and fixes) applied to the summary input. The call runs inside the run, so stop and shutdown already
@@ -268,8 +278,9 @@ call. The steps:
 **Usage.** The summary call's usage is added to the run's usage, so `run.completed` reports what the run cost. The
 `context.compacted` event carries it separately, so a client can tell the two apart.
 
-**Failure.** If the summary call fails, the failure is logged, `compaction_failed_at` is set, and the run continues
-with the placeholders. For 10 minutes after a failure the threshold trigger applies only the placeholder pass and
+**Failure.** If the summary call fails, or its summary is cut off at the output limit (a truncated summary is never
+stored), the failure is logged, `compaction_failed_at` is set, and the run continues with the placeholders
+(`pruned_id` is stored). For 10 minutes after a failure the threshold trigger applies only the placeholder pass and
 makes no summary call, so a broken summary does not cost every turn a failed call. The `context_overflow` trigger
 ignores this pause and tries once, since the alternative is failing the run. A persisting overflow fails the run with
 `context_overflow` as it does today.
@@ -284,7 +295,7 @@ once and reused byte for byte" becomes "reused byte for byte between compactions
 
 - **`tests/test_long_session.py`**, in normal CI. A scripted `FakeProvider` with a small `context_window` drives
   many turns through the HTTP API. It asserts compactions fired, every transcript pairs calls with results, the
-  system prompt and tool list are identical between compactions, the memory snapshot refreshes after a compaction,
+  system prompt and tool list are identical between compactions, the memory snapshot refreshes after a compaction (added with memory),
   and the full transcript is still readable. Separate cases cover the edges of §5:
   - a compaction in the middle of a run, between two tool calls;
   - a newest tool round larger than the tail budget, which is cut in the request and left whole in the store;
@@ -297,18 +308,18 @@ once and reused byte for byte" becomes "reused byte for byte between compactions
   - mostly-CJK text, so the estimate triggers before the provider overflows;
   - a failing summary call, then the 10-minute pause, then a successful compaction;
   - the run's usage including the summary call.
-- **`scripts/long_session_live.py`**, opt-in with the existing `KEEL_LIVE_*` variables. It plants facts early in a
+- **`tests/test_long_session_live.py`**, skipped unless `KEEL_LIVE_BEDROCK=1`, like the other live tests. It plants facts early in a
   long session, forces compactions, and asks for the facts back.
 
 ## 7. Data model changes
 
-These are migration 2 (§1). A 0.2.0 database is upgraded at start; no data is lost.
+These are migrations 2 and 3 (§1). A 0.2.0 database is upgraded at start; no data is lost.
 
 | Table | Change |
 |---|---|
 | `schema_version` | new, one row |
 | `profiles` | adds `memory` (default false) |
-| `sessions` | adds `summary`, `summary_head_id`, `summary_tail_id`, `context_tokens`, `context_message_id`, `compaction_failed_at` (all nullable), `turns_since_memory` (default 0) |
+| `sessions` | adds `summary`, `summary_head_id`, `summary_tail_id`, `pruned_id`, `context_tokens`, `context_message_id`, `compaction_failed_at` (all nullable), `turns_since_memory` (default 0) |
 | `memories` | new (§4) |
 | `runs` | `current_exec_id` is now read and cleared |
 | `run_events` | rows of runs finished more than `KEEL_EVENT_RETENTION_DAYS` ago are deleted (§1) |

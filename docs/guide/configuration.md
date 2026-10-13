@@ -15,6 +15,7 @@ an invalid value stops the service at start with a message naming the variable.
 | `KEEL_MAX_RUNNING` | `10` | Queued plus running runs allowed across all instances. A new run over the cap gets 429 `at_capacity`. |
 | `KEEL_LEASE_SECONDS` | `30` | Run lease. A worker renews it while it runs; a run whose lease lapses fails as `worker_lost`. |
 | `KEEL_MAX_ITERATIONS` | `60` | Tool iterations one run may take. After that, one final model call without tools asks for a summary (so at most N + 1 model calls). |
+| `KEEL_COMPRESSION_THRESHOLD` | `0.75` | Fraction of the model's context window at which a session is compacted before the next model call: old tool results and images are replaced by placeholders, and if that is not enough the middle of the conversation is summarized. Above 0, at most 1. |
 
 ## Sandbox
 

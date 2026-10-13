@@ -107,11 +107,15 @@ below. Events are stored: pass `after=<last seq>` to resume without losing or re
 | `message.delta` | `text`: a piece of the model's answer |
 | `tool.started` | `tool_call_id`, `tool`, `preview` |
 | `tool.completed` | `tool_call_id`, `tool`, `duration_s`, `error` (boolean), `preview` |
+| `context.compacted` | `messages_before`, `messages_after`, `tokens_before`, `tokens_after` (estimates), `usage` (the summary call's; it is also counted in the run's `usage`) |
 | `run.completed` | `output`, `usage`, and `incomplete: true` when the model reported an incomplete response |
 | `run.failed` | `error_code`, `message` |
 | `run.cancelled` | none |
 
 `run.completed`, `run.failed` and `run.cancelled` are terminal.
+
+`context.compacted` means a long session's earlier turns were summarized before a model call; the transcript itself
+is unchanged. A client should ignore event types it does not know.
 
 ## Sessions and messages
 
