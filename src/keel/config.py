@@ -36,6 +36,19 @@ def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
     return value
 
 
+def _fraction(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not 0 < value <= 1:
+        raise ValueError(f"{name} must be a number above 0 and at most 1, not {raw!r}")
+    return value
+
+
 def _instance_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
 
@@ -49,6 +62,7 @@ class Settings:
     lease_seconds: float = 30.0
     aws_region: str = "us-east-1"
     max_iterations: int = 60
+    compression_threshold: float = 0.75
     sandbox: str = "docker"
     sandbox_idle_seconds: float = 1800.0
     sandbox_mount_root: str | None = None
@@ -95,6 +109,7 @@ class Settings:
             lease_seconds=_positive_float(env, "KEEL_LEASE_SECONDS", 30.0),
             aws_region=(env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1").strip(),
             max_iterations=_positive_int(env, "KEEL_MAX_ITERATIONS", 60),
+            compression_threshold=_fraction(env, "KEEL_COMPRESSION_THRESHOLD", 0.75),
             sandbox=sandbox,
             sandbox_idle_seconds=_positive_float(env, "KEEL_SANDBOX_IDLE_SECONDS", 1800.0),
             sandbox_mount_root=mount_root,

@@ -76,3 +76,11 @@ def test_openai_compat_window_and_base_url_validation():
         Settings.from_env({**BASE, "KEEL_OPENAI_BASE_URL": "llm:8000/v1"})
     with pytest.raises(ValueError, match="KEEL_OPENAI_CONTEXT_WINDOW"):
         Settings.from_env({**BASE, "KEEL_OPENAI_CONTEXT_WINDOW": "0"})
+
+
+def test_the_compression_threshold_is_a_fraction_of_the_window():
+    assert Settings.from_env(BASE).compression_threshold == 0.75
+    assert Settings.from_env({**BASE, "KEEL_COMPRESSION_THRESHOLD": "0.5"}).compression_threshold == 0.5
+    for bad in ("0", "1.5", "half", "nan"):
+        with pytest.raises(ValueError, match="KEEL_COMPRESSION_THRESHOLD"):
+            Settings.from_env({**BASE, "KEEL_COMPRESSION_THRESHOLD": bad})
