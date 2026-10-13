@@ -47,6 +47,8 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - The `memory` tool writes only when the profile's memory flag is on. A sandboxed run can still call it when it was
   not offered; that call is an error and stores nothing.
+- A background memory review sends the history a model call would: the assembled head, summary and tail, with image
+  bytes loaded. Reasoning stays on the review's own assistant message. The stored transcript is unchanged.
 
 ## [0.2.0] - 2026-10-12
 

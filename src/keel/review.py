@@ -1,10 +1,10 @@
-"""One memory review. It sees the session's prompt and messages so the call can hit the cache, and it writes
-memory only. It never appends a message or an event."""
+"""One memory review. It sees the session's prompt and the history a model call would (assembled bounds, loaded
+images) so the call can hit the cache, and it writes memory only. It never appends a message or an event."""
 
 from __future__ import annotations
 
-from keel import prompts
-from keel.models import Message, ModelRequest, TextDelta, TextPart, ToolCallReady
+from keel import compress, prompts
+from keel.models import Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCallReady
 from keel.providers.retry import stream_with_retries
 from keel.tools import ToolContext, run_tool
 
@@ -35,10 +35,12 @@ async def _review(executor, run) -> None:
     session = await executor.store.get_session(run.profile_id, run.session_id)
     if session is None or not session.system_prompt:
         return
-    stored = await executor.store.messages(run.session_id)
-    messages = [item.message for item in stored]
-    messages.append(Message("user", (TextPart(prompts.text("memory_review")),)))
     provider = executor.providers.get(run.provider)
+    stored = await executor.store.messages(run.session_id)
+    budget = compress.tail_budget(provider.capabilities(run.model).context_window)
+    items = compress.assemble(stored, compress.Boundaries.of(session), budget)
+    messages = await executor._with_images([item.message for item in items], {})
+    messages.append(Message("user", (TextPart(prompts.text("memory_review")),)))
     ctx = ToolContext(store=executor.store, profile_id=run.profile_id, session_id=run.session_id,
                       memory_chars=executor.memory_chars, user_chars=executor.user_chars)
     tools = prompts.tool_definitions(("memory",))
@@ -46,13 +48,16 @@ async def _review(executor, run) -> None:
         request = ModelRequest(provider=run.provider, model=run.model, system=session.system_prompt,
                                messages=tuple(messages), tools=tools, reasoning_effort="low",
                                cache_scope=run.session_id)
-        calls, text = [], []
+        calls, text, reasoning = [], [], []
         async for event in stream_with_retries(provider, request, sleep=executor._sleep):
             if isinstance(event, TextDelta):
                 text.append(event.text)
+            elif isinstance(event, ReasoningReady):
+                reasoning.append(event.item)
             elif isinstance(event, ToolCallReady):
                 calls.append(event.call)
-        messages.append(Message("assistant", (TextPart("".join(text)),) if text else (), tool_calls=tuple(calls)))
+        messages.append(Message("assistant", (TextPart("".join(text)),) if text else (), tool_calls=tuple(calls),
+                                reasoning=tuple(reasoning)))
         if not calls:
             return
         for call in calls:

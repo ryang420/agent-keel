@@ -8,9 +8,12 @@ import pytest
 
 from keel.background import Background
 from keel.events import InMemoryEventBus
-from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
+from keel.models import (
+    Completed, ImagePart, Message, ReasoningItem, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
+)
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
+from keel.review import run_review
 from keel.runner import RunExecutor
 
 OK = [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]
@@ -194,3 +197,43 @@ async def test_a_dropped_review_does_not_stick_the_profile(store):
     await wait_for_background(background)
     assert (await store.get_run("p1", first.id)).status == "completed"
     assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
+
+
+async def test_a_review_sends_the_assembled_history_with_loaded_images(store):
+    """After compaction the model sees head, summary and tail, with image bytes loaded. The review sends that
+    same history and leaves the stored transcript alone, including empty image bytes."""
+    provider = FakeProvider()
+    reasoning = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
+    provider.script = [
+        [ReasoningReady(reasoning), ToolCallReady(ToolCall("c1", "memory", TEA)), Completed(Usage(1, 1, 0, 0))],
+        REVIEW_DONE,
+    ]
+    executor, _background = executor_for(store, provider, turns=1)
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    await store.ensure_session("p1", "s1")
+    blob = await store.put_blob("p1", "s1", "image/png", "aGVsbG8=")
+    head = await store.append_message("s1", None, Message("user", (TextPart("hello"),)))
+    await store.append_message("s1", None, Message("user", (TextPart("forgotten middle"),)))
+    tail = await store.append_message(
+        "s1", None, Message("user", (TextPart("see this"), ImagePart("image/png", blob_id=blob))))
+    await store.compact_session("s1", summary="A red square.", head_id=head.id, tail_id=tail.id,
+                                system_prompt="SYSTEM PROMPT")
+    before = [(item.id, item.message) for item in await store.messages("s1")]
+    run = await start(store)
+    await run_review(executor, run)
+
+    review = review_requests(provider)
+    assert review
+    texts = [message.text for message in review[0].messages]
+    assert any("A red square." in text for text in texts)
+    assert not any("forgotten middle" in text for text in texts)
+    images = [part for message in review[0].messages for part in message.parts if isinstance(part, ImagePart)]
+    assert [part.data_b64 for part in images] == ["aGVsbG8="]
+    assert len(provider.requests) == 2
+    assistant = next(message for message in provider.requests[1].messages if message.role == "assistant")
+    assert assistant.reasoning == (reasoning,)
+    after = [(item.id, item.message) for item in await store.messages("s1")]
+    assert after == before
+    stored_image = after[-1][1].parts[1]
+    assert isinstance(stored_image, ImagePart) and stored_image.data_b64 == "" and stored_image.blob_id == blob
