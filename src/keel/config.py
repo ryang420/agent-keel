@@ -64,6 +64,10 @@ class Settings:
     max_iterations: int = 60
     compression_threshold: float = 0.75
     event_retention_days: int = 7
+    background_limit: int = 4
+    memory_review_turns: int = 10
+    memory_chars: int = 2200
+    user_chars: int = 1375
     sandbox: str = "docker"
     sandbox_idle_seconds: float = 1800.0
     sandbox_mount_root: str | None = None
@@ -118,6 +122,10 @@ class Settings:
             max_iterations=_positive_int(env, "KEEL_MAX_ITERATIONS", 60),
             compression_threshold=_fraction(env, "KEEL_COMPRESSION_THRESHOLD", 0.75),
             event_retention_days=_positive_int(env, "KEEL_EVENT_RETENTION_DAYS", 7),
+            background_limit=_positive_int(env, "KEEL_BACKGROUND_LIMIT", 4),
+            memory_review_turns=_positive_int(env, "KEEL_MEMORY_REVIEW_TURNS", 10),
+            memory_chars=_positive_int(env, "KEEL_MEMORY_CHARS", 2200),
+            user_chars=_positive_int(env, "KEEL_USER_CHARS", 1375),
             sandbox=sandbox,
             sandbox_idle_seconds=_positive_float(env, "KEEL_SANDBOX_IDLE_SECONDS", 1800.0),
             sandbox_mount_root=mount_root,

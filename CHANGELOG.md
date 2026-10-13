@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Best-effort background tasks for work that must not belong to a run. `KEEL_BACKGROUND_LIMIT` (default 4) caps how
+  many run at once; a task past the limit is dropped and logged, and tasks are cancelled only at shutdown.
+  `KEEL_MEMORY_REVIEW_TURNS` (10), `KEEL_MEMORY_CHARS` (2200) and `KEEL_USER_CHARS` (1375) are read at start.
 - Numbered schema migrations: a database is upgraded in place at start, and a 0.2.0 database keeps its data. A
   database written by a newer keel is refused. Migration 2 adds the tables and columns M3 uses.
 - Context compression: a session can outgrow the model's context window. At `KEEL_COMPRESSION_THRESHOLD` (0.75)

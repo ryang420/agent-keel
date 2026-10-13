@@ -43,6 +43,7 @@ class Keel:
     api_key: str
     max_running: int
     sandbox_mount_root: str | None = None
+    background: object = None
 
 
 class ApiError(Exception):

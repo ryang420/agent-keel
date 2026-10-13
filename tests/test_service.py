@@ -134,3 +134,17 @@ async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_p
     async with app.router.lifespan_context(app):
         pass
     assert "rm -f c1" in log.read_text().splitlines()
+
+
+async def test_the_lifespan_closes_the_background_after_the_pool_runs(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from keel.background import Background
+
+    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
+    app = create_service(settings)
+    close = AsyncMock()
+    monkeypatch.setattr(Background, "close", close)
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.background, Background)
+    close.assert_awaited_once()

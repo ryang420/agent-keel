@@ -17,6 +17,10 @@ an invalid value stops the service at start with a message naming the variable.
 | `KEEL_MAX_ITERATIONS` | `60` | Tool iterations one run may take. After that, one final model call without tools asks for a summary (so at most N + 1 model calls). |
 | `KEEL_COMPRESSION_THRESHOLD` | `0.75` | Fraction of the model's context window at which a session is compacted before the next model call: old tool results and images are replaced by placeholders, and if that is not enough the middle of the conversation is summarized. Above 0, at most 1. |
 | `KEEL_EVENT_RETENTION_DAYS` | `7` | Days a finished run's events are kept, a positive integer. An hourly task deletes older ones (runs, their output and messages are kept). |
+| `KEEL_BACKGROUND_LIMIT` | `4` | Concurrent best-effort tasks this instance runs outside a run (a title, a memory review). Past the limit the new task is dropped and logged. They are cancelled only when the service stops. |
+| `KEEL_MEMORY_REVIEW_TURNS` | `10` | Completed runs between memory reviews. A positive integer. |
+| `KEEL_MEMORY_CHARS` | `2200` | Character limit for the `memory` target. A positive integer. |
+| `KEEL_USER_CHARS` | `1375` | Character limit for the `user` target. A positive integer. |
 
 ## Sandbox
 

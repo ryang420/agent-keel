@@ -9,6 +9,7 @@ import logging
 from fastapi import FastAPI
 
 from keel.api import Keel, create_app
+from keel.background import Background
 from keel.config import Settings
 from keel.events import InMemoryEventBus, PostgresEventBus
 from keel.providers.base import ProviderRegistry
@@ -47,8 +48,10 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold)
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
                       lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0)
+    background = Background(limit=settings.background_limit)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key=settings.api_key,
-                max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root)
+                max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root,
+                background=background)
     return keel, pool, [registry, bus, store], backend
 
 
@@ -76,6 +79,7 @@ def create_service(settings: Settings | None = None, *, providers: ProviderRegis
             except Exception:
                 log.warning("could not remove leftover sandboxes; continuing", exc_info=True)
         app.state.keel = keel
+        app.state.background = keel.background
         try:
             await pool.start()
             if backend is not None:
@@ -83,6 +87,7 @@ def create_service(settings: Settings | None = None, *, providers: ProviderRegis
             yield
         finally:
             await pool.close()
+            await keel.background.close()
             if reaper is not None:
                 reaper.cancel()
                 await asyncio.gather(reaper, return_exceptions=True)
