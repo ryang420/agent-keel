@@ -2,9 +2,10 @@
 
 Adapted from Hermes (Nous Research hermes-agent, MIT, v2026.9.24 `f97608f178`): the guidance blocks of the
 stable tier in agent/system_prompt.py, the api_server platform hint, the skills index header, the
-iteration-cap request (agent/context_compressor.py) and the eight tool schemas as model_tools sends them.
-Edits remove what keel does not have: background processes, a persistent kernel, skill authoring, document
-extraction, other tools. See THIRD_PARTY_NOTICES.md.
+iteration-cap request, the compaction summary prefix and checkpoint prompt (agent/context_compressor.py) and the
+eight tool schemas as model_tools sends them. Edits remove what keel does not have: background processes, a
+persistent kernel, skill authoring, document extraction, other tools, and the compressor's skill, session-log and
+memory-provider sections. See THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations

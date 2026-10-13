@@ -31,7 +31,7 @@ def test_tool_parameters_offer_only_what_keel_does():
 
 def test_texts_mention_nothing_keel_lacks():
     files = list(PROMPTS.glob("*.md")) + list((PROMPTS / "tools").glob("*.json"))
-    assert len(files) == 14
+    assert len(files) == 18
     for path in files:
         content = path.read_text(encoding="utf-8")
         for pattern in FORBIDDEN:

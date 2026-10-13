@@ -6,12 +6,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import re
 from typing import Sequence
 
 from keel import prompts
 from keel.models import ImagePart, Message, TextPart
 from keel.store.base import Session, StoredMessage
-from keel.tools.base import cap_json_result, truncate_middle
+from keel.tools.base import cap_json_result, redact, truncate_middle
 
 MESSAGE_OVERHEAD = 4
 IMAGE_TOKENS = 1_600
@@ -21,6 +22,16 @@ TAIL_SHARE, TAIL_MIN_TOKENS, TAIL_MAX_TOKENS = 0.025, 10_000, 25_000
 PLACEHOLDER_OVER_CHARS = 200
 IMAGE_OMITTED = "[image omitted from context]"
 SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+SUMMARY_INPUT_TOKENS = 40_000
+FILES_LIMIT = 50
+FILES_HEADING = "## Files referenced"
+_CONTENT_MAX, _CONTENT_HEAD, _CONTENT_TAIL = 6_000, 4_000, 1_500
+_ARGS_MAX, _ARGS_HEAD = 1_500, 1_200
+_PATH_ARGUMENT_TOOLS = ("read_file", "write_file", "patch")
+_PATH_TEXT_ARGUMENTS = {"terminal": "command", "execute_code": "code"}
+# A fixed prefix and one bounded character class keep the search linear on model-controlled text. The look-behind
+# keeps URLs (`https://host/path`) and relative paths (`a/b`) out.
+_ABSOLUTE_PATH = re.compile(r"(?<![\w/.:~-])/[\w.@+~-][\w./@+~-]{0,1023}")
 
 
 def text_tokens(text: str) -> int:
@@ -195,3 +206,86 @@ def estimate(items: Sequence[Item], base: int, anchor_tokens: int | None = None,
     if anchor_tokens is not None and anchor_id is not None and anchor_id in ids:
         return anchor_tokens + sum(message_tokens(item.message) for item in items[ids.index(anchor_id) + 1:])
     return base + sum(message_tokens(item.message) for item in items)
+
+
+def serialize(messages: Sequence[Message]) -> str:
+    """Messages as labelled, redacted text for the summary call (Hermes's format), after the placeholder pass."""
+    records = []
+    for message in messages:
+        message = placeholder(message)
+        content = redact(message.text)
+        if len(content) > _CONTENT_MAX:
+            content = f"{content[:_CONTENT_HEAD]}\n...[truncated]...\n{content[-_CONTENT_TAIL:]}"
+        if message.role == "tool":
+            records.append(f"[TOOL RESULT {message.tool_call_id}]: {content}")
+            continue
+        if message.tool_calls:
+            lines = []
+            for call in message.tool_calls:
+                arguments = redact(call.arguments)
+                if len(arguments) > _ARGS_MAX:
+                    arguments = arguments[:_ARGS_HEAD] + "..."
+                lines.append(f"  {call.name}({arguments})")
+            content += "\n[Tool calls:\n" + "\n".join(lines) + "\n]"
+        records.append(f"[{message.role.upper()}]: {content}")
+    return "\n\n".join(records)
+
+
+def summary_turns(previous: str | None, middle: Sequence[Message]) -> str:
+    """The middle serialized for the summary call, cut head-and-tail so that it and the previous summary stay
+    within SUMMARY_INPUT_TOKENS."""
+    room = SUMMARY_INPUT_TOKENS - (text_tokens(previous) if previous else 0)
+    return _cut_text(serialize(middle), max(1_000, room))
+
+
+def _paths_in(text: str) -> list[str]:
+    return [match.rstrip(".,:;") for match in _ABSOLUTE_PATH.findall(text)]
+
+
+def collect_files(messages: Sequence[Message], previous: Sequence[str] = ()) -> list[str]:
+    """File paths named in `messages`, after the previous list: the `path` argument of the file tools, and absolute
+    paths in user messages and in terminal and execute_code arguments. Deduplicated in first-seen order; the newest
+    FILES_LIMIT are kept."""
+    found = list(previous)
+    for message in messages:
+        if message.role == "user":
+            found += _paths_in(message.text)
+        for call in message.tool_calls:
+            try:
+                arguments = json.loads(call.arguments or "{}")
+            except ValueError:
+                continue
+            if not isinstance(arguments, dict):
+                continue
+            if call.name in _PATH_ARGUMENT_TOOLS and isinstance(arguments.get("path"), str):
+                found.append(arguments["path"])
+            elif call.name in _PATH_TEXT_ARGUMENTS and isinstance(arguments.get(_PATH_TEXT_ARGUMENTS[call.name]), str):
+                found += _paths_in(arguments[_PATH_TEXT_ARGUMENTS[call.name]])
+    return list(dict.fromkeys(path for path in found if len(path) > 1))[-FILES_LIMIT:]
+
+
+def split_files(summary: str | None) -> tuple[str | None, list[str]]:
+    """A stored summary's body and its "Files referenced" list (keel appends the list last)."""
+    if summary is None:
+        return None, []
+    body, heading, files = summary.rpartition(f"\n\n{FILES_HEADING}\n")
+    if not heading:
+        return summary, []
+    return body, [line[2:] for line in files.splitlines() if line.startswith("- ")]
+
+
+def join_files(body: str, files: Sequence[str]) -> str:
+    if not files:
+        return body
+    return f"{body}\n\n{FILES_HEADING}\n" + "\n".join(f"- {path}" for path in files)
+
+
+def summary_prompt(previous: str | None, turns: str, *, today: str) -> tuple[str, str]:
+    """(system, user) for the summary call: Hermes's checkpoint prompt, in its first or its update form."""
+    target = max(2_000, min(text_tokens(turns) // 5, 10_000))
+    sections = prompts.text("summary_sections").format(target=target, today=today)
+    if previous:
+        user = prompts.text("summary_update").format(previous=previous, turns=turns, sections=sections)
+    else:
+        user = prompts.text("summary_first").format(turns=turns, sections=sections)
+    return prompts.text("summary_system"), user

@@ -1,4 +1,5 @@
 import json
+import time
 
 from keel import compress, prompts
 from keel.models import ImagePart, Message, ReasoningItem, TextPart, ToolCall
@@ -161,3 +162,76 @@ def test_boundaries_come_from_the_session():
     assert compress.Boundaries.of(session) == compress.Boundaries("S", 3, 9, 12)
     assert compress.Boundaries.of(None) == compress.Boundaries() and not compress.Boundaries().active
     assert compress.Boundaries(pruned_id=1).active
+
+
+def test_messages_are_serialized_as_labelled_redacted_text():
+    secret = "sk-" + "a" * 24
+    text = compress.serialize([user(f"key {secret}"), assistant("ok", call("c1", "read_file", path="/w/a.py")),
+                               result("c1", "short")])
+    assert text == ('[USER]: key [REDACTED]\n\n[ASSISTANT]: ok\n[Tool calls:\n  read_file({"path": "/w/a.py"})\n]'
+                    "\n\n[TOOL RESULT c1]: short")
+
+
+def test_serialization_clips_long_messages_and_arguments_and_applies_placeholders():
+    long_user = compress.serialize([user("m" * 7_000)])
+    assert "...[truncated]..." in long_user and len(long_user) < 6_000
+    long_args = compress.serialize([assistant("", call("c1", "write_file", path="/w/x", content="c" * 2_000))])
+    assert long_args.endswith("...)\n]") and len(long_args) < 1_400
+    assert compress.serialize([result("c1", "y" * 500)]) == (
+        "[TOOL RESULT c1]: [terminal result omitted from context: 500 characters]")
+
+
+def test_the_summary_input_is_capped_with_the_previous_summary_counted():
+    middle = [user("t" * 6_000) for _ in range(200)]
+    turns = compress.summary_turns(None, middle)
+    assert "OUTPUT TRUNCATED" in turns and compress.text_tokens(turns) <= compress.SUMMARY_INPUT_TOKENS + 50
+    with_previous = compress.summary_turns("p" * 40_000, middle)
+    assert compress.text_tokens(with_previous) <= compress.SUMMARY_INPUT_TOKENS - 10_000 + 50
+    assert compress.summary_turns(None, [user("short")]) == "[USER]: short"
+
+
+def test_files_referenced_come_from_tool_arguments_and_absolute_paths():
+    messages = [
+        user("Here is /data/uploads/report-2026.csv. See https://example.com/a/b and a/b/c too."),
+        assistant("I will look at /not/collected.txt",
+                  call("c1", "write_file", path="out/summary.md", content="x"),
+                  call("c2", "terminal", command="python /work/run.py --in /data/x.csv"),
+                  call("c3", "execute_code", code="open('/tmp/y.txt')"),
+                  call("c4", "read_file", path="/w/a.py")),
+        assistant("", call("c5", "read_file", path="/w/a.py"), call("c6", "patch", path="/w/b.py")),
+    ]
+    assert compress.collect_files(messages, ["/prev/one.txt"]) == [
+        "/prev/one.txt", "/data/uploads/report-2026.csv", "out/summary.md", "/work/run.py", "/data/x.csv",
+        "/tmp/y.txt", "/w/a.py", "/w/b.py"]
+
+
+def test_files_referenced_keep_the_newest_fifty():
+    previous = [f"/p/{n}" for n in range(60)]
+    assert compress.collect_files([], previous) == previous[-50:]
+
+
+def test_the_path_pattern_is_linear_on_long_input():
+    for text in ("/" + "a" * 200_000, "/a" * 100_000, "/" * 200_000, " /a." * 50_000, "a/" * 100_000):
+        started = time.perf_counter()
+        compress.collect_files([user(text)])
+        assert time.perf_counter() - started < 1.0
+
+
+def test_the_files_section_is_appended_and_read_back():
+    joined = compress.join_files("BODY", ["/a", "/b"])
+    assert joined == "BODY\n\n## Files referenced\n- /a\n- /b"
+    assert compress.split_files(joined) == ("BODY", ["/a", "/b"])
+    assert compress.split_files("BODY") == ("BODY", [])
+    assert compress.split_files(None) == (None, [])
+    assert compress.join_files("BODY", []) == "BODY"
+
+
+def test_the_summary_prompt_has_a_first_and_an_update_form():
+    system, first = compress.summary_prompt(None, "TURNS", today="October 12, 2026")
+    assert system == prompts.text("summary_system")
+    assert "TURNS TO SUMMARIZE:\nTURNS" in first and "PREVIOUS SUMMARY" not in first
+    assert "## Historical Task Snapshot" in first and "The current date is October 12, 2026." in first
+    assert "Target ~2000 tokens." in first
+    _, update = compress.summary_prompt("OLD", "NEW", today="October 12, 2026")
+    assert "PREVIOUS SUMMARY:\nOLD" in update and "NEW TURNS TO INCORPORATE:\nNEW" in update
+    assert "## Historical Task Snapshot" in update
