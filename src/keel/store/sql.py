@@ -25,16 +25,20 @@ def _j(value) -> str:
 
 
 def _profile(row: dict) -> Profile:
-    return Profile(row["id"], json.loads(row["models"]), json.loads(row["sandbox"]), row["soul"],
-                   json.loads(row["skills"]), row["updated_at"], bool(row["memory"]))
+    return Profile(id=row["id"], models=json.loads(row["models"]), sandbox=json.loads(row["sandbox"]),
+                   soul=row["soul"], skills=json.loads(row["skills"]), updated_at=row["updated_at"],
+                   memory=bool(row["memory"]))
 
 
 def _session(row: dict) -> Session:
-    return Session(row["id"], row["profile_id"], row["title"], row["title_source"], row["created_at"],
-                   row["last_active_at"], row["message_count"], row["system_prompt"], row["provider"],
-                   row["model"], row["cwd"], row["summary"], row["summary_head_id"], row["summary_tail_id"],
-                   row["context_tokens"], row["context_message_id"], row["compaction_failed_at"],
-                   row["turns_since_memory"])
+    return Session(
+        id=row["id"], profile_id=row["profile_id"], title=row["title"], title_source=row["title_source"],
+        created_at=row["created_at"], last_active_at=row["last_active_at"], message_count=row["message_count"],
+        system_prompt=row["system_prompt"], provider=row["provider"], model=row["model"], cwd=row["cwd"],
+        summary=row["summary"], summary_head_id=row["summary_head_id"], summary_tail_id=row["summary_tail_id"],
+        context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
+        compaction_failed_at=row["compaction_failed_at"], turns_since_memory=row["turns_since_memory"],
+    )
 
 
 def _message(row: dict) -> StoredMessage:

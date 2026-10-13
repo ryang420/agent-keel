@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Taken first in every migration's transaction, so instances starting together migrate once.
+# The key must equal 0.2.0's, so that a 0.2.0 instance and this one starting together also serialise.
 _PG_LOCK = "SELECT pg_advisory_xact_lock(7312100001)"
 _TYPES = {
     "sqlite": {"real": "REAL", "serial": "INTEGER", "bigint": "INTEGER"},
@@ -92,11 +93,18 @@ async def _table_exists(db, name: str) -> bool:
     return row is not None
 
 
+async def _stamped_version(db) -> int | None:
+    if not await _table_exists(db, "schema_version"):
+        return None
+    row = await db.fetchrow("SELECT version FROM schema_version")
+    return int(row["version"]) if row else None
+
+
 async def schema_version(db) -> int:
-    """The database's version: 0 when empty, 1 for a 0.2.0 database (keel's tables and no version table)."""
-    if await _table_exists(db, "schema_version"):
-        row = await db.fetchrow("SELECT version FROM schema_version")
-        return int(row["version"]) if row else 0
+    """The database's version: 0 when empty, 1 for a 0.2.0 database (keel's tables and no version recorded)."""
+    stamped = await _stamped_version(db)
+    if stamped is not None:
+        return stamped
     return 1 if await _table_exists(db, "profiles") else 0
 
 
@@ -118,8 +126,11 @@ async def migrate(db) -> int:
                 raise SchemaTooNew(f"The database schema is version {current}; this keel knows versions up to "
                                    f"{LATEST_VERSION}. A downgrade is not supported.")
             if current >= migration.version:
-                if not await _table_exists(db, "schema_version"):
-                    await _set_version(db, current)  # a 0.2.0 database: record the version it was recognised as
+                if await _stamped_version(db) is None:
+                    # A 0.2.0 database, maybe partly created: 0.2.0 made its tables outside a transaction.
+                    for statement in migration.statements(db.dialect):
+                        await db.execute(statement)
+                    await _set_version(db, current)
                 continue
             for statement in migration.statements(db.dialect):
                 await db.execute(statement)

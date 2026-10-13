@@ -5,8 +5,9 @@ import sqlite3
 
 import pytest
 
-from keel.store import open_store
-from keel.store.migrations import LATEST_VERSION, SchemaTooNew, schema_version
+from keel.store import migrations, open_store
+from keel.store.db import SqliteDb
+from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
 
 ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, blobs"
 BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("KEEL_TEST_POSTGRES_DSN") else [])
@@ -73,6 +74,15 @@ async def run_script(url: str, script: str) -> None:
         await conn.execute(script)
     finally:
         await conn.close()
+
+
+async def connect(url: str):
+    """A connection that, unlike open_store, does not migrate."""
+    if url.startswith("sqlite:///"):
+        return await SqliteDb.connect(url[len("sqlite:///"):])
+    from keel.store.postgres import PostgresDb
+
+    return await PostgresDb.connect(url)
 
 
 def v020_script(url: str) -> str:
@@ -170,6 +180,57 @@ async def test_a_database_newer_than_the_code_is_refused(db_url):
     await store.close()
     with pytest.raises(SchemaTooNew):
         await open_store(db_url)
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == LATEST_VERSION + 1
+    finally:
+        await db.close()
+
+
+async def test_a_failed_migration_leaves_the_database_at_the_version_before(db_url, monkeypatch):
+    await (await open_store(db_url)).close()
+    failing = Migration(LATEST_VERSION + 1, """
+ALTER TABLE profiles ADD COLUMN doomed INTEGER;
+CREATE TABLE doomed (id TEXT PRIMARY KEY);
+INSERT INTO no_such_table (id) VALUES ('x');
+""")
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS + (failing,))
+    monkeypatch.setattr(migrations, "LATEST_VERSION", failing.version)
+    with pytest.raises(Exception, match="no_such_table"):
+        await open_store(db_url)
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == failing.version - 1
+        shape = await schema_shape(db)
+        assert "doomed" not in shape["columns"]
+        assert "doomed" not in [column[0] for column in shape["columns"]["profiles"]]
+    finally:
+        await db.close()
+
+
+async def test_a_0_2_0_database_whose_first_start_crashed_is_completed(db_url):
+    partial = [s for s in v020_script(db_url).split(";") if "TABLE IF NOT EXISTS profiles" in s or "blobs" in s]
+    await run_script(db_url, ";".join(partial))
+    store = await open_store(db_url)
+    try:
+        assert await schema_version(store.db) == LATEST_VERSION
+        upgraded = await schema_shape(store.db)
+    finally:
+        await store.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded
+    finally:
+        await fresh.close()
+
+
+async def test_an_empty_version_table_reads_like_no_version_table(db_url):
+    await run_script(db_url, v020_script(db_url) + "CREATE TABLE schema_version (version INTEGER NOT NULL);")
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == 1
+    finally:
+        await db.close()
 
 
 @needs_postgres
@@ -189,7 +250,6 @@ async def test_instances_starting_together_upgrade_an_old_database_once():
 async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
     store = await open_store(db_url)
     try:
-        assert LATEST_VERSION == 2
         assert (await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])).memory is False
         session = await store.ensure_session("p1", "s1")
         assert (session.summary, session.summary_head_id, session.summary_tail_id) == (None, None, None)
