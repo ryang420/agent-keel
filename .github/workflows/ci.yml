@@ -21,6 +21,8 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - run: pytest -q
+        env:
+          KEEL_TEST_SUBPROCESS: "1"
 
   postgres:
     name: postgres
@@ -47,7 +49,9 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       # The store, bus and runner tests drop and recreate keel's tables in this throwaway database.
-      - run: pytest -q tests/test_postgres_db.py tests/test_store.py tests/test_events.py tests/test_runner.py
+      - run: >-
+          pytest -q tests/test_postgres_db.py tests/test_store.py tests/test_events.py tests/test_runner.py
+          tests/test_worker.py tests/test_migrations.py tests/test_compaction.py tests/test_fault_injection.py
         env:
           KEEL_TEST_POSTGRES_DSN: postgresql://keel:postgres@localhost:5432/keel_test
 
@@ -62,7 +66,7 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - run: docker pull python:3.12-slim
-      - run: pytest -q tests/test_docker_sandbox.py
+      - run: pytest -q tests/test_docker_sandbox.py tests/test_fault_injection.py
         env:
           KEEL_TEST_DOCKER: "1"
 
