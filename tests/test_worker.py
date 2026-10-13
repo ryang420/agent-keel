@@ -1,4 +1,7 @@
 import asyncio
+import contextlib
+import os
+import signal
 
 import pytest
 
@@ -299,22 +302,53 @@ async def test_sweeping_kills_the_command_a_lost_worker_left_running(store, cloc
         if "x1" in sandbox._groups:
             break
         await asyncio.sleep(0.02)
+    pgid = sandbox._groups["x1"]
+    try:
+        run = await queue(store)
+        await store.claim_run("dead-worker", clock.now + 30)
+        await store.set_current_exec(run.id, "x1")
+        executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=sandbox)
+        pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+        clock.now += 31
+        assert await pool.sweep_once() == 1
+        result = await asyncio.wait_for(command, 5)
+        assert result.exit_code != 0 and not (work / "late").exists()
+        swept = await store.get_run("p1", run.id)
+        assert (swept.status, swept.error_code, swept.current_exec_id) == ("failed", "worker_lost", None)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        command.cancel()
+        await asyncio.gather(command, return_exceptions=True)
+
+
+async def test_the_sweeper_never_creates_a_sandbox(store, clock, tmp_path):
+    killed = []
+
+    class NoCreate(LocalSandbox):
+        async def ensure(self, profile_id, policy):
+            killed.append("ensure")
+            raise AssertionError("the sweeper must not create a sandbox")
+
+        async def kill_tree(self, sandbox, exec_id):
+            killed.append((sandbox.name, exec_id))
+
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
+                               sandbox={"image": "local", "workdir": str(tmp_path / "w")})
     run = await queue(store)
     await store.claim_run("dead-worker", clock.now + 30)
     await store.set_current_exec(run.id, "x1")
-    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=sandbox)
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=NoCreate())
     pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
     clock.now += 31
     assert await pool.sweep_once() == 1
-    result = await asyncio.wait_for(command, 5)
-    assert result.exit_code != 0 and not (work / "late").exists()
-    swept = await store.get_run("p1", run.id)
-    assert (swept.status, swept.error_code, swept.current_exec_id) == ("failed", "worker_lost", None)
+    assert killed == [("local-p1", "x1")]
+    assert not (tmp_path / "w").exists()
 
 
 async def test_a_sweep_survives_an_unreachable_sandbox(store, clock, tmp_path):
     class Down(LocalSandbox):
-        async def ensure(self, profile_id, policy):
+        async def kill_tree(self, sandbox, exec_id):
             raise SandboxError("docker is down")
 
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],

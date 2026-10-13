@@ -72,6 +72,9 @@ class DockerSandbox:
     def container_name(self, profile_id: str) -> str:
         return "keel-sbx-" + hashlib.sha256(f"{self.deployment}\0{profile_id}".encode()).hexdigest()[:12]
 
+    def reference(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
+        return Sandbox(profile_id, self.container_name(profile_id), policy)
+
     def run_args(self, profile_id: str, policy: SandboxPolicy, env_file: str | None = None) -> list[str]:
         # Hardening mirrors the Hermes docker backend: no capabilities beyond file ownership and access, no
         # privilege gain, and writable scratch space on tmpfs (nosuid; /tmp stays executable for scripts).
@@ -140,7 +143,7 @@ class DockerSandbox:
                 if created != 0:
                     raise SandboxError(f"Could not create the sandbox: {out.strip()[:300]}")
         self._last_used[name] = self.clock()
-        return Sandbox(profile_id, name, policy)
+        return self.reference(profile_id, policy)
 
     async def exec(self, sandbox: Sandbox, argv: list[str], *, cwd: str, timeout_s: float, exec_id: str,
                    env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:

@@ -170,7 +170,8 @@ class RunExecutor:
 
     async def kill_orphaned_command(self, run: Run) -> None:
         """For a run swept as worker_lost: kill the command its dead worker started, so it does not run on. Best
-        effort and never raises; the exec id is cleared either way, since the run is over."""
+        effort and never raises; the exec id is cleared either way, since the run is over. It never creates a
+        sandbox: this instance may not share the dead worker's Docker daemon, and then there is nothing to kill."""
         if not run.current_exec_id:
             return
         if self.sandbox is not None:
@@ -178,7 +179,7 @@ class RunExecutor:
                 profile = await self.store.get_profile(run.profile_id)
                 if profile is not None and profile.sandbox:
                     policy = parse_policy(profile.sandbox, self.mount_root)
-                    sandbox = await asyncio.wait_for(self.sandbox.ensure(run.profile_id, policy), self.kill_timeout_s)
+                    sandbox = self.sandbox.reference(run.profile_id, policy)
                     await asyncio.wait_for(self.sandbox.kill_tree(sandbox, run.current_exec_id), self.kill_timeout_s)
             except Exception:
                 log.warning("run %s: could not kill the command of its lost worker", run.id, exc_info=True)

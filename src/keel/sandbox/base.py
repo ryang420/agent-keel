@@ -149,6 +149,10 @@ class ExecResult:
 class SandboxBackend(Protocol):
     async def ensure(self, profile_id: str, policy: SandboxPolicy) -> Sandbox: ...
 
+    def reference(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
+        """The handle `ensure` would return, without creating or starting anything."""
+        ...
+
     async def exec(self, sandbox: Sandbox, argv: list[str], *, cwd: str, timeout_s: float, exec_id: str,
                    env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult: ...
 
