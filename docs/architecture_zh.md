@@ -159,8 +159,9 @@ erDiagram
   `404 session_not_found`。
 - **事件按 run 编号。** `(run_id, seq)` 是主键；`append_event` 在事务内取 `MAX(seq) + 1`，遇到唯一约束冲突最多重试三次。
 
-同一套 SQL（`?` 占位符）同时跑在 SQLite 和 Postgres 上。创建 Postgres schema 时会取一个 advisory lock，
-避免多个实例同时启动时互相竞争。目前没有迁移（migration）机制。
+同一套 SQL（`?` 占位符）同时跑在 SQLite 和 Postgres 上。schema 在启动时由编号迁移（`store/migrations.py`）
+创建和升级：每个迁移在自己的事务里、持有 Postgres advisory lock 执行，多个实例同时启动时只会迁移一次。0.2.0 的
+数据库会原地升级；由更新版本 keel 写入的数据库会被拒绝。
 
 ---
 
@@ -544,7 +545,6 @@ flowchart LR
 
 - **目前只运行一个实例。** Postgres 的 `LISTEN` 连接不会自行重连（跨实例唤醒随后退回到轮询），而且启动时的
   `remove_orphans` 会删除该部署的所有沙箱，这会破坏第二个实例上正在进行的 run。
-- **没有 schema 迁移。** schema 缺失时会被创建；如果某个版本改了 schema，就需要一个全新的数据库。
 - **没有上下文压缩。** 超出模型窗口的对话会以 `context_overflow` 结束 run。
 - **尚未实现：** 长期记忆、定时任务、审批、网页搜索或浏览、MCP 服务器、agent 自己编写的 skills、Anthropic 官方
   API 的 provider。

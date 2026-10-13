@@ -165,8 +165,10 @@ Rules the schema enforces:
 - **Events are numbered per run.** `(run_id, seq)` is the primary key; `append_event` takes `MAX(seq) + 1` inside a
   transaction and retries up to three times on a unique violation.
 
-The same SQL (`?` placeholders) runs on SQLite and Postgres. The Postgres schema takes an advisory lock while it is
-created so several instances starting together do not race. There are no migrations yet.
+The same SQL (`?` placeholders) runs on SQLite and Postgres. The schema is created and upgraded by numbered
+migrations (`store/migrations.py`) at start: each runs in its own transaction under a Postgres advisory lock, so
+several instances starting together migrate once. A database from 0.2.0 is upgraded in place; one written by a newer
+keel is refused.
 
 ---
 
@@ -579,7 +581,6 @@ The reporting policy for vulnerabilities is in [SECURITY.md](../SECURITY.md).
 - **Run a single instance for now.** The Postgres `LISTEN` connection does not reconnect on its own (cross-instance
   wake-ups then fall back to polling), and `remove_orphans` at start removes every sandbox of the deployment, which
   would break a second instance's runs.
-- **No schema migrations.** The schema is created if missing; a release that changes it needs a fresh database.
 - **No context compression.** A conversation that outgrows the model's window ends a run with `context_overflow`.
 - **Not built:** long-term memory, scheduled jobs, approvals, web search or browsing, MCP servers, agent-written
   skills, a provider for Anthropic's own API.

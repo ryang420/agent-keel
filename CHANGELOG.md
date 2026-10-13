@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Numbered schema migrations: a database is upgraded in place at start, and a 0.2.0 database keeps its data. A
+  database written by a newer keel is refused. Migration 2 adds the tables and columns M3 uses.
+
 ### Changed
 - `search_files` uses ripgrep when the sandbox image has it, and `grep`/`find` otherwise. Both skip hidden
   directories (before, only `.git`). With ripgrep, gitignored files are skipped too, results are sorted by path, and
