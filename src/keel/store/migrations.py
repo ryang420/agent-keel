@@ -64,7 +64,22 @@ CREATE TABLE IF NOT EXISTS blobs (
 CREATE INDEX IF NOT EXISTS blobs_session ON blobs (session_id);
 """
 
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1),)
+_V2 = """
+ALTER TABLE profiles ADD COLUMN memory INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN summary TEXT;
+ALTER TABLE sessions ADD COLUMN summary_head_id {bigint};
+ALTER TABLE sessions ADD COLUMN summary_tail_id {bigint};
+ALTER TABLE sessions ADD COLUMN context_tokens INTEGER;
+ALTER TABLE sessions ADD COLUMN context_message_id {bigint};
+ALTER TABLE sessions ADD COLUMN compaction_failed_at {real};
+ALTER TABLE sessions ADD COLUMN turns_since_memory INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE memories (
+    profile_id TEXT NOT NULL, target TEXT NOT NULL, entries TEXT NOT NULL, updated_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, target));
+CREATE INDEX runs_finished ON runs (finished_at);
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1), Migration(2, _V2))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

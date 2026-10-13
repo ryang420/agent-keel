@@ -134,6 +134,8 @@ async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_
     store = await open_store(db_url)
     try:
         assert await schema_version(store.db) == LATEST_VERSION
+        stamped = await store.db.fetch("SELECT version FROM schema_version")
+        assert [row["version"] for row in stamped] == [LATEST_VERSION]
         assert (await store.get_profile("p1")).soul == "You help."
         session = await store.get_session("p1", "s1")
         assert (session.title, session.title_source, session.system_prompt) == ("Old chat", "derived", "sys")
@@ -182,3 +184,30 @@ async def test_instances_starting_together_upgrade_an_old_database_once():
     finally:
         for store in stores:
             await store.close()
+
+
+async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
+    store = await open_store(db_url)
+    try:
+        assert LATEST_VERSION == 2
+        assert (await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])).memory is False
+        session = await store.ensure_session("p1", "s1")
+        assert (session.summary, session.summary_head_id, session.summary_tail_id) == (None, None, None)
+        assert (session.context_tokens, session.context_message_id, session.compaction_failed_at) == (None, None, None)
+        assert session.turns_since_memory == 0
+        await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
+                               "p1", "user", "[]", 1.0)
+        assert (await store.db.fetchrow("SELECT entries FROM memories WHERE profile_id = ?", "p1"))["entries"] == "[]"
+    finally:
+        await store.close()
+
+
+async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
+    await run_script(db_url, v020_script(db_url) + SEED)
+    store = await open_store(db_url)
+    try:
+        assert (await store.get_profile("p1")).memory is False
+        session = await store.get_session("p1", "s1")
+        assert session.summary is None and session.turns_since_memory == 0 and session.title == "Old chat"
+    finally:
+        await store.close()
