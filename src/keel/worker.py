@@ -91,6 +91,8 @@ class WorkerPool:
             await asyncio.sleep(self.lease_seconds)
 
     async def prune_once(self) -> int:
+        if self.event_retention_s is None:
+            return 0
         return await self.store.prune_events(self.clock() - self.event_retention_s)
 
     async def _maintain(self) -> None:

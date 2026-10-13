@@ -351,6 +351,7 @@ async def test_the_maintenance_task_prunes_at_start_and_stops_on_close(store, cl
     pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", workers=1, poll_seconds=0.01, clock=clock,
                       event_retention_s=7 * 86_400)
     await pool.start()
+    [maintenance] = [t for t in pool._tasks if t.get_name() == "keel-maintenance"]
     try:
         for _ in range(100):
             if not await store.events_after(run.id, 0):
@@ -359,4 +360,15 @@ async def test_the_maintenance_task_prunes_at_start_and_stops_on_close(store, cl
         assert await store.events_after(run.id, 0) == []
     finally:
         await asyncio.wait_for(pool.close(drain_seconds=0.1), 2)
-    assert all(t.done() for t in asyncio.all_tasks() if t.get_name() == "keel-maintenance")
+    assert maintenance.done() and pool._tasks == []
+
+
+async def test_prune_once_without_a_retention_deletes_nothing(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    run = await queue(store)
+    await store.append_event(run.id, "run.started", {})
+    await store.finish_run(run.id, "completed")
+    clock.now += 365 * 86_400
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+    assert await pool.prune_once() == 0
+    assert len(await store.events_after(run.id, 0)) == 1

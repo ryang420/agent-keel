@@ -248,6 +248,28 @@ async def test_stream_waits_for_a_terminal_event_that_lands_after_the_status(ser
     assert types[-1] == "run.completed"
 
 
+async def test_a_run_finished_seconds_ago_still_waits_for_its_terminal_event(service):
+    client, provider, store = service
+    run_id = await _finished_without_terminal_event(client, provider, store)
+    store.clock.now += 30
+    executor = client._transport.app.state.keel.executor
+    stream = asyncio.create_task(client.get(f"/v1/profiles/p1/runs/{run_id}/events"))
+    await asyncio.sleep(0.2)
+    assert not stream.done()
+    await executor.emit(run_id, "run.completed", {"output": "x", "usage": {}})
+    response = await asyncio.wait_for(stream, 5)
+    types = [json.loads(l[6:])["type"] for l in response.text.splitlines() if l.startswith("data: ")]
+    assert types[-1] == "run.completed"
+
+
+async def test_a_run_finished_over_a_minute_ago_without_a_terminal_event_closes_at_once(service):
+    client, provider, store = service
+    run_id = await _finished_without_terminal_event(client, provider, store)
+    store.clock.now += 61
+    response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 2)
+    assert response.status_code == 200
+
+
 async def test_stream_gives_up_when_no_terminal_event_ever_comes(service, monkeypatch):
     client, provider, store = service
     monkeypatch.setattr("keel.api._TERMINAL_GRACE_SECONDS", 0.2)
