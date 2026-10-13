@@ -47,11 +47,12 @@ Errors have one shape, with a machine-readable code:
 - `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means the sandbox tools are not offered.
 - `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
 - `skills`: the names of the skills to enable.
-- `memory`: when true, the model is offered a `memory` tool (with or without a sandbox) and the system prompt
-  includes a snapshot of stored facts, frozen until that prompt is rebuilt. Every `KEEL_MEMORY_REVIEW_TURNS`
-  completed runs (10 by default), a background review may save facts. It does not add messages or events to the
-  session, and a review already running for that profile is skipped. Omitted, it is false, including when
-  replacing a profile that had it on. Anything other than a boolean is 400 `invalid_input`.
+- `memory`: a boolean. When true, the model is offered a `memory` tool (with or without a sandbox) and the system
+  prompt includes a snapshot of stored facts. A write does not change this session's stored prompt: it is visible in
+  the next session's prompt, and after a compaction. Every `KEEL_MEMORY_REVIEW_TURNS` completed runs (10 by default)
+  of that profile, a background review may save facts. The review does not add messages or events to the session, and
+  one already running for that profile is skipped. Omitted, the field is false, including on update. `null`, or
+  anything other than a boolean, is 400 `invalid_input`.
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 
@@ -128,8 +129,9 @@ is unchanged. A client should ignore event types it does not know.
 
 ## Sessions and messages
 
-A session is `id`, `title`, `title_source` (`derived` from the first message, `llm` after the first completed run, or
-`user` after a rename), `created_at`, `last_active_at`, `message_count`.
+A session is `id`, `title`, `title_source` (`derived` from the first message, then `llm` after the first completed
+run, or `user` after a rename; `user` outranks `llm`, which outranks `derived`), `created_at`, `last_active_at`,
+`message_count`. Setting the model title emits no event; a client reads the title from the session.
 
 `GET .../messages` returns `{"data": [message, …], "pagination": {"limit", "offset", "returned"}}` with `limit`
 (1-500, default 200) and `offset`. With `after_id=<message id>` it returns only the later messages, without

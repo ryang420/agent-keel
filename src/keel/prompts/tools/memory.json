@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "description": "Save a fact that is shown in future sessions. Two stores: target \"user\" is who the user is (name, role, preferences, style); target \"memory\" is your notes about the environment (conventions, tool quirks, paths). One fact goes to one store. Keep entries short. Skip task progress, one-off logs and anything already in the prompt. The snapshot in the prompt is frozen for this session; a write shows up in the next session. replace overwrites the whole entry; old_text only locates it. operations applies every change atomically, and the final text must fit the character budget.",
+  "description": "Save a fact that is shown in future sessions. Two stores: target \"user\" is who the user is (name, role, preferences, style); target \"memory\" is your notes about the environment (conventions, tool quirks, paths). One fact goes to one store. Keep entries short. Skip task progress, one-off logs and anything already in the prompt. The snapshot in the prompt is frozen for this session; a write shows up in the next session, and in this one after a compaction. replace overwrites the whole entry; old_text only locates it. operations applies every change atomically, and the final text must fit the character budget.",
   "parameters": {
     "type": "object",
     "properties": {

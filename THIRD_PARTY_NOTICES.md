@@ -9,8 +9,10 @@ https://github.com/NousResearch/hermes-agent
 
 Version v2026.9.24 (commit `f97608f178`). Used in `src/keel/providers/responses.py`,
 `src/keel/providers/sigv4.py`, `src/keel/providers/retry.py`, the prompt texts and tool definitions under
-`src/keel/prompts/`, `src/keel/skills.py` (index format), `src/keel/prompt.py` (tier order), the tool behaviour in
-`src/keel/tools/` (result shapes, truncation), and `src/keel/compress.py` (summary input format and limits).
+`src/keel/prompts/` (including `title.md`, `memory.md`, `memory_review.md` and `tools/memory.json`),
+`src/keel/skills.py` (index format), `src/keel/prompt.py` (tier order), the tool behaviour in
+`src/keel/tools/` (result shapes, truncation), `src/keel/compress.py` (summary input format and limits),
+`src/keel/titles.py`, `src/keel/memory.py` and `src/keel/review.py`.
 
 MIT License
 

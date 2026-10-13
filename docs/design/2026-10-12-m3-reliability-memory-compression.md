@@ -138,6 +138,8 @@ New `src/keel/background.py` owns them:
   `finally`, next to `pool.close()`.
 - A background task is not cancelled when its run finishes. It is cancelled only on shutdown.
 
+As built (2026-10-13): `Background.close` waits 5 seconds.
+
 ## 3. Model-generated titles
 
 The first turn already sets a derived title (arch §9, `titles.py`). M3 adds the model title.
@@ -155,6 +157,8 @@ The first turn already sets a derived title (arch §9, `titles.py`). M3 adds the
   and the model title its own 100.
 - **Failure.** Bad JSON, an empty title or any provider error keeps the derived title.
 - **Event.** No new event. A client reads the title from `GET …/sessions`.
+
+As built (2026-10-13): guards reject a title over 12 words, an echo of an example, or the friendly greeting.
 
 ## 4. Memory and background review
 
@@ -202,6 +206,10 @@ session never changes its cached prefix. Writes appear in the next session or af
   `memory` tool is offered, with an iteration cap of 4.
 - **Isolation.** Nothing is written to the session's messages. The review only changes `memories`. A review is
   skipped when one is already running for that profile.
+
+As built (2026-10-13): memory guidance is its own file (`prompts/memory.md`), included only when memory is on, and
+the prompt rebuild is async. Omitting `memory` on `PUT` stores false (`null` is 400). A write may be a batch of
+operations. Five injection patterns are refused.
 
 ## 5. Context compression, in place
 

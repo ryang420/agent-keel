@@ -7,19 +7,21 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Background memory review: with memory on, every `KEEL_MEMORY_REVIEW_TURNS` completed runs (default 10) a review
-  may save facts. It does not write messages or events on the session. A review already running for that profile
-  is skipped, and one dropped because the background limit is full does not block the next.
-- `PUT /v1/profiles/{id}` accepts `memory` (a boolean). Omitting it stores false, including when replacing a
-  profile that had memory on. Memory entries for a profile are written in one transaction. With memory on, the
-  model is offered a `memory` tool even when the profile has no sandbox, and the system prompt carries a snapshot
-  of the stored facts that stays frozen until the prompt is first stored or rebuilt.
-- A session's first completed run may replace its derived title with a short model title (`title_source` `llm`).
-  A user rename still wins, and a reply that is empty, vague, or not a short title keeps the derived one. Numbered
-  suffixes (`#2`, `#3`, …) are no longer capped.
-- Best-effort background tasks for work that must not belong to a run. `KEEL_BACKGROUND_LIMIT` (default 4) caps how
-  many run at once; a task past the limit is dropped and logged, and tasks are cancelled only at shutdown.
-  `KEEL_MEMORY_REVIEW_TURNS` (10), `KEEL_MEMORY_CHARS` (2200) and `KEEL_USER_CHARS` (1375) are read at start.
+- Background memory review: with memory on, every `KEEL_MEMORY_REVIEW_TURNS` completed runs of a profile, a review
+  may save facts. It does not add messages or events to the session. A review already running for that profile is
+  skipped, and one dropped because the background limit is full does not block the next.
+- `PUT /v1/profiles/{id}` accepts `memory` (a boolean). Omitting it stores false, including on update; `null` is
+  400. Memory entries for a profile are written in one transaction. With memory on, the model is offered a `memory`
+  tool even when the profile has no sandbox. A write does not change the current session's stored system prompt; it
+  appears in the next session's prompt, and when this session is compacted.
+- A session's first completed run may replace its derived title with a short model title (`title_source` `llm`,
+  between `derived` and `user`). No new event: a client reads the title from the session. A user rename still wins,
+  and a reply that is empty, vague, or not a short title keeps the derived one. Numbered suffixes (`#2`, `#3`, …)
+  are no longer capped.
+- Best-effort background tasks for work that must not belong to a run. `KEEL_BACKGROUND_LIMIT` (4),
+  `KEEL_MEMORY_REVIEW_TURNS` (10), `KEEL_MEMORY_CHARS` (2200) and `KEEL_USER_CHARS` (1375) are positive integers,
+  read at start. `KEEL_BACKGROUND_LIMIT` caps how many tasks run at once; a task past the limit is dropped and
+  logged, and tasks are cancelled only at shutdown.
 - Numbered schema migrations: a database is upgraded in place at start, and a 0.2.0 database keeps its data. A
   database written by a newer keel is refused. Migration 2 adds the tables and columns M3 uses.
 - Context compression: a session can outgrow the model's context window. At `KEEL_COMPRESSION_THRESHOLD` (0.75)

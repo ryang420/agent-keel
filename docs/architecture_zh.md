@@ -76,10 +76,13 @@ flowchart TB
 | `events.py` | `InMemoryEventBus`、`PostgresEventBus`。 |
 | `providers/` | `ModelProvider` 接口、注册表、重试策略、Responses API 传输层、Bedrock（SigV4）、OpenAI。 |
 | `sandbox/` | `SandboxBackend`：策略解析、Docker 后端、供测试用的宿主进程后端。 |
-| `tools/` | 八个工具，以及循环调用的唯一入口 `run_tool`。 |
+| `tools/` | 沙箱工具和 `memory` 工具，以及循环调用的唯一入口 `run_tool`。 |
 | `prompt.py`、`prompts/` | 会话的系统提示词，以及提示词和工具定义文本。 |
 | `skills.py` | 通过沙箱发现 skill，并生成提示词里的索引。 |
 | `titles.py` | 会话标题：从首条消息推导，也可由模型生成。 |
+| `background.py` | run 之外的尽力而为任务：模型标题、记忆复查。 |
+| `memory.py` | 两个记忆目标的条目，以及写入时的检查。 |
+| `review.py` | 后台记忆复查。它只写记忆。 |
 
 只有存在多个实现的地方才定义接口：`Store`（SQLite、Postgres）、`EventBus`（进程内、Postgres）、
 `ModelProvider`（Bedrock、OpenAI，以及测试用的 fake）、`SandboxBackend`（Docker、本地）。其余都是具体代码。
@@ -91,6 +94,7 @@ flowchart TB
 ```mermaid
 erDiagram
     profiles ||--o{ sessions : "拥有"
+    profiles ||--o{ memories : "记忆"
     sessions ||--o{ messages : "对话记录"
     sessions ||--o{ runs : "各轮"
     sessions ||--o{ blobs : "图片"
@@ -103,6 +107,12 @@ erDiagram
         text sandbox "策略 JSON，为空表示没有工具"
         text soul "人设"
         text skills "启用的 skill 名称"
+        bool memory "省略则为关"
+    }
+    memories {
+        text profile_id PK
+        text target PK "memory 或 user"
+        text entries "JSON 字符串列表"
     }
     sessions {
         text id PK
@@ -264,7 +274,7 @@ run；之后每一轮只扫描上一轮截止时间之后结束的 run（再重�
 ```mermaid
 flowchart TB
     A["加载 profile 和 session<br/>解析沙箱策略"] --> B{"设置了策略且<br/>KEEL_SANDBOX=docker？"}
-    B -->|否| C["没有工具：模型只回答"]
+    B -->|否| C["没有沙箱工具<br/>开启记忆时仍提供 memory"]
     B -->|是| D["sandbox.ensure(profile)<br/>发现 skills"]
     C --> E
     D --> E["系统提示词：<br/>沿用会话已有的，或构建并冻结"]
@@ -351,8 +361,8 @@ notify 可以唤醒另一个实例上的读取方。它需要两个直连（一�
 
 ## 8. 沙箱
 
-只有当 profile 的 `sandbox` 策略非空，**并且**服务以 `KEEL_SANDBOX=docker` 运行时，profile 才有工具。
-策略为空或 `KEEL_SANDBOX=none` 时，run 就是普通聊天：模型作答，但没有工具。
+只有当 profile 的 `sandbox` 策略非空，**并且**服务以 `KEEL_SANDBOX=docker` 运行时，profile 才有沙箱工具。
+策略为空或 `KEEL_SANDBOX=none` 时没有沙箱工具。profile 的 `memory` 为开时，仍会提供 `memory` 工具。
 
 ### 策略
 
@@ -416,7 +426,8 @@ no-new-privileges`；`--init`；以及 `/tmp`（512 MB，`nosuid`）、`/var/tmp
 
 ## 9. 工具
 
-profile 有沙箱时，会提供八个工具；它们的 schema 位于 `prompts/tools/*.json`。
+profile 有沙箱时，会提供八个工具；它们的 schema 位于 `prompts/tools/*.json`。`memory` 工具是另外的：profile 的
+`memory` 为开时提供，有没有沙箱都可以。
 
 | 工具 | 作用 | 限制 |
 |---|---|---|
@@ -436,6 +447,19 @@ profile 有沙箱时，会提供八个工具；它们的 schema 位于 `prompts/
 - **结果有上限。** 超过 100 000 个字符的结果会被缩短，同时仍然保持是合法的 JSON。
 - **预览。** 每次调用都有一个简短的预览（`tool.started` / `tool.completed`），客户端无需完整参数就能展示进度。
 
+### 记忆
+
+`memory` 工具可以添加、替换或删除条目，几次改动也可以放在一批里。一次写入不会改变该会话已存储的系统提示词。
+
+两个目标，各自是一串短句：`user` 是用户是谁，`memory` 是关于环境的笔记。拼起来的文本分别受 `KEEL_USER_CHARS`（1375）
+和 `KEEL_MEMORY_CHARS`（2200）限制。
+
+系统提示词里有两者的快照，在构建提示词时取出。这份快照在该会话里保持冻结。写入会出现在下一个会话的提示词里，
+也会在本会话压缩、提示词重建时出现。
+
+开启记忆的 profile 每完成 `KEEL_MEMORY_REVIEW_TURNS`（10）次 run，后台复查可能会保存事实。它不会往会话里加消息，
+该 profile 已有复查在跑时会跳过。
+
 ### Skills
 
 skill 是一个带有 `SKILL.md` 的目录，其 front matter 包含名称和描述。keel **通过沙箱**从策略的 `skills_path` 读取
@@ -450,10 +474,11 @@ skill 是一个带有 `SKILL.md` 的目录，其 front matter 包含名称和描
 逐字节相同，这正是 provider 端提示词缓存能起作用的前提。顺序如下，稳定的内容在前：
 
 1. **身份** — profile 的 `soul`，或 `You are a helpful assistant.`
-2. **指导**与**平台**文本（工具使用和环境规则）。
+2. **指导**，记忆开启时接着是记忆指导，然后是**平台**文本（工具使用和环境规则）。
 3. **Skills** 的页眉、索引和页脚（有 skills 时）。
 4. **易变的上下文** — 当前日期（构建时的日期，压缩时随之刷新）、模型和 provider。
-5. **环境** — 工作目录。
+5. **记忆快照** — 两个目标，记忆开启时。
+6. **环境** — 工作目录。
 
 没有工具时，提示词只有身份这一部分。每次 run 的 `instructions`（客户端随每次 run 发送的文本）是模型请求中的独立字段，
 不会改变已存储的提示词；provider 会把它追加在系统提示词之后。提示词缓存的键是会话 id、系统提示词和工具定义的哈希，
@@ -499,7 +524,7 @@ profile 可以使用哪些模型由它的允许列表（`models`）决定；run 
 
 | 路由 | 用途 |
 |---|---|
-| `PUT /` | 创建或替换 profile：`models`、`sandbox`、`soul`、`skills`。 |
+| `PUT /` | 创建或替换 profile：`models`、`sandbox`、`soul`、`skills`、`memory`。 |
 | `POST /runs` | 发起 run；返回 `202` 和 `run_id`、`status`、`session_id`。 |
 | `GET /runs`、`GET /runs/{id}` | 列出 run（默认 `status=active`）或读取其中一个。 |
 | `POST /runs/{id}/stop` | 停止 run。 |
@@ -517,8 +542,9 @@ keel 不认识终端用户：**profile 是租户的单位**，由前面的产品
 ### 会话、标题与图片
 
 - **会话**由第一个指明它的 run 创建（否则会生成一个 id）。它们保存对话记录、系统提示词（两次压缩之间保持不变）和工作目录。
-- **标题**来自第一条用户消息（清理、限长），然后在第一次完成的 run 之后由模型再取一个。重名用 `#2`、`#3`、… 区分，
-  没有上限。带有等级（`derived` < `llm` < `user`），用户设置的标题不会被低等级的标题覆盖。
+- **标题**来自第一条用户消息（清理、限长），然后在第一次完成的 run 之后由模型再取一个（`title_source` 为 `llm`，
+  位于 `derived` 和 `user` 之间）。重名用 `#2`、`#3`、… 区分，没有上限。等级是 `user` > `llm` > `derived`，
+  用户设置的标题不会被低等级的标题覆盖。没有新的事件；客户端从会话上读取标题。
 - **图片**（PNG、JPEG、GIF、WebP；每个 run 最多 4 张，每张 5 MiB，在解码前先检查长度）以 blob 存储；消息里只保留
   引用，构建模型请求时才加载字节。blob 丢失时会变成文本 `[image no longer available]`。不支持视觉的模型会拒绝图片。
 
@@ -568,8 +594,8 @@ flowchart LR
 
 ## 15. 已知限制
 
-- **尚未实现：** 长期记忆、定时任务、审批、网页搜索或浏览、MCP 服务器、agent 自己编写的 skills、Anthropic 官方
-  API 的 provider。
+- **尚未实现：** 定时任务、审批、网页搜索或浏览、MCP 服务器、agent 自己编写的 skills、Anthropic 官方 API 的
+  provider。
 - **Postgres 需要直连**以支持 `LISTEN`；事务模式的连接池不行。
 - **1.0 之前：** API 和 schema 可能在版本之间变化（见[更新日志](../CHANGELOG.md)）。
 
