@@ -3,7 +3,8 @@
 Adapted from Hermes (Nous Research hermes-agent, MIT, v2026.9.24 `f97608f178`): the guidance blocks of the
 stable tier in agent/system_prompt.py, the api_server platform hint, the skills index header, the
 iteration-cap request, the compaction summary prefix and checkpoint prompt (agent/context_compressor.py), the
-session title prompt (agent/title_generator.py) and the eight tool schemas as model_tools sends them. Edits remove
+session title prompt (agent/title_generator.py), the memory-review prompt (agent/background_review.py) and the
+eight tool schemas as model_tools sends them. Edits remove
 what keel does not have: background processes, a persistent kernel, skill authoring, document extraction, other
 tools, and the compressor's skill, session-log and
 memory-provider sections. The memory guidance and its tool schema are keel's, and memory is not one of the

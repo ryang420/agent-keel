@@ -84,7 +84,7 @@ class RunExecutor:
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None, kill_timeout_s: float = 10.0,
                  skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC),
                  compression_threshold: float = 0.75, background=None, memory_chars: int = 2200,
-                 user_chars: int = 1375) -> None:
+                 user_chars: int = 1375, memory_review_turns: int = 10) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
@@ -92,6 +92,7 @@ class RunExecutor:
         self.background = background
         self.memory_chars = memory_chars
         self.user_chars = user_chars
+        self.memory_review_turns = memory_review_turns
         self.max_iterations = max_iterations
         self.mount_root = mount_root
         self.kill_timeout_s = kill_timeout_s
@@ -333,7 +334,7 @@ class RunExecutor:
                 await self._finish(run, "completed", output=output, usage=state.usage, event="run.completed",
                                    data={"output": output, "usage": state.usage.to_dict(),
                                          **({"incomplete": True} if incomplete else {})})
-                await self._maybe_title(run)
+                await self._after_complete(run, profile)
                 return
             for call in calls:
                 outcome, duration, preview = await self._call_tool(run, call, ctx, state)
@@ -484,6 +485,16 @@ class RunExecutor:
                 return
             except TitleInUse:
                 continue
+
+    async def _after_complete(self, run: Run, profile) -> None:
+        """A completed run may be renamed, and every memory_review_turns runs may start a memory review."""
+        await self._maybe_title(run)
+        if profile is not None and profile.memory and self.background is not None:
+            if await self.store.note_memory_turn(run.session_id, self.memory_review_turns):
+                from keel.review import claim, release, run_review
+                if claim(run.profile_id):
+                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}"):
+                        release(run.profile_id)
 
     async def _maybe_title(self, run: Run) -> None:
         """After the first completed run, ask the model to name a session that still has a derived title."""

@@ -131,6 +131,15 @@ class SqlStore:
     async def reset_memory_turns(self, session_id: str) -> None:
         await self.db.execute("UPDATE sessions SET turns_since_memory = 0 WHERE id = ?", session_id)
 
+    async def note_memory_turn(self, session_id: str, threshold: int) -> bool:
+        """Count one completed run toward the next review. At the threshold the counter returns to 0 and this
+        is True."""
+        row = await self.db.fetchrow(
+            "UPDATE sessions SET turns_since_memory = CASE WHEN turns_since_memory + 1 >= ? THEN 0 "
+            "ELSE turns_since_memory + 1 END WHERE id = ? RETURNING turns_since_memory",
+            threshold, session_id)
+        return row is not None and row["turns_since_memory"] == 0
+
     # sessions
 
     async def ensure_session(self, profile_id: str, session_id: str) -> Session:

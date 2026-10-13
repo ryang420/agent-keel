@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Background memory review: with memory on, every `KEEL_MEMORY_REVIEW_TURNS` completed runs (default 10) a review
+  may save facts. It does not write messages or events on the session. A review already running for that profile
+  is skipped, and one dropped because the background limit is full does not block the next.
 - `PUT /v1/profiles/{id}` accepts `memory` (a boolean). Omitting it stores false, including when replacing a
   profile that had memory on. Memory entries for a profile are written in one transaction. With memory on, the
   model is offered a `memory` tool even when the profile has no sandbox, and the system prompt carries a snapshot

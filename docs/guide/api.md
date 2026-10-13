@@ -48,7 +48,9 @@ Errors have one shape, with a machine-readable code:
 - `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
 - `skills`: the names of the skills to enable.
 - `memory`: when true, the model is offered a `memory` tool (with or without a sandbox) and the system prompt
-  includes a snapshot of stored facts, frozen until that prompt is rebuilt. Omitted, it is false, including when
+  includes a snapshot of stored facts, frozen until that prompt is rebuilt. Every `KEEL_MEMORY_REVIEW_TURNS`
+  completed runs (10 by default), a background review may save facts. It does not add messages or events to the
+  session, and a review already running for that profile is skipped. Omitted, it is false, including when
   replacing a profile that had it on. Anything other than a boolean is 400 `invalid_input`.
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
