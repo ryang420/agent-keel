@@ -1,11 +1,13 @@
-# M3: reliability, titles, memory and compression — design
+# M3: reliability, titles, memory, compression and tenant isolation — design
 
 Parent design: `docs/design/2026-10-11-architecture.md` (sections are cited as "arch §N"). Previous milestone:
 `docs/design/2026-10-12-m2-agent-loop.md`. M2 made a run an agent loop in a sandbox. M3 makes long-lived
 sessions and multi-instance deployments safe: faults are survived and tested, sessions get model titles and
-long-term memory, and a conversation can outgrow the model's context window.
+long-term memory, and a conversation can outgrow the model's context window. Tenant ownership and authorization
+are explicit, while every profile keeps its own runtime state (§12).
 
-Status: draft.
+Status: draft. Tenant/profile isolation requirements agreed on 2026-10-14 and added to M3; §12 describes the
+required behavior, not an already implemented capability.
 
 ## Goal and gate
 
@@ -16,7 +18,11 @@ M3 is done when all of these hold:
 - **A long session survives.** A scripted session many times longer than the context window finishes with valid
   transcripts, compactions that fired, and a stable cached prefix between them (§5, §6).
 - **The consumer's own checks still pass.** The M2 contract checks and quality eval are re-run unchanged. M3
-  features are off or invisible to a consumer that does not use them.
+  optional features are off or invisible to a consumer that does not use them. The consumer adapter must adopt
+  tenant-scoped credentials and profile ownership (§12); authorization is mandatory, not an optional feature.
+- **Tenant and profile isolation passes.** Cross-tenant access is refused, and profiles within one tenant retain
+  independent sessions, memory, files and tool credentials. Tests include two tenant accounts belonging to the same
+  person. These checks gate any real-user pilot (§12).
 
 As in M2, the consumer's quality gate runs in the consumer's own repository. keel carries only the deterministic
 harness and an opt-in live script (§6).
@@ -33,10 +39,11 @@ harness and an opt-in live script (§6).
 | Postgres listener reconnect, orphan removal safe for several instances | not listed | **M3** | They are what keeps the single-instance caveat in the README. |
 | Schema migrations | none (README) | **M3** | M3 changes the schema, and a consumer cannot recreate a database that holds its users' sessions. A 0.2.0 database is upgraded in place. |
 | Pruning old run events | arch §3 | **M3** | Every streamed token is a `run_events` row; the table must not grow without bound. |
+| Explicit tenant ownership and authorization | profile isolation only | **M3** | A tenant contains multiple independent account profiles; profile isolation alone does not authorize a caller for a tenant (§12). |
 | Hermes history import | M4 | M4 | Unchanged. |
 
 Still out of M3: parallel read-only tools, scheduled jobs, approvals, web tools, the Anthropic provider and the
-Hermes import.
+Hermes import. Tenant-level quotas, billing, and shared files or knowledge are also outside this milestone (§12).
 
 ## 1. Reliability and fault injection
 
@@ -98,10 +105,11 @@ SQLite and for Postgres. Version 1 is the 0.2.0 schema exactly as released; vers
   upgraded one go through the same code. A database with keel's tables but no `schema_version` is a 0.2.0 database
   and is treated as version 1. A version newer than the code knows makes the service refuse to start: a downgrade
   is not supported.
-- **Rules.** A released migration is never edited; a change is a new migration. M3's migration only adds tables and
+- **Rules.** A released migration is never edited; a change is a new migration. Migrations 2 and 3 only add tables and
   columns with defaults (`ALTER TABLE … ADD COLUMN`, which both databases run inside a transaction), so it is quick
   on a large table, and an older instance still running during a rolling upgrade keeps working, because it reads
-  row values by column name and ignores columns it does not know.
+  row values by column name and ignores columns it does not know. This rolling-upgrade compatibility does not
+  apply to enabling tenant authorization: old instances must be drained and stopped before that cutover (§12).
 - **Tests.** A frozen copy of the 0.2.0 DDL builds an old database with a few rows. The test upgrades it on SQLite
   and on Postgres and checks the rows survive and the resulting schema equals a fresh one.
 
@@ -341,12 +349,15 @@ once and reused byte for byte" becomes "reused byte for byte between compactions
 
 ## 7. Data model changes
 
-These are migrations 2 and 3 (§1). A 0.2.0 database is upgraded at start; no data is lost.
+The reliability, memory and compression changes are migrations 2 and 3 (§1). Tenant ownership uses a subsequent
+numbered migration and explicit backfill (§12); existing migrations are not rewritten. No data is discarded.
 
 | Table | Change |
 |---|---|
 | `schema_version` | new, one row |
 | `profiles` | adds `memory` (default false) |
+| `tenants` | new tenant identity table (§12); no natural-person identity or membership directory |
+| `profiles.tenant_id` | required, indexed tenant ownership after the explicit backfill (§12) |
 | `sessions` | adds `summary`, `summary_head_id`, `summary_tail_id`, `pruned_id`, `context_tokens`, `context_message_id`, `compaction_failed_at` (all nullable), `turns_since_memory` (default 0) |
 | `memories` | new (§4) |
 | `runs` | `current_exec_id` is now read and cleared |
@@ -370,7 +381,8 @@ These are migrations 2 and 3 (§1). A 0.2.0 database is upgraded at start; no da
 - New event `context.compacted`: `messages_before`, `messages_after`, `tokens_before`, `tokens_after`, `usage` (the
   summary call's). It is not terminal; a client that does not know it ignores it.
 - The events of a run finished more than `KEEL_EVENT_RETENTION_DAYS` ago are gone; its stream sends nothing.
-- No new routes. A read-only `GET /v1/profiles/{p}/memory` is easy to add if wanted and is left out of M3.
+- Existing profile route paths remain; their authentication and ownership checks change as specified in §12.
+  A read-only `GET /v1/profiles/{p}/memory` is easy to add if wanted and is left out of M3.
 
 ## 10. Testing
 
@@ -383,6 +395,8 @@ These are migrations 2 and 3 (§1). A 0.2.0 database is upgraded at start; no da
 - **Event pruning** deletes only events of runs finished before the cutoff, in batches, and leaves runs and
   messages alone.
 - **Long session** is §6.
+- **Tenant and profile isolation** is §12, including API authorization, background work, real sandbox isolation,
+  consumer account authorization, and migration/cutover checks.
 
 ## 11. Risks
 
@@ -398,3 +412,124 @@ These are migrations 2 and 3 (§1). A 0.2.0 database is upgraded at start; no da
 - **A migration that fails halfway.** Each migration runs in one transaction with its version bump, so a failure
   leaves the database at the previous version and the service refuses to start with the error. The release note
   still advises a database backup before upgrading.
+- **An incorrect ownership mapping or an old privileged caller.** An inferred tenant assignment, an unrestricted
+  service key, or an old instance can bypass the intended boundary. Mitigation: explicit backfill, scoped
+  credentials, refusal to serve incomplete ownership, and a coordinated cutover (§12).
+
+## 12. Tenant ownership and independent profiles
+
+### Identity and scope
+
+A tenant is the ownership and authorization boundary. A profile is the independent account's runtime and data
+boundary within that tenant. One tenant contains many profiles; each profile belongs to exactly one tenant.
+The same natural person may hold accounts in several tenants, but those accounts have different profiles and
+identities. keel does not store or infer a link between them, including from a shared email address or external
+user identifier.
+
+```text
+tenant A -> account profile A -> sessions, runs, memory, sandbox and private files
+tenant B -> account profile B -> sessions, runs, memory, sandbox and private files
+```
+
+Profiles in the same tenant are independent too. There is no tenant-wide memory, shared knowledge store or shared
+user-file directory. Public model configuration, base sandbox images and read-only deployment skills may be
+reused; they must contain no profile's private state. Profile ownership is immutable through the runtime API.
+Changing tenant means using another profile; it never continues the old identity's session or reassigns its data.
+
+### Consumer and runtime responsibilities
+
+The consumer authenticates the end user, manages tenant membership and account permissions, and resolves the
+authorized `(tenant, profile)` before calling keel. It must not accept an arbitrary profile from a client without
+checking that account's access. Switching tenants selects that tenant's account profile.
+
+keel authenticates its service caller and enforces the tenant ownership of every requested profile, followed by
+the profile ownership of each session or run. Authentication to a tenant does not by itself identify an end user:
+the trusted consumer remains responsible for account authorization inside that tenant. Its adapter checks are
+part of the integration gate; a tenant-scoped service caller is deliberately trusted to serve that tenant's
+profiles. End users do not receive these service credentials.
+
+For M3, deployment-managed service credentials each resolve to one tenant. The deployment provisions the tenant
+and credential binding; no tenant-management HTTP API or end-user login system is required. The existing Bearer
+transport and `/v1/profiles/{p}/...` paths remain. Tenant context comes from the verified credential binding,
+not from an unsigned tenant header, request-body field, profile prefix or model-generated tool argument.
+There is no unrestricted all-tenant credential on these runtime routes. Profile creation assigns the caller's
+tenant; updating an existing profile cannot change its tenant.
+
+Missing or invalid credentials return 401. A valid caller requesting a profile outside its tenant, or a session
+or run outside the selected profile, receives the same 404 as a missing resource, with no resource data or side
+effects. Apply these checks to profile updates, lists, reads, message boundaries, history pagination, rename,
+delete, stop, and SSE replay before any event is sent. Referenced blobs must belong to the authorized session and
+profile. IDs are locators, never evidence of permission.
+
+### Stored ownership and execution
+
+Add `tenants` with a stable primary key and `profiles.tenant_id` referencing it, with an index for tenant-scoped
+lookups. Retain globally unique internal profile and session IDs; adding tenant ownership does not silently make
+existing IDs tenant-local. If a consumer has tenant-local account or conversation IDs, its adapter maps the full
+scoped identity to distinct keel IDs. A naming convention alone is not authorization.
+
+Sessions and runs retain their profile ownership; messages, events and blobs are reached through that ownership
+chain. Memory remains keyed by profile. Every API-to-store operation uses validated ownership, and all resource
+references must agree with the parent profile. Jobs load their scope from persisted ownership rather than an
+unverified caller field. The executor, title generation, memory review, compression and recovery must preserve
+that scope after the HTTP request ends. Internal maintenance can scan multiple tenants, but each action must use
+the persisted resource's own profile and sandbox.
+
+Keep containers, writable directories, private mounts, tool credentials and any private caches separate per
+profile, even within one tenant. Provisioning must not bind two profiles to the same private host directory or
+give one profile credentials capable of reading another's private data. Container naming alone does not enforce
+this. Deployment-owned public read-only assets are the only shared mounts in this design. Infrastructure model
+provider credentials may remain service-wide; they are not exposed as sandbox tool credentials. Tenant ownership
+does not change the existing sandbox hardening or the requirement for deployment-enforced network access policy.
+
+### Migration and compatibility
+
+Use the next numbered migration after those already present. Preserve existing profile and session IDs, messages,
+runs, blobs, memory, and their sandbox/file associations. Do not edit migrations 1–3 or recreate the database.
+
+For an existing database, require an explicit operator-provided assignment of every existing profile to a tenant.
+A single-tenant installation may explicitly assign all profiles to one named tenant; never infer assignments from
+an email, an ID prefix or the natural person behind an account. Validate coverage, tenant references and conflicting
+assignments before applying the backfill transaction. An incomplete or conflicting mapping leaves the database
+unchanged and the service refuses to serve it. Fresh databases require ownership from the first profile creation.
+Enforce non-null ownership and referential integrity on both SQLite and Postgres after backfill.
+
+Drain in-flight runs and background work, stop old instances, back up the database, apply the migration and
+credential bindings, update the consumer adapter, then start only tenant-aware instances. Old instances with a
+global service key must not run alongside the tenant-aware service. A legacy service key may be retained only when
+explicitly bound to one tenant, with the same checks as every other scoped credential. Omitting scope never grants
+access to all tenants. A binary downgrade is not a rollback procedure; use the tested backup/restore procedure
+and reconcile any new state before reverting traffic.
+
+### Acceptance gate
+
+The following are required M3 checks, not optional follow-up work:
+
+| Scenario | Required result |
+|---|---|
+| Tenant A credential names tenant B's profile, session, run or event stream | 404, no data, events or mutation; profile upsert cannot overwrite B's profile |
+| Missing/invalid credential or a forged tenant field/header | No tenant impersonation; only a valid credential binding determines scope |
+| One person has accounts in tenants A and B, with matching consumer-local identifiers | Distinct keel identities; no shared state and no automatic cross-tenant session continuation |
+| Two profiles in the same tenant use the same titles, filenames and memory facts | Each sees only its own session state, memory, private files and tool credentials |
+| A session/run/blob ID from another profile is supplied under an authorized profile | Rejected without reading, changing, stopping or streaming the other resource |
+| Consumer user A selects user B's profile in the same tenant | The consumer rejects the request before calling keel; integration checks cover every user-facing entry point |
+| Background review, titles, compaction and recovery run concurrently for several profiles | Each reads and writes only its persisted profile's resources, including after restart |
+| Real Docker sandboxes for two profiles, including profiles in one tenant | Private file markers and tool credentials are inaccessible from the other profile; private mounts do not overlap |
+| An old database is upgraded on SQLite and Postgres | Explicit ownership is complete; all prior data and IDs survive; fresh and upgraded schemas agree |
+| Backfill is incomplete/conflicting, or a scoped caller attempts to reassign a profile | No partial assignment or ownership transfer; invalid migration input prevents service startup |
+
+API/store checks belong in normal CI using the fake provider; database cases also run in the Postgres suite and
+the real sandbox cases in the Docker suite. The consumer owns account/membership integration checks, just as it
+owns the quality gate (§6). Release validation includes these integration and Docker checks even though local
+default tests do not require those services.
+
+### Rollout and deferred work
+
+Tenant isolation is part of M3, completed before the first real-user pilot. After M3 acceptance, start with one
+profile in one tenant, keep that profile on keel for complete conversations and subsequent sessions, and expand
+by profile. Isolation tests still require at least two tenants and multiple profiles; one pilot account cannot
+demonstrate the boundary. Do not randomly split an account's requests between runtimes with divergent state.
+
+Tenant-level quotas, fair scheduling, usage reporting and billing can follow based on operational needs. M3 keeps
+the existing global capacity controls and per-sandbox limits and does not claim tenant-level resource fairness.
+Shared files, shared knowledge, identity federation and cross-tenant account linking are not part of this design.

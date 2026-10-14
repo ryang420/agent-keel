@@ -80,6 +80,11 @@ CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an 
   derived, `#N` on collision), the `memory` tool with per-session snapshots and background review (this slice is
   done on the branch), plus fault-injection tests (kill a worker, delete a sandbox, provider 5xx). The long-session
   live eval stays opt-in and already exists. Stop and image input were already done in M2.
+- **M3 tenant isolation** (design §12, requirements agreed 2026-10-14) is required before a real-user pilot and is
+  not yet implemented: explicit tenant ownership, tenant-scoped service credentials, immutable profile ownership,
+  and independent sessions, memory, sandbox files and tool credentials for every profile, including profiles in
+  the same tenant. The consumer owns end-user membership and account authorization; keel enforces resource
+  ownership. Existing profiles need an explicit tenant backfill and a coordinated cutover from old instances.
 - Deferred items worth picking up with M3: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
   hands a running command's cleanup to the executor's cancel path.
