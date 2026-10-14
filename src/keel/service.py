@@ -51,7 +51,7 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
                           memory_review_turns=settings.memory_review_turns)
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
                       lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0)
-    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key=settings.api_key,
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, credentials=settings.credentials,
                 max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root,
                 background=background)
     return keel, pool, [registry, bus, store], backend

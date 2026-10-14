@@ -9,6 +9,7 @@ import pytest
 
 from keel import compress, prompts
 from keel.api import Keel, create_app
+from keel.config import ServiceCredential
 from keel.events import InMemoryEventBus
 from keel.models import Completed, ImagePart, Message, TextDelta, TextPart, ToolCall, Usage
 from keel.providers.base import Capabilities, ModelError, ProviderRegistry
@@ -101,7 +102,8 @@ async def service(store, tmp_path):
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, registry, sandbox=LocalSandbox(kill_grace_s=0.5))
     pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01)
-    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key="test-key", max_running=2)
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
+                credentials=(ServiceCredential("t1", "test-key"),), max_running=2)
     await pool.start()
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(keel)), base_url="http://keel",
                                headers=AUTH)

@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from keel.api import Keel, create_app
+from keel.config import ServiceCredential
 from keel.events import InMemoryEventBus
 from keel.models import TextDelta
 from keel.providers.base import Capabilities, ProviderRegistry
@@ -25,7 +26,8 @@ async def service(store):
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, registry)
     pool = WorkerPool(store, bus, executor, owner="w1", workers=2, poll_seconds=0.01)
-    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key="test-key", max_running=2)
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
+                credentials=(ServiceCredential("t1", "test-key"),), max_running=2)
     app = create_app(keel)
     await pool.start()
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel", headers=AUTH)
@@ -435,3 +437,29 @@ async def test_the_stream_of_a_pruned_run_closes_at_once(service):
     assert await store.prune_events(store.clock() - 7 * 86_400) > 0
     response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 2)
     assert response.status_code == 200 and response.text == ""
+
+
+async def test_either_bound_key_is_accepted_and_an_unbound_key_is_not(store):
+    from keel.config import ServiceCredential
+    provider = FakeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    bus = InMemoryEventBus()
+    executor = RunExecutor(store, bus, registry)
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
+                credentials=(ServiceCredential("tenant-a", "key-a"), ServiceCredential("tenant-b", "key-b")),
+                max_running=2)
+    app = create_app(keel)
+    transport = httpx.ASGITransport(app=app)
+
+    async def call(key, **headers):
+        client = httpx.AsyncClient(transport=transport, base_url="http://keel",
+                                   headers={"Authorization": f"Bearer {key}", **headers})
+        response = await client.get("/v1/profiles/p1/sessions")
+        await client.aclose()
+        return response
+
+    assert (await call("key-a")).status_code == 200
+    assert (await call("key-b", **{"X-Tenant-Id": "tenant-a"})).status_code == 200
+    denied = await call("nope")
+    assert denied.status_code == 401 and denied.json()["error"]["code"] == "unauthorized"

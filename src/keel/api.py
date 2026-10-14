@@ -6,7 +6,6 @@ import asyncio
 import base64
 import binascii
 from dataclasses import dataclass
-import hmac
 import json
 import logging
 import re
@@ -16,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from keel.config import tenant_id_for
 from keel.models import part_to_dict, ImagePart, TextPart
 from keel.sandbox.base import PolicyError, parse_policy
 from keel.store.base import ACTIVE, SessionBusy, SessionNotFound, TitleInUse
@@ -40,7 +40,7 @@ class Keel:
     bus: object
     providers: object
     executor: object
-    api_key: str
+    credentials: tuple
     max_running: int
     sandbox_mount_root: str | None = None
     background: object = None
@@ -187,10 +187,10 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         if getattr(request.app.state, "keel", None) is None:
             return _error(503, "unavailable", "The service is not ready.")
         if request.url.path != "/healthz":
-            supplied = request.headers.get("authorization", "")
-            expected = "Bearer " + k(request).api_key
-            if not hmac.compare_digest(supplied.encode(), expected.encode()):
+            tenant_id = tenant_id_for(tuple(k(request).credentials), request.headers.get("authorization", ""))
+            if tenant_id is None:
                 return _error(401, "unauthorized", "A valid service key is required.")
+            request.state.tenant_id = tenant_id
         return await call_next(request)
 
     @app.get("/healthz")
