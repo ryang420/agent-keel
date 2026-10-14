@@ -13,8 +13,8 @@ from keel.models import (
     tool_call_from_dict, tool_call_to_dict,
 )
 from keel.store.base import (
-    TITLE_RANK, WORKER_LOST_MESSAGE, Event, Profile, Run, Session, SessionBusy, SessionNotFound, StoredMessage,
-    TitleInUse, UniqueViolation,
+    TITLE_RANK, WORKER_LOST_MESSAGE, Event, Profile, ProfileTenantMismatch, Run, Session, SessionBusy,
+    SessionNotFound, StoredMessage, TitleInUse, UniqueViolation,
 )
 from keel.store.migrations import migrate
 
@@ -87,15 +87,20 @@ class SqlStore:
     # profiles
 
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
-                             skills: list[str], memory: bool = False) -> Profile:
+                             skills: list[str], memory: bool = False, tenant_id: str | None = None) -> Profile:
         await self.db.execute(
-            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET models = excluded.models, sandbox = excluded.sandbox, "
             "soul = excluded.soul, skills = excluded.skills, updated_at = excluded.updated_at, "
-            "memory = excluded.memory",
-            profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory))
-        return await self.get_profile(profile_id)
+            "memory = excluded.memory, tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id) "
+            "WHERE ? IS NULL OR profiles.tenant_id IS NULL OR profiles.tenant_id = ?",
+            profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), tenant_id,
+            tenant_id, tenant_id)
+        saved = await self.get_profile(profile_id)
+        if tenant_id is not None and (saved is None or saved.tenant_id != tenant_id):
+            raise ProfileTenantMismatch(profile_id)
+        return saved
 
     async def get_profile(self, profile_id: str) -> Profile | None:
         row = await self.db.fetchrow("SELECT * FROM profiles WHERE id = ?", profile_id)

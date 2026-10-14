@@ -459,7 +459,9 @@ async def test_either_bound_key_is_accepted_and_an_unbound_key_is_not(store):
         await client.aclose()
         return response
 
-    assert (await call("key-a")).status_code == 200
-    assert (await call("key-b", **{"X-Tenant-Id": "tenant-a"})).status_code == 200
+    owned = await call("key-a")
+    assert owned.status_code == 404 and owned.json()["error"]["code"] == "profile_not_found"
+    other = await call("key-b", **{"X-Tenant-Id": "tenant-a"})
+    assert other.status_code == 404 and other.json()["error"]["code"] == "profile_not_found"
     denied = await call("nope")
     assert denied.status_code == 401 and denied.json()["error"]["code"] == "unauthorized"

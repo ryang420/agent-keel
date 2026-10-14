@@ -125,6 +125,7 @@ async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_p
     db = tmp_path / "keel.sqlite3"
     store = await open_store(f"sqlite:///{db}")
     await store.upsert_profile("p2", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
+    await store.db.execute("UPDATE profiles SET tenant_id = ? WHERE id = ?", "t1", "p2")
     await store.ensure_session("p2", "s1")
     await store.create_run(profile_id="p2", session_id="s1", provider="fake", model="m", reasoning_effort=None,
                            input_parts=[{"type": "text", "text": "hi"}], instructions=None)

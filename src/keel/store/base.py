@@ -28,6 +28,10 @@ class TitleInUse(StoreError):
     pass
 
 
+class ProfileTenantMismatch(StoreError):
+    pass
+
+
 class UniqueViolation(Exception):
     """Raised by a Db adapter when a unique constraint rejects a write."""
 
