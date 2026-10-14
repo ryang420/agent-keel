@@ -32,6 +32,10 @@ class UniqueViolation(Exception):
     """Raised by a Db adapter when a unique constraint rejects a write."""
 
 
+class OwnershipError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class Profile:
     id: str
