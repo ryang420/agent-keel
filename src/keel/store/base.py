@@ -41,6 +41,7 @@ class Profile:
     skills: list[str]
     updated_at: float
     memory: bool = False
+    tenant_id: str | None = None
 
 
 @dataclass(frozen=True)

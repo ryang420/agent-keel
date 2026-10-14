@@ -28,7 +28,7 @@ def _j(value) -> str:
 def _profile(row: dict) -> Profile:
     return Profile(id=row["id"], models=json.loads(row["models"]), sandbox=json.loads(row["sandbox"]),
                    soul=row["soul"], skills=json.loads(row["skills"]), updated_at=row["updated_at"],
-                   memory=bool(row["memory"]))
+                   memory=bool(row["memory"]), tenant_id=row["tenant_id"])
 
 
 def _session(row: dict) -> Session:

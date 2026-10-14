@@ -84,7 +84,14 @@ _V3 = """
 ALTER TABLE sessions ADD COLUMN pruned_id {bigint};
 """
 
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1), Migration(2, _V2), Migration(3, _V3))
+_V4 = """
+CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY);
+ALTER TABLE profiles ADD COLUMN tenant_id TEXT;
+CREATE INDEX IF NOT EXISTS profiles_tenant ON profiles (tenant_id);
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

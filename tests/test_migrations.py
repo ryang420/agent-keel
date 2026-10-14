@@ -9,7 +9,7 @@ from keel.store import migrations, open_store
 from keel.store.db import SqliteDb
 from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
 
-ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, blobs"
+ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, blobs"
 BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("KEEL_TEST_POSTGRES_DSN") else [])
 needs_postgres = pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"),
                                     reason="needs KEEL_TEST_POSTGRES_DSN")
@@ -273,3 +273,24 @@ async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
         assert session.pruned_id is None
     finally:
         await store.close()
+
+
+async def test_migration_4_keeps_existing_profiles_unowned(db_url):
+    store = await open_store(db_url)
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
+    await store.db.execute("UPDATE schema_version SET version = 3")
+    # SQLite refuses DROP COLUMN while profiles_tenant still indexes tenant_id.
+    await store.db.execute("DROP INDEX IF EXISTS profiles_tenant")
+    await store.db.execute("ALTER TABLE profiles DROP COLUMN tenant_id")
+    await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == 4
+        profile = await upgraded.get_profile("p1")
+        assert profile.soul == "kept" and profile.tenant_id is None
+        assert await upgraded.db.fetchrow("SELECT id FROM tenants") is None
+        columns = await schema_shape(upgraded.db)
+        assert "tenants" in columns["columns"]
+        assert "profiles_tenant" in columns["indexes"]
+    finally:
+        await upgraded.close()
