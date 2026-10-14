@@ -6,8 +6,9 @@ sessions and multi-instance deployments safe: faults are survived and tested, se
 long-term memory, and a conversation can outgrow the model's context window. Tenant ownership and authorization
 are explicit, while every profile keeps its own runtime state (§12).
 
-Status: draft. Tenant/profile isolation requirements agreed on 2026-10-14 and added to M3; §12 describes the
-required behavior, not an already implemented capability.
+Status: implemented, pending acceptance. Tenant/profile isolation requirements agreed on 2026-10-14 are
+implemented in keel; §12 remains the acceptance contract. The consumer's account-authorization and quality checks,
+the live long-session eval, and a deployment cutover rehearsal are required before a real-user pilot.
 
 ## Goal and gate
 
