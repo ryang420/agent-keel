@@ -18,7 +18,6 @@ from keel.providers.openai import OpenAIProvider
 from keel.runner import RunExecutor
 from keel.sandbox.docker import DockerSandbox
 from keel.store import open_store
-from keel.store.ownership import require_tenant_ownership
 from keel.worker import WorkerPool
 
 
@@ -37,16 +36,16 @@ def default_providers(settings: Settings) -> ProviderRegistry:
 
 
 async def build(settings: Settings, *, providers: ProviderRegistry | None = None):
-    store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout)
-    await require_tenant_ownership(
-        store.db, tuple(credential.tenant_id for credential in settings.credentials), settings.tenant_backfill)
+    store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout,
+                             tenant_ids=tuple(credential.tenant_id for credential in settings.credentials),
+                             tenant_backfill=settings.tenant_backfill)
     bus = PostgresEventBus(settings.database_url) if settings.is_postgres else InMemoryEventBus()
     await bus.start()
     registry = providers or default_providers(settings)
     backend = None
     if settings.sandbox == "docker":
         backend = DockerSandbox(docker=settings.docker, deployment=settings.deployment,
-                                idle_seconds=settings.sandbox_idle_seconds)
+                                idle_seconds=settings.sandbox_idle_seconds, mount_root=settings.sandbox_mount_root)
     background = Background(limit=settings.background_limit)
     executor = RunExecutor(store, bus, registry, sandbox=backend, max_iterations=settings.max_iterations,
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold,

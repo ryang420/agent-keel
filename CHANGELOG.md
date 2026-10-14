@@ -38,6 +38,9 @@ All notable changes to this project are documented here. The format follows
 - Fault-injection tests: a lost worker, provider 5xx, sandbox failures, a vanished container and a killed server.
 
 ### Changed
+- Bind mounts require `KEEL_SANDBOX_MOUNT_ROOT` and may use only the calling profile's SHA-256-named directory
+  beneath it. Sources in one profile cannot overlap, and container creation rechecks host paths. Service startup
+  migrates and backfills ownership in one transaction; a rejected backfill leaves the old database unchanged.
 - Listing runs or sessions for an unknown profile now returns 404 instead of an empty list.
 - `search_files` uses ripgrep when the sandbox image has it, and `grep`/`find` otherwise. Both skip hidden
   directories (before, only `.git`). With ripgrep, gitignored files are skipped too, results are sorted by path, and

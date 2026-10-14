@@ -22,7 +22,7 @@ from keel.models import (
 from keel.prompt import DEFAULT_IDENTITY, build_system_prompt
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.retry import stream_with_retries
-from keel.sandbox.base import PolicyError, SandboxError, parse_policy
+from keel.sandbox.base import PolicyError, SandboxError, parse_policy, profile_mount_root
 from keel.skills import discover_skills
 from keel.store.base import Event, Run, StoredMessage, TitleInUse
 from keel.titles import (
@@ -186,7 +186,7 @@ class RunExecutor:
             try:
                 profile = await self.store.get_profile(run.profile_id)
                 if profile is not None and profile.sandbox:
-                    policy = parse_policy(profile.sandbox, self.mount_root)
+                    policy = parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
                     sandbox = self.sandbox.reference(run.profile_id, policy)
                     await asyncio.wait_for(self.sandbox.kill_tree(sandbox, run.current_exec_id), self.kill_timeout_s)
             except Exception:
@@ -254,7 +254,7 @@ class RunExecutor:
         policy = None
         if self.sandbox is not None and profile is not None and profile.sandbox:
             try:
-                policy = parse_policy(profile.sandbox, self.mount_root)
+                policy = parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
             except PolicyError as exc:
                 raise RunFailure("sandbox_unavailable", f"The sandbox policy is invalid: {exc}") from exc
         ctx, skills = None, []

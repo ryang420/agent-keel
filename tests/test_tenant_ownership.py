@@ -53,3 +53,11 @@ async def test_backfill_assigns_every_profile_or_changes_nothing(store):
     with pytest.raises(OwnershipError, match="conflicts"):
         await require_tenant_ownership(store.db, (1, 2), {"p1": 2, "p2": 2})
     assert (await store.get_profile("p1")).tenant_id == 1
+
+
+async def test_backfill_rejects_a_persisted_tenant_without_a_current_credential(store):
+    await store.db.execute("INSERT INTO tenants (id) VALUES (?)", 2)
+    await _profile(store, "p1")
+    with pytest.raises(OwnershipError, match="not provisioned"):
+        await require_tenant_ownership(store.db, (1,), {"p1": 2})
+    assert (await store.get_profile("p1")).tenant_id is None

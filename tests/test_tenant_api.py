@@ -9,12 +9,13 @@ from keel.events import InMemoryEventBus
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
+from keel.sandbox.base import profile_mount_root
 from keel.worker import WorkerPool
 from tests.test_api import PROFILE
 
 
 @pytest.fixture
-async def clients(store):
+async def clients(store, tmp_path):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
@@ -23,7 +24,7 @@ async def clients(store):
     pool = WorkerPool(store, bus, executor, owner="w1", workers=2, poll_seconds=0.01)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
                 credentials=(ServiceCredential(1, "key-a"), ServiceCredential(2, "key-b")),
-                max_running=2)
+                max_running=2, sandbox_mount_root=str(tmp_path / "mounts"))
     app = create_app(keel)
     await pool.start()
     transport = httpx.ASGITransport(app=app)
@@ -101,31 +102,47 @@ async def test_two_profiles_in_one_tenant_do_not_share_a_session_id_or_memory(cl
     assert sessions == []
 
 
-async def test_private_mounts_cannot_overlap_another_profile(clients, store):
+async def test_private_mounts_cannot_overlap_another_profile(clients, store, tmp_path):
     owner, other = clients
+    root = str(tmp_path / "mounts")
+    p1_root = profile_mount_root(root, "p1")
     sandbox = {"image": "python:3.12-slim", "workdir": "/work", "mounts": [
-        {"source": "/data/private", "target": "/data"}]}
+        {"source": p1_root + "/private", "target": "/data"}]}
     body = {**PROFILE, "sandbox": sandbox}
     assert (await owner.put("/v1/profiles/p1", json=body)).status_code == 200
     for client, profile_id in ((owner, "p2"), (other, "p3")):
         response = await client.put(f"/v1/profiles/{profile_id}", json={
             **body, "sandbox": {**sandbox, "mounts": [
-                {"source": "/data/private/child", "target": "/secret", "read_only": True}]}})
+                {"source": p1_root + "/private/child", "target": "/secret", "read_only": True}]}})
         assert response.status_code == 400
         assert await store.get_profile(profile_id) is None
-    readonly = {**body, "sandbox": {**sandbox, "mounts": [
-        {"source": "/data/public", "target": "/data", "read_only": True}]}}
-    assert (await owner.put("/v1/profiles/public-a", json=readonly)).status_code == 200
-    assert (await owner.put("/v1/profiles/public-b", json=readonly)).status_code == 400
+    own = {**body, "sandbox": {**sandbox, "mounts": [
+        {"source": profile_mount_root(root, "p2") + "/private", "target": "/data"}]}}
+    assert (await owner.put("/v1/profiles/p2", json=own)).status_code == 200
+    nested = {**body, "sandbox": {**sandbox, "mounts": [
+        {"source": p1_root, "target": "/parent"},
+        {"source": p1_root + "/private", "target": "/data"}]}}
+    assert (await owner.put("/v1/profiles/p1", json=nested)).status_code == 400
     removed = await owner.put("/v1/profiles/p1", json={**PROFILE, "sandbox": {}})
     assert removed.status_code == 400
     assert (await store.get_profile("p1")).sandbox == sandbox
 
 
-async def test_concurrent_profiles_cannot_claim_the_same_mount(clients):
+async def test_a_legacy_mount_policy_requires_operator_migration(clients, store):
+    owner, _other = clients
+    await store.upsert_profile("legacy", models=PROFILE["models"], sandbox={
+        "image": "python:3.12-slim", "workdir": "/work",
+        "mounts": [{"source": "/old/location", "target": "/data"}]}, soul="", skills=[], tenant_id=1)
+    response = await owner.put("/v1/profiles/legacy", json=PROFILE)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "sandbox_requires_migration"
+
+
+async def test_concurrent_profiles_cannot_claim_the_same_mount(clients, tmp_path):
     owner, other = clients
+    source = profile_mount_root(str(tmp_path / "mounts"), "p1") + "/exclusive"
     body = {**PROFILE, "sandbox": {"image": "python:3.12-slim", "workdir": "/work", "mounts": [
-        {"source": "/data/exclusive", "target": "/private"}]}}
+        {"source": source, "target": "/private"}]}}
     first, second = await asyncio.gather(
         owner.put("/v1/profiles/p1", json=body), other.put("/v1/profiles/p2", json=body))
     assert sorted((first.status_code, second.status_code)) == [200, 400]

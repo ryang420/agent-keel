@@ -112,7 +112,7 @@ async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monke
                         lease_seconds=60)
     keel, pool, closables, backend = await service.build(settings)
     try:
-        assert seen == {"command_timeout": 20.0}
+        assert seen == {"command_timeout": 20.0, "tenant_ids": (1,), "tenant_backfill": {}}
     finally:
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")

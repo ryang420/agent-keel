@@ -30,7 +30,7 @@ service key are required; an invalid value stops the service at start with a mes
 |---|---|---|
 | `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). |
 | `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (checked about once a minute). |
-| `KEEL_SANDBOX_MOUNT_ROOT` | unset | Absolute path prefix. When set, every `mounts[].source` in a profile policy must be under it. When unset, any host path is allowed. |
+| `KEEL_SANDBOX_MOUNT_ROOT` | unset | Deployment-owned host directory for profile bind mounts. A profile may mount only paths under `<root>/<sha256(profile_id)>`; the operator must create and protect that directory. Without this setting, bind mounts are refused. |
 | `KEEL_DOCKER` | `docker` | The docker CLI to run. |
 | `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. At start, containers carrying this label are removed (except those of profiles with a run in flight), so it must be unique per deployment that shares a Docker daemon. |
 
@@ -53,7 +53,28 @@ See [providers.md](providers.md).
 Drain runs, stop older keel instances, back up the database, prepare the tenant-bound keys and an explicit
 `KEEL_TENANT_BACKFILL` assignment for every existing profile, and start only this version. Check that the consumer
 maps its authorized tenant account to the correct profile. Old builds with a global key must not run alongside this
-version. Restoring an older version requires restoring the database backup and reconciling any newer state.
+version. If existing profiles use bind mounts, move their data into their profile-specific directories and update
+their stored policies as a reviewed database migration during the stopped-service cutover; the runtime API refuses
+to change an existing mount list. Restoring an older version requires restoring the database backup and reconciling
+any newer state.
+
+For each profile with a legacy bind mount, use this stopped-service procedure before starting tenant-aware keel:
+
+1. Read the profile's `id` and `sandbox` JSON from the database backup. Compute
+   `<KEEL_SANDBOX_MOUNT_ROOT>/<sha256(profile_id)>` as described in [sandbox.md](sandbox.md). Give each old source a
+   distinct destination under that directory; sources for one profile must not be nested.
+2. Copy the old directory and its permissions to the destination. Keep the original in place. Verify the copied
+   files (for example, compare file counts and checksums) and ensure the destination does not resolve outside the
+   profile directory. If two old profiles used the same source, make independent copies.
+3. In a database transaction, update only that profile's `sandbox` JSON `mounts[].source` fields to the new paths.
+   Preserve every target, `read_only` flag and other policy field. Use the old JSON as an optimistic condition on
+   the update, check that exactly one row changed, and roll back if any profile cannot be updated. Perform this
+   after all destinations have been verified.
+4. Start keel with the tenant keys, explicit ownership backfill and the mount root. Check each migrated profile's
+   session history and a file in its sandbox. Delete old copies only after the cutover and rollback window.
+
+The frozen 0.2.0 migration test exercises this copy, policy update, backfill and history-preservation sequence on
+SQLite and PostgreSQL. A failed ownership mapping leaves the old schema and data unchanged.
 
 ## Tests
 

@@ -61,6 +61,14 @@ async def test_health_is_open_and_everything_else_needs_the_key(service):
     await bare.aclose()
 
 
+async def test_host_mounts_need_a_configured_profile_root(service):
+    client, _, store = service
+    response = await client.put("/v1/profiles/p1", json={**PROFILE, "sandbox": {
+        "image": "python:3.12-slim", "workdir": "/work", "mounts": [{"source": "/", "target": "/host"}]}})
+    assert response.status_code == 400
+    assert await store.get_profile("p1") is None
+
+
 async def test_a_run_completes_streams_and_is_stored(service):
     client, _, _ = service
     assert (await client.put("/v1/profiles/p1", json=PROFILE)).status_code == 200

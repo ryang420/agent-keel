@@ -100,8 +100,10 @@ SQLite and for Postgres. Version 1 is the 0.2.0 schema exactly as released; vers
 
 - **Version table.** `schema_version (version INTEGER NOT NULL)`, one row.
 - **At start.** `open_store` reads the version and applies every newer migration in order, each in its own
-  transaction that also writes the new version. On Postgres the whole pass runs under the advisory lock the schema
-  already uses, so instances starting together migrate once. On SQLite the transaction is `BEGIN IMMEDIATE`.
+  transaction that also writes the new version. Service startup wraps the migration pass and tenant ownership
+  backfill in one outer transaction, so invalid cutover input rolls all of it back. On Postgres the pass runs under
+  the advisory lock the schema already uses, so instances starting together migrate once. On SQLite the transaction
+  is `BEGIN IMMEDIATE`.
 - **Three starting states.** An empty database applies every migration from version 1, so a fresh database and an
   upgraded one go through the same code. A database with keel's tables but no `schema_version` is a 0.2.0 database
   and is treated as version 1. A version newer than the code knows makes the service refuse to start: a downgrade
@@ -481,7 +483,11 @@ the persisted resource's own profile and sandbox.
 Keep containers, writable directories, mounts, tool credentials and any private caches separate per profile, even
 within one tenant. Provisioning must not bind two profiles to the same host directory, including read-only mounts,
 or give one profile credentials capable of reading another's private data. Container naming alone does not enforce
-this. Once a profile has mounts, its mount list cannot be changed through `PUT`: an older live container could
+this. A bind mount is permitted only under the deployment-owned `KEEL_SANDBOX_MOUNT_ROOT/<sha256(profile_id)>`;
+without the root setting, bind mounts are refused. The operator creates and protects each profile directory. A
+profile cannot mount another profile's directory or both a host directory and its descendant. The source is checked
+again when a container is created, so a path retargeted after `PUT` cannot expose another profile. Once a profile
+has mounts, its mount list cannot be changed through `PUT`: an older live container could
 otherwise retain a removed mount while another profile claims the path. Public skills may be packaged into the
 shared image instead of a shared host mount. Infrastructure model
 provider credentials may remain service-wide; they are not exposed as sandbox tool credentials. Tenant ownership

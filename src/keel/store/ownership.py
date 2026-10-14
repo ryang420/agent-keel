@@ -16,7 +16,7 @@ async def require_tenant_ownership(db, tenant_ids: tuple[int, ...], assignment: 
         for tenant_id in dict.fromkeys(tenant_ids):
             await db.execute("INSERT INTO tenants (id) VALUES (?) ON CONFLICT (id) DO NOTHING", tenant_id)
         profiles = await db.fetch("SELECT id, tenant_id FROM profiles")
-        known_tenants = {row["id"] for row in await db.fetch("SELECT id FROM tenants")}
+        provisioned_tenants = set(tenant_ids)
         by_id = {row["id"]: row["tenant_id"] for row in profiles}
         pending = [profile_id for profile_id, tenant_id in by_id.items() if tenant_id is None]
         if pending and not assignment:
@@ -29,7 +29,7 @@ async def require_tenant_ownership(db, tenant_ids: tuple[int, ...], assignment: 
             if missing:
                 raise OwnershipError("KEEL_TENANT_BACKFILL does not name every profile")
             for profile_id, tenant_id in assignment.items():
-                if tenant_id not in known_tenants:
+                if tenant_id not in provisioned_tenants:
                     raise OwnershipError("KEEL_TENANT_BACKFILL names a tenant that is not provisioned")
                 current = by_id[profile_id]
                 if current is not None and current != tenant_id:

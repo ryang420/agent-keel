@@ -20,7 +20,8 @@ from typing import Collection
 import uuid
 
 from keel.sandbox.base import (
-    MAX_OUTPUT_BYTES, TIMEOUT_EXIT_CODE, ExecResult, Sandbox, SandboxError, SandboxPolicy, collect,
+    MAX_OUTPUT_BYTES, TIMEOUT_EXIT_CODE, ExecResult, PolicyError, Sandbox, SandboxError, SandboxPolicy, collect,
+    profile_mount_root, validate_mount_sources,
 )
 
 log = logging.getLogger(__name__)
@@ -58,12 +59,13 @@ def _env_file(env):
 
 class DockerSandbox:
     def __init__(self, *, docker: str = "docker", deployment: str = "keel", idle_seconds: float = 1800.0,
-                 kill_grace_s: float = 3.0, clock=time.monotonic) -> None:
+                 kill_grace_s: float = 3.0, clock=time.monotonic, mount_root: str | None = None) -> None:
         self.docker = docker
         self.deployment = deployment
         self.idle_seconds = idle_seconds
         self.kill_grace_s = kill_grace_s
         self.clock = clock
+        self.mount_root = mount_root
         self._active: dict[str, int] = {}       # container -> commands running in it
         self._last_used: dict[str, float] = {}  # container -> clock() of its last use
         self._clients: dict[str, asyncio.subprocess.Process] = {}  # exec_id -> its docker exec client
@@ -76,6 +78,10 @@ class DockerSandbox:
         return Sandbox(profile_id, self.container_name(profile_id), policy)
 
     def run_args(self, profile_id: str, policy: SandboxPolicy, env_file: str | None = None) -> list[str]:
+        try:
+            validate_mount_sources(policy.mounts, profile_mount_root(self.mount_root, profile_id))
+        except PolicyError as exc:
+            raise SandboxError(f"The sandbox mount policy is invalid: {exc}") from exc
         # Hardening mirrors the Hermes docker backend: no capabilities beyond file ownership and access, no
         # privilege gain, and writable scratch space on tmpfs (nosuid; /tmp stays executable for scripts).
         args = ["run", "-d", "--init", "--name", self.container_name(profile_id),
@@ -96,7 +102,7 @@ class DockerSandbox:
         if policy.pids_limit:
             args += ["--pids-limit", str(policy.pids_limit)]
         for mount in policy.mounts:
-            args += ["--mount", f"type=bind,source={mount.source},target={mount.target}"
+            args += ["--mount", f"type=bind,source={os.path.realpath(mount.source)},target={mount.target}"
                      + (",readonly" if mount.read_only else "")]
         if policy.env and env_file:
             args += ["--env-file", env_file]  # the values are in the file, never on the command line

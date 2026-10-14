@@ -41,7 +41,11 @@ Only these keys are accepted; any other key is refused. `image` and `workdir` ar
 | `memory_mb`, `pids_limit` | Whole numbers of at least 1. |
 | `skills_path` | Absolute path inside the container where skills live (see below). |
 
-When `KEEL_SANDBOX_MOUNT_ROOT` is set, each mount `source` must equal that root or be under it.
+Bind mounts require `KEEL_SANDBOX_MOUNT_ROOT`. Each profile's sources must be under a dedicated directory whose
+name is the SHA-256 hex digest of the keel profile ID, directly under that root. For example, an operator can
+compute the directory with `python3 -c 'import hashlib; print(hashlib.sha256(b"p1").hexdigest())'`, create it, and
+give only that profile's sandbox access to it. No profile can mount the common root or another profile's directory.
+Sources within one policy cannot overlap each other, including a directory and its descendant.
 
 ## Image requirements
 
@@ -87,11 +91,11 @@ Mitigate by protecting tenant-bound service keys, limiting host mounts with `KEE
 the daemon rootless or on a dedicated host where that is an option.
 
 Host mount paths and tool credentials belong to one profile, including profiles in the same tenant.
-`PUT /v1/profiles/{p}` rejects any mount overlapping another profile's mount, including read-only sources.
+`PUT /v1/profiles/{p}` rejects any mount outside that profile's directory or overlapping another profile's mount,
+including read-only sources.
 After a profile has mounts, its mount list cannot be changed through `PUT`; older live containers may still use
-those mounts. Public skills can be packaged into a shared image. Keep host mounts distinct in external
-provisioning too; the policy check resolves symlinks when saving a policy but cannot prevent later changes to
-host filesystem links.
+those mounts. Public skills can be packaged into a shared image. The mount source is checked again when creating
+a container. Protect the common root and each profile directory from changes by other profiles or host users.
 
 The image runs as uid 10001, so a deployment must also give it the socket's group (compose
 `group_add: ["<socket gid>"]`, or `docker run --group-add <gid>`). The dev compose file runs as root only because
