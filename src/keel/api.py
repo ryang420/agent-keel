@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from keel.config import tenant_id_for
 from keel.models import part_to_dict, ImagePart, TextPart
-from keel.sandbox.base import PolicyError, parse_policy
+from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict
 from keel.store.base import ACTIVE, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse
 from keel.titles import sanitize_title
 
@@ -259,15 +259,33 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "memory must be a boolean.")
         if not all(isinstance(m, dict) and m.get("provider") and m.get("model") for m in models):
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
-        existing = await k(request).store.get_profile(profile_id)
-        if existing is not None and existing.tenant_id != request.state.tenant_id:
-            raise ApiError(404, "profile_not_found", "No such profile.")
-        try:
-            profile = await k(request).store.upsert_profile(
-                profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
-                sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
-        except ProfileTenantMismatch:
-            raise ApiError(404, "profile_not_found", "No such profile.")
+        store = k(request).store
+        async with store.db.transaction():
+            if store.db.dialect == "postgres":
+                await store.db.execute("SELECT pg_advisory_xact_lock(7312100002)")
+            existing = await store.get_profile(profile_id)
+            if existing is not None and existing.tenant_id != request.state.tenant_id:
+                raise ApiError(404, "profile_not_found", "No such profile.")
+            policy = parse_policy(sandbox, k(request).sandbox_mount_root) if sandbox else None
+            if existing is not None and existing.sandbox:
+                old_mounts = parse_policy(existing.sandbox).mounts
+                new_mounts = policy.mounts if policy is not None else ()
+                if old_mounts and new_mounts != old_mounts:
+                    raise ApiError(400, "invalid_input", "A profile's sandbox mounts cannot be changed.")
+            if sandbox:
+                others = []
+                for other_id, raw in await store.profile_sandboxes():
+                    if other_id != profile_id and raw:
+                        others.append(parse_policy(raw))
+                conflict = private_mount_conflict(policy, others)
+                if conflict is not None:
+                    raise ApiError(400, "invalid_input", conflict)
+            try:
+                profile = await store.upsert_profile(
+                    profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
+                    sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
+            except ProfileTenantMismatch:
+                raise ApiError(404, "profile_not_found", "No such profile.")
         return {"id": profile.id, "models": profile.models, "sandbox": profile.sandbox, "soul": profile.soul,
                 "skills": profile.skills, "memory": profile.memory, "updated_at": profile.updated_at}
 

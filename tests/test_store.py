@@ -208,17 +208,20 @@ async def test_blobs_round_trip_and_leave_with_their_session(store):
     await store.ensure_session("p1", "s1")
     blob = await store.put_blob("p1", "s1", "image/png", "aGVsbG8=")
     assert blob.startswith("blob_")
-    assert await store.get_blobs([blob]) == {blob: ("image/png", "aGVsbG8=")}
-    assert await store.get_blobs([]) == {}
+    assert await store.get_blobs([blob], profile_id="p1", session_id="s1") == {
+        blob: ("image/png", "aGVsbG8=")}
+    assert await store.get_blobs([blob], profile_id="p2", session_id="s1") == {}
+    assert await store.get_blobs([blob], profile_id="p1", session_id="s2") == {}
+    assert await store.get_blobs([], profile_id="p1", session_id="s1") == {}
     await store.delete_session("p1", "s1")
-    assert await store.get_blobs([blob]) == {}
+    assert await store.get_blobs([blob], profile_id="p1", session_id="s1") == {}
 
 
 async def test_delete_blobs(store):
     await store.ensure_session("p1", "s1")
     blob = await store.put_blob("p1", "s1", "image/png", "aGVsbG8=")
     await store.delete_blobs([blob])
-    assert await store.get_blobs([blob]) == {}
+    assert await store.get_blobs([blob], profile_id="p1", session_id="s1") == {}
 
 
 async def test_image_parts_are_stored_as_references(store):

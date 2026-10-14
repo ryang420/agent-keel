@@ -12,7 +12,7 @@ async def _profile(store, profile_id, tenant_id=None):
 
 
 async def test_a_fresh_database_rejects_a_null_or_unknown_owner(store):
-    await require_tenant_ownership(store.db, ("tenant-a",), {})
+    await require_tenant_ownership(store.db, (1,), {})
     with pytest.raises(Exception):
         await store.db.execute(
             "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
@@ -20,7 +20,10 @@ async def test_a_fresh_database_rejects_a_null_or_unknown_owner(store):
     with pytest.raises(Exception):
         await store.db.execute(
             "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
-            "VALUES ('bare', '[]', '{}', '', '[]', 0, 0, 'missing-tenant')")
+            "VALUES ('bare', '[]', '{}', '', '[]', 0, 0, 999999)")
+    for invalid in (0, -1, 2_147_483_648):
+        with pytest.raises(Exception):
+            await store.db.execute("INSERT INTO tenants (id) VALUES (?)", invalid)
     assert await store.get_profile("bare") is None
 
 
@@ -28,25 +31,25 @@ async def test_backfill_assigns_every_profile_or_changes_nothing(store):
     await _profile(store, "p1")
     await _profile(store, "p2")
     with pytest.raises(OwnershipError, match="KEEL_TENANT_BACKFILL"):
-        await require_tenant_ownership(store.db, ("tenant-a",), {})
+        await require_tenant_ownership(store.db, (1,), {})
     assert (await store.get_profile("p1")).tenant_id is None
     assert await store.db.fetchrow("SELECT id FROM tenants") is None
 
     with pytest.raises(OwnershipError, match="every profile"):
-        await require_tenant_ownership(store.db, ("tenant-a",), {"p1": "tenant-a"})
+        await require_tenant_ownership(store.db, (1,), {"p1": 1})
     assert (await store.get_profile("p1")).tenant_id is None
 
     with pytest.raises(OwnershipError, match="unknown profile"):
-        await require_tenant_ownership(store.db, ("tenant-a",), {"p1": "tenant-a", "p2": "tenant-a", "nope": "tenant-a"})
+        await require_tenant_ownership(store.db, (1,), {"p1": 1, "p2": 1, "nope": 1})
     with pytest.raises(OwnershipError, match="not provisioned"):
-        await require_tenant_ownership(store.db, ("tenant-a",), {"p1": "tenant-a", "p2": "other"})
+        await require_tenant_ownership(store.db, (1,), {"p1": 1, "p2": 999999})
     assert (await store.get_profile("p2")).tenant_id is None
 
-    await require_tenant_ownership(store.db, ("tenant-a", "tenant-b"), {"p1": "tenant-a", "p2": "tenant-b"})
-    assert (await store.get_profile("p1")).tenant_id == "tenant-a"
-    assert (await store.get_profile("p2")).tenant_id == "tenant-b"
-    await require_tenant_ownership(store.db, ("tenant-a", "tenant-b"), {})  # already complete
+    await require_tenant_ownership(store.db, (1, 2), {"p1": 1, "p2": 2})
+    assert (await store.get_profile("p1")).tenant_id == 1
+    assert (await store.get_profile("p2")).tenant_id == 2
+    await require_tenant_ownership(store.db, (1, 2), {})  # already complete
 
     with pytest.raises(OwnershipError, match="conflicts"):
-        await require_tenant_ownership(store.db, ("tenant-a", "tenant-b"), {"p1": "tenant-b", "p2": "tenant-b"})
-    assert (await store.get_profile("p1")).tenant_id == "tenant-a"
+        await require_tenant_ownership(store.db, (1, 2), {"p1": 2, "p2": 2})
+    assert (await store.get_profile("p1")).tenant_id == 1

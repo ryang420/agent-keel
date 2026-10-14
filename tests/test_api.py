@@ -27,7 +27,7 @@ async def service(store):
     executor = RunExecutor(store, bus, registry)
     pool = WorkerPool(store, bus, executor, owner="w1", workers=2, poll_seconds=0.01)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
-                credentials=(ServiceCredential("t1", "test-key"),), max_running=2)
+                credentials=(ServiceCredential(1, "test-key"),), max_running=2)
     app = create_app(keel)
     await pool.start()
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel", headers=AUTH)
@@ -398,7 +398,7 @@ async def test_no_blob_is_left_behind_when_a_later_step_fails(service, monkeypat
     image = {"type": "image", "media_type": "image/png", "data": PNG}
     with pytest.raises(RuntimeError):
         await send(client, text=[image, image])
-    assert await store.get_blobs(stored) == {}
+    assert await store.get_blobs(stored, profile_id="p1", session_id="chat-1") == {}
     monkeypatch.undo()
 
     async def create_fails(**kwargs):
@@ -414,7 +414,7 @@ async def test_no_blob_is_left_behind_when_a_later_step_fails(service, monkeypat
     monkeypatch.setattr(store, "put_blob", recording_put)
     with pytest.raises(RuntimeError):
         await send(client, text=[image])
-    assert puts and await store.get_blobs(puts) == {}
+    assert puts and await store.get_blobs(puts, profile_id="p1", session_id="chat-1") == {}
 
 
 async def test_profile_memory_is_a_boolean_and_omitted_means_false(service):
@@ -447,7 +447,7 @@ async def test_either_bound_key_is_accepted_and_an_unbound_key_is_not(store):
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, registry)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
-                credentials=(ServiceCredential("tenant-a", "key-a"), ServiceCredential("tenant-b", "key-b")),
+                credentials=(ServiceCredential(1, "key-a"), ServiceCredential(2, "key-b")),
                 max_running=2)
     app = create_app(keel)
     transport = httpx.ASGITransport(app=app)
@@ -461,7 +461,7 @@ async def test_either_bound_key_is_accepted_and_an_unbound_key_is_not(store):
 
     owned = await call("key-a")
     assert owned.status_code == 404 and owned.json()["error"]["code"] == "profile_not_found"
-    other = await call("key-b", **{"X-Tenant-Id": "tenant-a"})
+    other = await call("key-b", **{"X-Tenant-Id": "1"})
     assert other.status_code == 404 and other.json()["error"]["code"] == "profile_not_found"
     denied = await call("nope")
     assert denied.status_code == 401 and denied.json()["error"]["code"] == "unauthorized"

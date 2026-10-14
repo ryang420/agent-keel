@@ -17,7 +17,7 @@ reasoning behind the design, read [design/2026-10-11-architecture.md](design/202
 
 ```mermaid
 flowchart TB
-    CL(["Client — your product's backend<br/>one shared service key"])
+    CL(["Client — your product's backend<br/>tenant-bound service key"])
 
     subgraph inst["keel instance (identical, stateless)"]
         direction TB
@@ -38,7 +38,7 @@ flowchart TB
     SBX["sandbox containers<br/>keel-sbx-&lt;hash&gt;, one per profile<br/>terminal, files, execute_code"]
     LLM["model endpoints<br/>bedrock-mantle.&lt;region&gt;.api.aws<br/>api.openai.com or compatible"]
 
-    CL -->|"HTTP + SSE · Bearer KEEL_API_KEY"| API
+    CL -->|"HTTP + SSE · tenant-bound bearer key"| API
     API -->|"create_run, events_after"| DB
     API -->|"notify / wait"| BUS
     WP -->|"claim_run, renew_lease"| DB
@@ -431,7 +431,7 @@ flowchart LR
   (the policy digest) let keel find, compare and clean up its own containers and nobody else's.
 - **A profile's sessions share its container.** A container is per profile, not per session or per run. keel keeps a
   working directory per session but does not isolate one session from another inside the container; if that matters,
-  use one profile per tenant.
+  use a separate profile for each independent account, including accounts in the same tenant.
 - **Idle reaping.** A background task runs every 60 s and removes containers idle for `KEEL_SANDBOX_IDLE_SECONDS`
   (default 30 min) that are running nothing. The next run recreates one.
 - **Leftovers.** At start, `remove_orphans` removes the containers labelled for this deployment, except those of
@@ -574,9 +574,10 @@ All under `/v1/profiles/{profile_id}` except `/healthz`. Details are in the [API
 | `GET /sessions`, `GET /sessions/{id}/messages`, `GET /sessions/{id}/boundary` | List sessions; read the transcript; the newest message id. |
 | `PATCH /sessions/{id}`, `DELETE /sessions/{id}` | Rename; delete (refused while a run is in flight). |
 
-**Authentication** is one shared service key: `Authorization: Bearer <KEEL_API_KEY>`, compared in constant time.
-`/healthz` is open. keel does not know end users: **a profile is the unit of tenancy**, and the product in front maps
-its users to profiles and keeps the key secret.
+**Authentication** uses tenant-bound service keys: `Authorization: Bearer <key>`, compared in constant time.
+`/healthz` is open. Tenant IDs are positive integers; each tenant owns multiple independent profiles. The product
+authenticates end users and maps each tenant account to its profile. keel validates the key's tenant and the
+profile's ownership, while sessions, memory and private sandbox state stay per profile.
 
 **Errors** are always `{"error": {"code", "message"}}`. The codes a client sees: `unauthorized`, `unavailable`,
 `invalid_input`, `run_not_found`, `session_not_found`, `session_busy`, `at_capacity` (429), `model_not_allowed`,

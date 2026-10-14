@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import posixpath
 import re
 from typing import Awaitable, Callable, Protocol
@@ -109,7 +110,10 @@ def parse_policy(data: dict, mount_root: str | None = None) -> SandboxPolicy:
         source = _path(raw.get("source"), "sandbox.mounts[].source", mount=True)
         if mount_root is not None:
             root = posixpath.normpath(mount_root)
-            if source != root and not source.startswith(root.rstrip("/") + "/"):
+            resolved_root, resolved_source = os.path.realpath(root), os.path.realpath(source)
+            if ((source != root and not source.startswith(root.rstrip("/") + "/"))
+                    or (resolved_source != resolved_root
+                        and not resolved_source.startswith(resolved_root.rstrip("/") + "/"))):
                 raise PolicyError(f"sandbox.mounts[].source must be under {root}.")
         target = _path(raw.get("target"), "sandbox.mounts[].target", mount=True)
         mounts.append(Mount(source, target, bool(raw.get("read_only", False))))
@@ -129,6 +133,20 @@ def parse_policy(data: dict, mount_root: str | None = None) -> SandboxPolicy:
         pids_limit=_positive(data, "pids_limit", int),
         skills_path=None if skills_path is None else _path(skills_path, "sandbox.skills_path"),
     )
+
+
+def private_mount_conflict(candidate: SandboxPolicy, others: list[SandboxPolicy]) -> str | None:
+    """Reject a mount that would expose another profile's writable host tree."""
+    for mount in candidate.mounts:
+        source = os.path.realpath(mount.source)
+        for other in others:
+            for theirs in other.mounts:
+                peer = os.path.realpath(theirs.source)
+                shared = (source == peer or source.startswith(peer.rstrip("/") + "/")
+                          or peer.startswith(source.rstrip("/") + "/"))
+                if shared:
+                    return "sandbox.mounts[].source overlaps another profile's private directory."
+    return None
 
 
 @dataclass(frozen=True)

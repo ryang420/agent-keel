@@ -39,7 +39,8 @@ async def _review(executor, run) -> None:
     stored = await executor.store.messages(run.session_id)
     budget = compress.tail_budget(provider.capabilities(run.model).context_window)
     items = compress.assemble(stored, compress.Boundaries.of(session), budget)
-    messages = await executor._with_images([item.message for item in items], {})
+    messages = await executor._with_images([item.message for item in items], {},
+                                           profile_id=run.profile_id, session_id=run.session_id)
     messages.append(Message("user", (TextPart(prompts.text("memory_review")),)))
     ctx = ToolContext(store=executor.store, profile_id=run.profile_id, session_id=run.session_id,
                       memory_chars=executor.memory_chars, user_chars=executor.user_chars)

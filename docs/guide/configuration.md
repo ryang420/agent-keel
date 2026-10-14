@@ -1,13 +1,15 @@
 # Configuration
 
-keel reads its settings from environment variables at start. `KEEL_API_KEY` and `KEEL_DATABASE_URL` are required;
-an invalid value stops the service at start with a message naming the variable.
+keel reads its settings from environment variables at start. `KEEL_DATABASE_URL` and at least one tenant-bound
+service key are required; an invalid value stops the service at start with a message naming the variable.
 
 ## Service
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KEEL_API_KEY` | required | The bearer key every caller sends (`Authorization: Bearer <key>`). |
+| `KEEL_API_KEYS` | unset | Comma-separated `tenant-id:secret` bindings, for example `1:key-a,2:key-b`. Each positive 32-bit integer tenant ID has its own key; multiple keys may name one tenant. A key cannot name two tenants. |
+| `KEEL_API_KEY`, `KEEL_API_KEY_TENANT` | unset | Single-key form of the binding. Both must be set together; `KEEL_API_KEY_TENANT` is a positive 32-bit integer. A bare key does not start the service. |
+| `KEEL_TENANT_BACKFILL` | unset | Path to a JSON object mapping existing profile IDs to integer tenant IDs, for example `{"p1":1}`. Required while any existing profile lacks an owner. The named tenants must have configured keys; an incomplete, unknown or conflicting assignment stops startup without changing ownership. |
 | `KEEL_DATABASE_URL` | required | `postgresql://…` (or `postgres://…`) or `sqlite:///path`. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). A lost LISTEN connection is reconnected with backoff; several instances can share one database. |
 | `KEEL_HOST` | `0.0.0.0` | Listen address. |
 | `KEEL_PORT` | `8700` | Listen port. If you change it, change the image's `HEALTHCHECK` too. |
@@ -45,6 +47,13 @@ See [sandbox.md](sandbox.md) for the profile's sandbox policy.
 | `KEEL_OPENAI_CONTEXT_WINDOW` | `128000` | Context window the `openai` provider reports. |
 
 See [providers.md](providers.md).
+
+## Existing database cutover
+
+Drain runs, stop older keel instances, back up the database, prepare the tenant-bound keys and an explicit
+`KEEL_TENANT_BACKFILL` assignment for every existing profile, and start only this version. Check that the consumer
+maps its authorized tenant account to the correct profile. Old builds with a global key must not run alongside this
+version. Restoring an older version requires restoring the database backup and reconciling any newer state.
 
 ## Tests
 

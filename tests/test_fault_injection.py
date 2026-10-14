@@ -272,7 +272,7 @@ LAUNCHER = textwrap.dedent("""
     db, port, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
     providers = ProviderRegistry()
     providers.register(FakeProvider(script=[[TextDelta("par"), "hang"]] if mode == "hang" else []))
-    settings = Settings(credentials=(ServiceCredential("t1", "k"),), database_url=f"sqlite:///{db}",
+    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=f"sqlite:///{db}",
                         sandbox="none", workers=1, lease_seconds=2.0)
     uvicorn.run(create_service(settings, providers=providers), host="127.0.0.1", port=port, log_level="warning")
 """)

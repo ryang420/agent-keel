@@ -83,8 +83,15 @@ the local sandbox); otherwise the command runs until its own timeout. The sweep 
 
 The service starts containers by running the docker CLI against the Docker daemon. Giving it the Docker socket is
 **root-equivalent on the host**: anyone who can make the service run arbitrary docker commands controls the host.
-Mitigate by protecting `KEEL_API_KEY`, limiting host mounts with `KEEL_SANDBOX_MOUNT_ROOT`, and running the daemon
-rootless or on a dedicated host where that is an option.
+Mitigate by protecting tenant-bound service keys, limiting host mounts with `KEEL_SANDBOX_MOUNT_ROOT`, and running
+the daemon rootless or on a dedicated host where that is an option.
+
+Host mount paths and tool credentials belong to one profile, including profiles in the same tenant.
+`PUT /v1/profiles/{p}` rejects any mount overlapping another profile's mount, including read-only sources.
+After a profile has mounts, its mount list cannot be changed through `PUT`; older live containers may still use
+those mounts. Public skills can be packaged into a shared image. Keep host mounts distinct in external
+provisioning too; the policy check resolves symlinks when saving a policy but cannot prevent later changes to
+host filesystem links.
 
 The image runs as uid 10001, so a deployment must also give it the socket's group (compose
 `group_add: ["<socket gid>"]`, or `docker run --group-add <gid>`). The dev compose file runs as root only because

@@ -365,7 +365,8 @@ class RunExecutor:
         state.usage = state.usage + spent
         retried = False
         while True:
-            messages = await self._with_images([item.message for item in items], turn.blobs)
+            messages = await self._with_images([item.message for item in items], turn.blobs,
+                                               profile_id=run.profile_id, session_id=run.session_id)
             if final:
                 messages.append(Message("user", (TextPart(prompts.MAX_ITERATIONS_REQUEST),)))
             request = ModelRequest(
@@ -452,7 +453,8 @@ class RunExecutor:
                 log.warning("run %s: could not record the current command", run.id, exc_info=True)
         return record
 
-    async def _with_images(self, messages: list[Message], cache: dict) -> list[Message]:
+    async def _with_images(self, messages: list[Message], cache: dict, *,
+                           profile_id: str, session_id: str) -> list[Message]:
         """Load the bytes of stored image references, each once per run; an image whose blob is gone becomes a
         text note."""
         wanted = {part.blob_id for message in messages for part in message.parts
@@ -461,7 +463,7 @@ class RunExecutor:
             return list(messages)
         missing = [blob_id for blob_id in wanted if blob_id not in cache]
         if missing:
-            found = await self.store.get_blobs(missing)
+            found = await self.store.get_blobs(missing, profile_id=profile_id, session_id=session_id)
             cache.update({blob_id: found.get(blob_id) for blob_id in missing})
 
         def load(part):

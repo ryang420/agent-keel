@@ -24,10 +24,12 @@ class Migration:
     template: str  # statements separated by ";", with {real}, {serial} and {bigint} filled per dialect
 
     def statements(self, dialect: str) -> list[str]:
-        sql = self.template.format(**_TYPES[dialect])
+        sql = self.template
         if dialect == "sqlite":
             # SQLite only auto-increments an INTEGER PRIMARY KEY when it is declared exactly that way.
-            sql = sql.replace("id INTEGER PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
+            # Tenant ids are assigned by the operator, so only {serial} columns get AUTOINCREMENT.
+            sql = sql.replace("id {serial} PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
+        sql = sql.format(**_TYPES[dialect])
         return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 
@@ -85,8 +87,8 @@ ALTER TABLE sessions ADD COLUMN pruned_id {bigint};
 """
 
 _V4 = """
-CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY);
-ALTER TABLE profiles ADD COLUMN tenant_id TEXT;
+CREATE TABLE IF NOT EXISTS tenants (id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 2147483647));
+ALTER TABLE profiles ADD COLUMN tenant_id INTEGER;
 CREATE INDEX IF NOT EXISTS profiles_tenant ON profiles (tenant_id);
 """
 

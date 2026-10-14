@@ -1,14 +1,14 @@
 import pytest
 
-from keel.config import Settings
+from keel.config import ServiceCredential, Settings
 
-BASE = {"KEEL_API_KEY": "secret", "KEEL_API_KEY_TENANT": "tenant-a",
+BASE = {"KEEL_API_KEY": "secret", "KEEL_API_KEY_TENANT": "1",
         "KEEL_DATABASE_URL": "sqlite:///tmp/keel.sqlite3"}
 
 
 def test_defaults_from_the_minimum_environment():
     settings = Settings.from_env(BASE)
-    assert [(c.tenant_id, c.secret) for c in settings.credentials] == [("tenant-a", "secret")]
+    assert [(c.tenant_id, c.secret) for c in settings.credentials] == [(1, "secret")]
     assert settings.tenant_backfill == {}
     assert "secret" not in repr(settings)
     assert settings.workers == 4 and settings.max_running == 10
@@ -26,7 +26,7 @@ def test_overrides_and_postgres_detection():
 
 @pytest.mark.parametrize(("env", "message"), [
     ({"KEEL_DATABASE_URL": "sqlite:///x"}, "KEEL_API_KEY"),
-    ({"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "tenant-a"}, "KEEL_DATABASE_URL"),
+    ({"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "1"}, "KEEL_DATABASE_URL"),
     ({**BASE, "KEEL_DATABASE_URL": "mysql://x"}, "KEEL_DATABASE_URL"),
     ({**BASE, "KEEL_WORKERS": "0"}, "KEEL_WORKERS"),
     ({**BASE, "KEEL_MAX_RUNNING": "many"}, "KEEL_MAX_RUNNING"),
@@ -40,7 +40,7 @@ def test_bad_settings_name_the_variable(env, message):
 
 
 def test_sandbox_settings_have_defaults_and_validation():
-    base = {"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "tenant-a", "KEEL_DATABASE_URL": "sqlite:///x.db"}
+    base = {"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "1", "KEEL_DATABASE_URL": "sqlite:///x.db"}
     settings = Settings.from_env(base)
     assert (settings.max_iterations, settings.sandbox, settings.sandbox_idle_seconds, settings.sandbox_mount_root,
             settings.docker, settings.deployment) == (60, "docker", 1800.0, None, "docker", "keel")
@@ -111,28 +111,28 @@ def test_a_key_without_a_tenant_is_refused_and_two_keys_can_share_a_tenant(tmp_p
     with pytest.raises(ValueError, match="KEEL_API_KEY_TENANT"):
         Settings.from_env({**BASE, "KEEL_API_KEY_TENANT": ""})
     with pytest.raises(ValueError, match="KEEL_API_KEY"):
-        Settings.from_env({"KEEL_API_KEY_TENANT": "tenant-a", "KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"]})
+        Settings.from_env({"KEEL_API_KEY_TENANT": "1", "KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"]})
     with pytest.raises(ValueError, match="KEEL_API_KEY or KEEL_API_KEYS"):
         Settings.from_env({"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"]})
     path = tmp_path / "tenants.json"
-    path.write_text('{"p1": "tenant-a", "p2": "tenant-b"}')
+    path.write_text('{"p1": 1, "p2": 2}')
     settings = Settings.from_env({
         "KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"],
-        "KEEL_API_KEYS": "tenant-a:key-a,tenant-b:key-b",
-        "KEEL_API_KEY": "key-legacy", "KEEL_API_KEY_TENANT": "tenant-a",
+        "KEEL_API_KEYS": "1:key-a,2:key-b",
+        "KEEL_API_KEY": "key-legacy", "KEEL_API_KEY_TENANT": "1",
         "KEEL_TENANT_BACKFILL": str(path),
     })
     assert [(c.tenant_id, c.secret) for c in settings.credentials] == [
-        ("tenant-a", "key-a"), ("tenant-b", "key-b"), ("tenant-a", "key-legacy")]
-    assert settings.tenant_backfill == {"p1": "tenant-a", "p2": "tenant-b"}
+        (1, "key-a"), (2, "key-b"), (1, "key-legacy")]
+    assert settings.tenant_backfill == {"p1": 1, "p2": 2}
     assert "key-a" not in repr(settings) and "key-legacy" not in repr(settings)
     for raw, message in (
-        ("tenant-a:key-a,tenant-b:key-a", "more than one tenant"),
+        ("1:key-a,2:key-a", "more than one tenant"),
         ("no-colon", "tenant:secret"),
         (":key", "tenant id"),
         ("bad id:key", "tenant id"),
-        ("tenant-a:", "tenant:secret"),
-        ("tenant-a:has space", "tenant:secret"),
+        ("1:", "tenant:secret"),
+        ("1:has space", "tenant:secret"),
     ):
         with pytest.raises(ValueError, match=message):
             Settings.from_env({"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"], "KEEL_API_KEYS": raw})
@@ -142,6 +142,20 @@ def test_a_key_without_a_tenant_is_refused_and_two_keys_can_share_a_tenant(tmp_p
     path.write_text("[1]")
     with pytest.raises(ValueError, match="KEEL_TENANT_BACKFILL"):
         Settings.from_env({**BASE, "KEEL_TENANT_BACKFILL": str(path)})
+    for invalid in ('{"p1": "1"}', '{"p1": 2147483648}', '{"p1": 0}', '{"p1": true}'):
+        path.write_text(invalid)
+        with pytest.raises(ValueError, match="KEEL_TENANT_BACKFILL"):
+            Settings.from_env({**BASE, "KEEL_TENANT_BACKFILL": str(path)})
+    for invalid in ("0:key", "2147483648:key", "01:key", "-1:key"):
+        with pytest.raises(ValueError, match="tenant id"):
+            Settings.from_env({"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"], "KEEL_API_KEYS": invalid})
+
+
+def test_a_direct_service_credential_requires_an_integer_tenant_id():
+    assert ServiceCredential(1, "key").tenant_id == 1
+    for invalid in ("1", True, 0, 2_147_483_648):
+        with pytest.raises(ValueError, match="tenant id"):
+            ServiceCredential(invalid, "key")
 
 
 def test_memory_limits_default_and_must_be_positive():

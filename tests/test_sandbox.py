@@ -5,7 +5,7 @@ import time
 import pytest
 
 from keel.sandbox import base
-from keel.sandbox.base import TIMEOUT_EXIT_CODE, Mount, PolicyError, parse_policy
+from keel.sandbox.base import TIMEOUT_EXIT_CODE, Mount, PolicyError, parse_policy, private_mount_conflict
 from keel.sandbox.local import LocalSandbox
 
 
@@ -47,6 +47,42 @@ def test_mount_sources_can_be_confined_to_a_root():
         parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": "/etc", "target": "/x"}]}, "/srv")
     with pytest.raises(PolicyError, match="under /srv"):
         parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": "/srv/../etc", "target": "/x"}]}, "/srv")
+
+
+def test_private_mounts_may_not_overlap_another_profile():
+    def policy(source, read_only=False):
+        return parse_policy({"image": "i", "workdir": "/work", "mounts": [
+            {"source": source, "target": "/data", "read_only": read_only}]})
+
+    assert private_mount_conflict(policy("/data/one/child"), [policy("/data/one")]) is not None
+    assert private_mount_conflict(policy("/data/one", True), [policy("/data/one")]) is not None
+    assert private_mount_conflict(policy("/data/one"), [policy("/data/one", True)]) is not None
+    assert private_mount_conflict(policy("/data/one", True), [policy("/data/one", True)]) is not None
+    assert private_mount_conflict(policy("/data/one"), [policy("/data/one-other")]) is None
+
+
+def test_private_mounts_detect_a_host_symlink_alias(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(private, target_is_directory=True)
+
+    def policy(source):
+        return parse_policy({"image": "i", "workdir": "/work", "mounts": [
+            {"source": str(source), "target": "/data"}]})
+
+    assert private_mount_conflict(policy(alias), [policy(private)]) is not None
+
+
+def test_mount_root_checks_the_resolved_host_path(tmp_path):
+    root = tmp_path / "root"
+    private = tmp_path / "private"
+    root.mkdir()
+    private.mkdir()
+    (root / "alias").symlink_to(private, target_is_directory=True)
+    with pytest.raises(PolicyError, match="under"):
+        parse_policy({"image": "i", "workdir": "/work", "mounts": [
+            {"source": str(root / "alias"), "target": "/data"}]}, str(root))
 
 
 @pytest.fixture

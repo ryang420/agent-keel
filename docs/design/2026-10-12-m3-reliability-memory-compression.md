@@ -432,8 +432,9 @@ tenant B -> account profile B -> sessions, runs, memory, sandbox and private fil
 ```
 
 Profiles in the same tenant are independent too. There is no tenant-wide memory, shared knowledge store or shared
-user-file directory. Public model configuration, base sandbox images and read-only deployment skills may be
-reused; they must contain no profile's private state. Profile ownership is immutable through the runtime API.
+user-file directory. Public model configuration, base sandbox images and read-only deployment skills packaged in
+those images may be reused; they must contain no profile's private state. Profile ownership is immutable through
+the runtime API.
 Changing tenant means using another profile; it never continues the old identity's session or reassigns its data.
 
 ### Consumer and runtime responsibilities
@@ -463,7 +464,8 @@ profile. IDs are locators, never evidence of permission.
 
 ### Stored ownership and execution
 
-Add `tenants` with a stable primary key and `profiles.tenant_id` referencing it, with an index for tenant-scoped
+Add `tenants` with a positive 32-bit integer primary key and `profiles.tenant_id` of the same integer type
+referencing it, with an index for tenant-scoped
 lookups. Retain globally unique internal profile and session IDs; adding tenant ownership does not silently make
 existing IDs tenant-local. If a consumer has tenant-local account or conversation IDs, its adapter maps the full
 scoped identity to distinct keel IDs. A naming convention alone is not authorization.
@@ -475,10 +477,12 @@ unverified caller field. The executor, title generation, memory review, compress
 that scope after the HTTP request ends. Internal maintenance can scan multiple tenants, but each action must use
 the persisted resource's own profile and sandbox.
 
-Keep containers, writable directories, private mounts, tool credentials and any private caches separate per
-profile, even within one tenant. Provisioning must not bind two profiles to the same private host directory or
-give one profile credentials capable of reading another's private data. Container naming alone does not enforce
-this. Deployment-owned public read-only assets are the only shared mounts in this design. Infrastructure model
+Keep containers, writable directories, mounts, tool credentials and any private caches separate per profile, even
+within one tenant. Provisioning must not bind two profiles to the same host directory, including read-only mounts,
+or give one profile credentials capable of reading another's private data. Container naming alone does not enforce
+this. Once a profile has mounts, its mount list cannot be changed through `PUT`: an older live container could
+otherwise retain a removed mount while another profile claims the path. Public skills may be packaged into the
+shared image instead of a shared host mount. Infrastructure model
 provider credentials may remain service-wide; they are not exposed as sandbox tool credentials. Tenant ownership
 does not change the existing sandbox hardening or the requirement for deployment-enforced network access policy.
 
@@ -487,7 +491,7 @@ does not change the existing sandbox hardening or the requirement for deployment
 Use the next numbered migration after those already present. Preserve existing profile and session IDs, messages,
 runs, blobs, memory, and their sandbox/file associations. Do not edit migrations 1–3 or recreate the database.
 
-For an existing database, require an explicit operator-provided assignment of every existing profile to a tenant.
+For an existing database, require an explicit operator-provided assignment of every existing profile to an integer tenant ID.
 A single-tenant installation may explicitly assign all profiles to one named tenant; never infer assignments from
 an email, an ID prefix or the natural person behind an account. Validate coverage, tenant references and conflicting
 assignments before applying the backfill transaction. An incomplete or conflicting mapping leaves the database

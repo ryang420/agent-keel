@@ -103,7 +103,7 @@ async def service(store, tmp_path):
     executor = RunExecutor(store, bus, registry, sandbox=LocalSandbox(kill_grace_s=0.5))
     pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
-                credentials=(ServiceCredential("t1", "test-key"),), max_running=2)
+                credentials=(ServiceCredential(1, "test-key"),), max_running=2)
     await pool.start()
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(keel)), base_url="http://keel",
                                headers=AUTH)

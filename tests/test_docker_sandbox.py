@@ -79,6 +79,27 @@ async def test_files_round_trip(docker):
 
 
 @needs_docker
+async def test_two_profiles_keep_private_files_and_env_separate(docker, tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "marker").write_text("from-left")
+    (right / "marker").write_text("from-right")
+    a = await docker.ensure("p1", policy(env={"KEEL_TOKEN": "token-left"}, mounts=[
+        {"source": str(left), "target": "/private"}]))
+    b = await docker.ensure("p2", policy(env={"KEEL_TOKEN": "token-right"}, mounts=[
+        {"source": str(right), "target": "/private"}]))
+    await docker.write_file(a, "/work/only-a", b"marker-a")
+    result = await docker.exec(b, ["sh", "-c", 'echo "$KEEL_TOKEN"; ls /work; cat /private/marker'],
+                               cwd="/work", timeout_s=30, exec_id="isolation")
+    assert result.exit_code == 0 and a.name != b.name
+    assert "token-right" in result.output and "token-left" not in result.output
+    assert "from-right" in result.output and "from-left" not in result.output
+    assert "only-a" not in result.output and "marker-a" not in result.output
+
+
+@needs_docker
 async def test_a_timeout_kills_the_process_tree(docker):
     sandbox = await docker.ensure("p1", policy())
     result = await docker.exec(sandbox, ["sh", "-c", "(sleep 2; touch /work/late) & sleep 30"], cwd="/work",

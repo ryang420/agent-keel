@@ -292,5 +292,19 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
         columns = await schema_shape(upgraded.db)
         assert "tenants" in columns["columns"]
         assert "profiles_tenant" in columns["indexes"]
+        if upgraded.db.dialect == "sqlite":
+            tenant_type = await upgraded.db.fetchrow(
+                "SELECT type FROM pragma_table_info('tenants') WHERE name = 'id'")
+            owner_type = await upgraded.db.fetchrow(
+                "SELECT type FROM pragma_table_info('profiles') WHERE name = 'tenant_id'")
+            assert tenant_type["type"] == owner_type["type"] == "INTEGER"
+        else:
+            tenant_type = await upgraded.db.fetchrow(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'tenants' AND column_name = 'id'")
+            owner_type = await upgraded.db.fetchrow(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'profiles' AND column_name = 'tenant_id'")
+            assert tenant_type["data_type"] == owner_type["data_type"] == "integer"
     finally:
         await upgraded.close()

@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 
@@ -20,7 +22,7 @@ async def clients(store):
     executor = RunExecutor(store, bus, registry)
     pool = WorkerPool(store, bus, executor, owner="w1", workers=2, poll_seconds=0.01)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
-                credentials=(ServiceCredential("tenant-a", "key-a"), ServiceCredential("tenant-b", "key-b")),
+                credentials=(ServiceCredential(1, "key-a"), ServiceCredential(2, "key-b")),
                 max_running=2)
     app = create_app(keel)
     await pool.start()
@@ -39,10 +41,10 @@ async def test_a_foreign_profile_is_a_404_and_cannot_be_replaced(clients, store)
     owner, other = clients
     created = await owner.put("/v1/profiles/acct", json={**PROFILE, "soul": "owner"})
     assert created.status_code == 200
-    assert (await store.get_profile("acct")).tenant_id == "tenant-a"
-    forged = await owner.put("/v1/profiles/acct", json={**PROFILE, "soul": "changed", "tenant": "tenant-b"})
+    assert (await store.get_profile("acct")).tenant_id == 1
+    forged = await owner.put("/v1/profiles/acct", json={**PROFILE, "soul": "changed", "tenant": 2})
     assert forged.status_code == 200 and forged.json()["soul"] == "changed"
-    assert (await store.get_profile("acct")).tenant_id == "tenant-a"  # body field is ignored
+    assert (await store.get_profile("acct")).tenant_id == 1  # body field is ignored
     stolen = await other.put("/v1/profiles/acct", json={**PROFILE, "soul": "stolen"})
     assert stolen.status_code == 404
     assert stolen.json()["error"] == {"code": "profile_not_found", "message": "No such profile."}
@@ -97,3 +99,33 @@ async def test_two_profiles_in_one_tenant_do_not_share_a_session_id_or_memory(cl
     assert (await store.memory_entries("p2"))["memory"] == ["FACT-P2"]
     sessions = (await owner.get("/v1/profiles/p2/sessions")).json()["data"]
     assert sessions == []
+
+
+async def test_private_mounts_cannot_overlap_another_profile(clients, store):
+    owner, other = clients
+    sandbox = {"image": "python:3.12-slim", "workdir": "/work", "mounts": [
+        {"source": "/data/private", "target": "/data"}]}
+    body = {**PROFILE, "sandbox": sandbox}
+    assert (await owner.put("/v1/profiles/p1", json=body)).status_code == 200
+    for client, profile_id in ((owner, "p2"), (other, "p3")):
+        response = await client.put(f"/v1/profiles/{profile_id}", json={
+            **body, "sandbox": {**sandbox, "mounts": [
+                {"source": "/data/private/child", "target": "/secret", "read_only": True}]}})
+        assert response.status_code == 400
+        assert await store.get_profile(profile_id) is None
+    readonly = {**body, "sandbox": {**sandbox, "mounts": [
+        {"source": "/data/public", "target": "/data", "read_only": True}]}}
+    assert (await owner.put("/v1/profiles/public-a", json=readonly)).status_code == 200
+    assert (await owner.put("/v1/profiles/public-b", json=readonly)).status_code == 400
+    removed = await owner.put("/v1/profiles/p1", json={**PROFILE, "sandbox": {}})
+    assert removed.status_code == 400
+    assert (await store.get_profile("p1")).sandbox == sandbox
+
+
+async def test_concurrent_profiles_cannot_claim_the_same_mount(clients):
+    owner, other = clients
+    body = {**PROFILE, "sandbox": {"image": "python:3.12-slim", "workdir": "/work", "mounts": [
+        {"source": "/data/exclusive", "target": "/private"}]}}
+    first, second = await asyncio.gather(
+        owner.put("/v1/profiles/p1", json=body), other.put("/v1/profiles/p2", json=body))
+    assert sorted((first.status_code, second.status_code)) == [200, 400]

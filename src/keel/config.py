@@ -14,7 +14,8 @@ from typing import Mapping
 
 _DB_SCHEMES = ("postgresql://", "postgres://", "sqlite:///")
 _DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
-_TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TENANT_INT_MAX = 2_147_483_647
 _SECRET = re.compile(r"^[^\s,]+$")
 
 
@@ -59,11 +60,15 @@ def _instance_id() -> str:
 
 @dataclass(frozen=True)
 class ServiceCredential:
-    tenant_id: str
+    tenant_id: int
     secret: str = field(repr=False)
 
+    def __post_init__(self) -> None:
+        if type(self.tenant_id) is not int or not 0 < self.tenant_id <= _TENANT_INT_MAX:
+            raise ValueError("tenant id must be a positive 32-bit integer")
 
-def tenant_id_for(credentials: tuple[ServiceCredential, ...], authorization: str) -> str | None:
+
+def tenant_id_for(credentials: tuple[ServiceCredential, ...], authorization: str) -> int | None:
     """The tenant bound to this exact bearer secret, or None. Every secret is compared."""
     prefix = "Bearer "
     if not authorization.startswith(prefix):
@@ -77,11 +82,14 @@ def tenant_id_for(credentials: tuple[ServiceCredential, ...], authorization: str
 
 
 def _credential(tenant_id: str, secret: str, source: str) -> ServiceCredential:
-    if not _TENANT.fullmatch(tenant_id):
-        raise ValueError(f"{source} tenant id is not a valid tenant id")
+    if not tenant_id.isascii() or not tenant_id.isdecimal() or tenant_id.startswith("0"):
+        raise ValueError(f"{source} tenant id must be a positive 32-bit integer")
+    value = int(tenant_id)
+    if value > _TENANT_INT_MAX:
+        raise ValueError(f"{source} tenant id must be a positive 32-bit integer")
     if not secret or not _SECRET.fullmatch(secret):
         raise ValueError(f"{source} entry must be tenant:secret")
-    return ServiceCredential(tenant_id, secret)
+    return ServiceCredential(value, secret)
 
 
 def _credentials(env: Mapping[str, str]) -> tuple[ServiceCredential, ...]:
@@ -110,7 +118,7 @@ def _credentials(env: Mapping[str, str]) -> tuple[ServiceCredential, ...]:
     return tuple(found)
 
 
-def _backfill(env: Mapping[str, str]) -> dict[str, str]:
+def _backfill(env: Mapping[str, str]) -> dict[str, int]:
     path = (env.get("KEEL_TENANT_BACKFILL") or "").strip()
     if not path:
         return {}
@@ -119,11 +127,11 @@ def _backfill(env: Mapping[str, str]) -> dict[str, str]:
         data = json.loads(text)
     except (OSError, ValueError) as exc:
         raise ValueError(f"KEEL_TENANT_BACKFILL cannot be read: {path}") from exc
-    if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
-        raise ValueError("KEEL_TENANT_BACKFILL must be a JSON object of profile id to tenant id")
+    if not isinstance(data, dict) or not all(isinstance(k, str) and type(v) is int for k, v in data.items()):
+        raise ValueError("KEEL_TENANT_BACKFILL must map profile ids to integer tenant ids")
     for profile_id, tenant_id in data.items():
-        if not _TENANT.fullmatch(profile_id) or not _TENANT.fullmatch(tenant_id):
-            raise ValueError("KEEL_TENANT_BACKFILL ids must be 1-128 letters, digits, '.', '_' or '-'")
+        if not _ID.fullmatch(profile_id) or not 0 < tenant_id <= _TENANT_INT_MAX:
+            raise ValueError("KEEL_TENANT_BACKFILL has an invalid profile or integer tenant id")
     return dict(data)
 
 
@@ -152,7 +160,7 @@ class Settings:
     openai_compat: bool = False
     openai_context_window: int = 128_000
     instance_id: str = field(default_factory=_instance_id)
-    tenant_backfill: dict[str, str] = field(default_factory=dict)
+    tenant_backfill: dict[str, int] = field(default_factory=dict)
 
     @property
     def is_postgres(self) -> bool:

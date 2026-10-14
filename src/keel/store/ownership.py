@@ -9,7 +9,7 @@ from keel.store.base import OwnershipError
 from keel.store.migrations import _PG_LOCK
 
 
-async def require_tenant_ownership(db, tenant_ids: tuple[str, ...], assignment: dict[str, str]) -> None:
+async def require_tenant_ownership(db, tenant_ids: tuple[int, ...], assignment: dict[str, int]) -> None:
     async with db.transaction():
         if db.dialect == "postgres":
             await db.execute(_PG_LOCK)
@@ -53,7 +53,7 @@ async def _enforce(db) -> None:
             "CREATE TABLE profiles_owned ("
             "id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL, "
             "skills TEXT NOT NULL, updated_at REAL NOT NULL, memory INTEGER NOT NULL DEFAULT 0, "
-            "tenant_id TEXT NOT NULL REFERENCES tenants(id))")
+            "tenant_id INTEGER NOT NULL REFERENCES tenants(id))")
         await db.execute(
             "INSERT INTO profiles_owned (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
             "SELECT id, models, sandbox, soul, skills, updated_at, memory, tenant_id FROM profiles")
