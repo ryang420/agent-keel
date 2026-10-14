@@ -6,7 +6,7 @@ import json
 import logging
 
 from keel.sandbox.base import SandboxError
-from keel.tools import files, shell, skill_tools  # noqa: F401  (registers their tools)
+from keel.tools import files, memory, shell, skill_tools  # noqa: F401  (registers their tools)
 from keel.tools.base import (
     HANDLERS, MAX_TOOL_RESULT_CHARS, ToolArgumentError, ToolContext, ToolOutcome, cap_json_result, error_result,
 )
@@ -27,6 +27,8 @@ async def run_tool(name: str, arguments: str, ctx: ToolContext) -> ToolOutcome:
         return error_result(f"Invalid JSON arguments: {exc}")
     if not isinstance(args, dict):
         return error_result("Tool arguments must be a JSON object.")
+    if name != "memory" and ctx.backend is None:
+        return error_result("This tool needs a sandbox.")
     try:
         outcome = await handler(args, ctx)
     except ToolArgumentError as exc:

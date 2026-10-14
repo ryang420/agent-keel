@@ -72,12 +72,19 @@ CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an 
 
 - 0.2.0 (M1 + M2) is released. M3 so far (unreleased): numbered schema migrations, context compression, and
   reliability (LISTEN reconnect, lease-derived database timeout, orphan removal that spares runs in flight, a lost
-  worker's command killed, run-event pruning, fault-injection tests).
-- **M3** (`docs/design/2026-10-12-m3-reliability-memory-compression.md`): numbered schema migrations (a 0.2.0
-  database upgrades in place), context compression (at ~75% of the window or on `context_overflow`; the summary is
-  kept in place on the same session), run-event pruning, model-generated titles (precedence user > llm > derived, `#N` on collision), the `memory` tool with
-  per-session snapshots and background review, plus fault-injection tests (kill a worker, delete a sandbox, provider
-  5xx) and a long-session eval. Stop and image input were already done in M2.
+  worker's command killed, run-event pruning, fault-injection tests). Model-generated titles, the `memory` tool and
+  background review are done on this branch.
+- **M3** (`docs/design/2026-10-12-m3-reliability-memory-compression.md`) is still open: numbered schema migrations
+  (a 0.2.0 database upgrades in place), context compression (at ~75% of the window or on `context_overflow`; the
+  summary is kept in place on the same session), run-event pruning, model-generated titles (precedence user > llm >
+  derived, `#N` on collision), the `memory` tool with per-session snapshots and background review (this slice is
+  done on the branch), plus fault-injection tests (kill a worker, delete a sandbox, provider 5xx). The long-session
+  live eval stays opt-in and already exists. Stop and image input were already done in M2.
+- **M3 tenant isolation** (design §12, requirements agreed 2026-10-14) is required before a real-user pilot and is
+  not yet implemented: explicit tenant ownership, tenant-scoped service credentials, immutable profile ownership,
+  and independent sessions, memory, sandbox files and tool credentials for every profile, including profiles in
+  the same tenant. The consumer owns end-user membership and account authorization; keel enforces resource
+  ownership. Existing profiles need an explicit tenant backfill and a coordinated cutover from old instances.
 - Deferred items worth picking up with M3: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
   hands a running command's cleanup to the executor's cancel path.

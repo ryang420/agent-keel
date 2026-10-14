@@ -1,13 +1,18 @@
 import asyncio
+import json
 
 import pytest
 
+from keel import prompts
+from keel.background import Background
 from keel.events import InMemoryEventBus
 from keel.models import Completed, ToolCall, ToolCallReady, ReasoningItem, ReasoningReady, TextDelta, TextPart, Usage
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import DEFAULT_IDENTITY, RunExecutor
+from keel.sandbox.local import LocalSandbox
 from keel.titles import derive_title
+from keel.tools import ToolContext, run_tool
 
 ITEM = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
 
@@ -206,3 +211,160 @@ async def test_an_incomplete_response_still_completes_but_says_so(setup, caplog)
     await executor.execute(await start(store, session="s2"))
     other = [r for r in await store.list_runs("p1", ("completed",)) if r.session_id == "s2"][0]
     assert "incomplete" not in (await store.events_after(other.id, 0))[-1].data
+
+
+def with_background(setup):
+    """`setup` builds the executor; these tests pass the background owner the fixture does not."""
+    store, provider, executor = setup
+    background = Background()
+    titled = RunExecutor(store, executor.bus, executor.providers, sleep=no_sleep, background=background)
+    return store, provider, titled, background
+
+
+async def wait_for_background(background):
+    """`asyncio.wait` rejects an empty set, and a task is removed from `_tasks` once it finishes."""
+    tasks = [task for task in background._tasks]
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=2)
+    assert not pending
+
+
+OPENING = "The pool exhausts under load"
+DONE = [TextDelta("done"), Completed(Usage(3, 1, 0, 0))]
+TITLE_OK = [TextDelta('{"title": "Pool exhausts under load"}'), Completed(Usage(3, 1, 0, 0))]
+
+
+async def test_the_first_completed_run_is_renamed_in_the_background(setup):
+    store, provider, executor, background = with_background(setup)
+    # The title step sleeps so the derived title can be read: any await after execute also runs the task.
+    provider.script = [DONE, [0.05, *TITLE_OK]]
+    run = await start(store, OPENING)
+    await executor.execute(run)
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == (OPENING, "derived")
+    events = [event.type for event in await store.events_after(run.id, 0)]
+    await wait_for_background(background)
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == ("Pool exhausts under load", "llm")
+    assert len(provider.requests) == 2
+    title_request = provider.requests[1]
+    assert title_request.tools == () and title_request.reasoning_effort == "low"
+    assert title_request.max_output_tokens == 512 and title_request.cache_scope == ""
+    assert OPENING in title_request.messages[0].text
+    assert [event.type for event in await store.events_after(run.id, 0)] == events
+    assert [message.message.role for message in await store.messages("s1")] == ["user", "assistant"]
+
+
+async def test_a_second_run_does_not_call_the_model_for_a_title(setup):
+    store, provider, executor, background = with_background(setup)
+    provider.script = [DONE, TITLE_OK, [TextDelta("again"), Completed(Usage(3, 1, 0, 0))]]
+    await executor.execute(await start(store, OPENING))
+    await wait_for_background(background)
+    titled = (await store.get_session("p1", "s1")).title
+    before = len(provider.requests)
+    await executor.execute(await start(store, "more detail"))
+    await wait_for_background(background)
+    assert len(provider.requests) == before + 1
+    assert (await store.get_session("p1", "s1")).title == titled
+
+
+async def test_a_bad_title_keeps_the_derived_one(setup):
+    store, provider, executor, background = with_background(setup)
+    provider.script = [DONE, [TextDelta("I cannot tell")]]
+    await executor.execute(await start(store, OPENING))
+    await wait_for_background(background)
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == (OPENING, "derived")
+
+
+async def test_a_user_rename_during_the_call_wins(setup):
+    store, provider, executor, background = with_background(setup)
+    provider.script = [DONE, [0.05, *TITLE_OK]]
+    await executor.execute(await start(store, OPENING))
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == (OPENING, "derived")
+
+    async def rename_once_the_title_call_starts():
+        for _ in range(100):
+            if len(provider.requests) >= 2:
+                await store.set_title("p1", "s1", "Chosen", "user")
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("the title call never started")
+
+    renaming = asyncio.create_task(rename_once_the_title_call_starts())
+    await wait_for_background(background)
+    await renaming
+    session = await store.get_session("p1", "s1")
+    assert (session.title, session.title_source) == ("Chosen", "user")
+
+
+async def test_memory_is_offered_without_a_sandbox(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    provider.script = [[ToolCallReady(ToolCall("c1", "memory", json.dumps(
+        {"action": "add", "target": "user", "content": "The user likes tea"}))), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    run = await start(store)
+    await store.db.execute("UPDATE sessions SET turns_since_memory = 4 WHERE id = ?", "s1")
+    await executor.execute(run)
+    assert tuple(tool["name"] for tool in provider.requests[0].tools) == ("memory",)
+    assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
+    session = await store.get_session("p1", "s1")
+    assert session.turns_since_memory == 0
+    # "tea" occurs inside "instead" in the guidance text, so the frozen snapshot is checked by the whole fact.
+    assert "The user likes tea" not in session.system_prompt and prompts.text("memory") in session.system_prompt
+    assert "USER PROFILE (who the user is)\n(empty)" in session.system_prompt
+    await executor.execute(await start(store, "later", session="s2"))
+    later = await store.get_session("p1", "s2")
+    assert "The user likes tea" in later.system_prompt
+    assert (await store.get_session("p1", "s1")).system_prompt == session.system_prompt
+
+
+async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(store, tmp_path):
+    provider = FakeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    work = tmp_path / "work"
+    work.mkdir()
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[], memory=True,
+                               sandbox={"image": "local", "workdir": str(work)})
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5), sleep=no_sleep)
+    await executor.execute(await start(store))
+    assert [tool["name"] for tool in provider.requests[0].tools] == [*prompts.TOOL_ORDER, "memory"]
+
+
+async def test_a_tool_other_than_memory_needs_a_sandbox():
+    missing = await run_tool("terminal", '{"command": "true"}', ToolContext())
+    assert missing.error and "sandbox" in missing.content
+    unavailable = await run_tool("memory", '{"target": "user", "action": "add", "content": "x"}', ToolContext())
+    assert unavailable.error and "Memory is not available." in unavailable.content
+
+
+async def test_memory_refuses_a_write_when_the_profile_flag_is_off(store, local_sandbox):
+    """A sandboxed run always puts the store on the context, and the model can call memory even when it was not
+    offered. The handler re-reads the profile and writes only when memory is on."""
+    backend, sandbox, _work = local_sandbox
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}],
+                               sandbox={"image": "local", "workdir": str(_work)}, soul="", skills=[], memory=False)
+    await store.ensure_session("p1", "s1")
+    ctx = ToolContext(backend, sandbox, cwd=str(_work), store=store, profile_id="p1", session_id="s1")
+    refused = await run_tool("memory", '{"action":"add","target":"memory","content":"secret fact"}', ctx)
+    assert refused.error
+    assert (await store.memory_entries("p1"))["memory"] == []
+
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}],
+                               sandbox={"image": "local", "workdir": str(_work)}, soul="", skills=[], memory=True)
+    saved = await run_tool("memory", '{"action":"add","target":"memory","content":"secret fact"}', ctx)
+    assert saved.error is False
+    assert (await store.memory_entries("p1"))["memory"] == ["secret fact"]
+
+
+async def test_a_profile_with_neither_still_gets_no_tools(setup):
+    store, provider, executor = setup
+    await executor.execute(await start(store))
+    assert provider.requests[0].tools == ()
+

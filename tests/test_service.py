@@ -33,11 +33,14 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
     from keel.service import build
 
     settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
-                        compression_threshold=0.5)
+                        compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3)
     keel, pool, closables, backend = await build(settings)
     try:
         assert backend is None and keel.executor.sandbox is None
+        assert keel.executor.background is keel.background
         assert keel.executor.compactor.threshold == 0.5
+        assert (keel.executor.memory_chars, keel.executor.user_chars, keel.executor.memory_review_turns) == (
+            100, 50, 3)
         assert pool.event_retention_s == 7 * 86_400
     finally:
         for item in closables:
@@ -134,3 +137,17 @@ async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_p
     async with app.router.lifespan_context(app):
         pass
     assert "rm -f c1" in log.read_text().splitlines()
+
+
+async def test_the_lifespan_closes_the_background_after_the_pool_runs(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from keel.background import Background
+
+    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
+    app = create_service(settings)
+    close = AsyncMock()
+    monkeypatch.setattr(Background, "close", close)
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.background, Background)
+    close.assert_awaited_once()

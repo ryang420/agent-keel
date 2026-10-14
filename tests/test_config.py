@@ -96,3 +96,19 @@ def test_event_retention_defaults_to_seven_days_and_must_be_positive():
     assert Settings.from_env({**BASE, "KEEL_EVENT_RETENTION_DAYS": "30"}).event_retention_days == 30
     with pytest.raises(ValueError, match="KEEL_EVENT_RETENTION_DAYS"):
         Settings.from_env({**BASE, "KEEL_EVENT_RETENTION_DAYS": "0"})
+
+
+def test_background_limit_defaults_and_rejects_zero():
+    assert Settings.from_env(BASE).background_limit == 4
+    with pytest.raises(ValueError, match="KEEL_BACKGROUND_LIMIT"):
+        Settings.from_env({**BASE, "KEEL_BACKGROUND_LIMIT": "0"})
+
+
+def test_memory_limits_default_and_must_be_positive():
+    settings = Settings.from_env(BASE)
+    assert (settings.memory_review_turns, settings.memory_chars, settings.user_chars) == (10, 2200, 1375)
+    custom = Settings.from_env({**BASE, "KEEL_MEMORY_REVIEW_TURNS": "3", "KEEL_MEMORY_CHARS": "100",
+                                "KEEL_USER_CHARS": "80"})
+    assert (custom.memory_review_turns, custom.memory_chars, custom.user_chars) == (3, 100, 80)
+    with pytest.raises(ValueError, match="KEEL_USER_CHARS"):
+        Settings.from_env({**BASE, "KEEL_USER_CHARS": "0"})

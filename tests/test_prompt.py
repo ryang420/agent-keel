@@ -28,3 +28,14 @@ def test_no_skills_means_no_skills_block():
     prompt = build_system_prompt(soul="", model="m", provider="p", now=NOW, tools=True, workdir="/w")
     assert prompt.startswith(DEFAULT_IDENTITY + "\n\n")
     assert "<available_skills>" not in prompt and prompts.text("skills_header") not in prompt
+
+
+def test_memory_guidance_follows_guidance_and_the_snapshot_follows_the_date():
+    prompt = build_system_prompt(soul="SOUL", model="m1", provider="bedrock", now=NOW, tools=True,
+                                 memory=True, memory_snapshot="SNAPSHOT", workdir="/work")
+    guidance, memory = prompts.text("guidance"), prompts.text("memory")
+    date = "Current date: Monday, October 12, 2026 (UTC, UTC+00:00)\nModel: m1\nProvider: bedrock"
+    assert prompt.index(memory) == prompt.index(guidance) + len(guidance) + 2
+    assert prompt.index("SNAPSHOT") == prompt.index(date) + len(date) + 2
+    plain = build_system_prompt(soul="SOUL", model="m1", provider="bedrock", now=NOW, tools=True, workdir="/work")
+    assert memory not in plain and "SNAPSHOT" not in plain

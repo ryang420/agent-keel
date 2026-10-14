@@ -241,3 +241,25 @@ async def test_a_middle_larger_than_the_summary_input_limit_is_cut_to_fit(store)
     prompt = model.summaries[0].messages[0].text
     assert "OUTPUT TRUNCATED" in prompt
     assert compress.text_tokens(prompt) <= compress.SUMMARY_INPUT_TOKENS + 5_000
+
+
+async def test_a_compaction_refreshes_the_memory_snapshot(store):
+    model = Counting(40_000)
+    executor = await executor_for(store, model)
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    await turn(store, executor, "turn 0 " + "u" * 4_000)
+    frozen = (await store.get_session("p1", "s1")).system_prompt
+    assert frozen and "FACT-ONE" not in frozen
+    await store.apply_memory("p1", "memory", 2200, [{"action": "add", "content": "FACT-ONE"}])
+    for n in range(1, 30):
+        await turn(store, executor, f"turn {n} " + "u" * 4_000)
+    assert model.summaries
+    refreshed = (await store.get_session("p1", "s1")).system_prompt
+    assert "FACT-ONE" in refreshed
+    before, after = between_summaries(model)[:2]
+    assert len(before) > 1 and len(after) > 1
+    assert len({request.system for request in before}) == 1
+    assert len({request.system for request in after}) == 1
+    assert before[0].system == frozen != after[0].system
+    assert after[0].system == refreshed

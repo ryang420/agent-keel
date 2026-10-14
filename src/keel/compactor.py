@@ -38,7 +38,7 @@ class Compactor:
         self._emit = emit
 
     async def prepare(self, run: Run, provider, stored: Sequence[StoredMessage], context: SessionContext, *,
-                      tools: tuple[dict, ...], window: int, rebuild: Callable[[], str],
+                      tools: tuple[dict, ...], window: int, rebuild: Callable[[], Awaitable[str]],
                       overflow: bool = False) -> tuple[list[compress.Item], Usage]:
         """The messages to send next, and the summary call's usage (empty when none was made).
 
@@ -90,7 +90,7 @@ class Compactor:
             await self._prune(run.session_id, context, pruned, failed_at=now.timestamp())
             return pruned_items, usage
         summary = compress.join_files(text, compress.collect_files(middle, files))
-        system_prompt = rebuild()
+        system_prompt = await rebuild()
         bounds = compress.Boundaries(summary, head[-1].id, tail_id, tail_id)
         await self.store.compact_session(run.session_id, summary=summary, head_id=bounds.head_id, tail_id=tail_id,
                                          system_prompt=system_prompt)

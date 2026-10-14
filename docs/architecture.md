@@ -80,10 +80,13 @@ Everything is in `src/keel/`.
 | `events.py` | `InMemoryEventBus`, `PostgresEventBus`. |
 | `providers/` | `ModelProvider` interface, registry, retry policy, the Responses-API transport, Bedrock (SigV4), OpenAI. |
 | `sandbox/` | `SandboxBackend`: policy parsing, the Docker backend, a host-process backend for tests. |
-| `tools/` | The eight tools and `run_tool`, the single entry point the loop calls. |
+| `tools/` | The sandbox tools, the `memory` tool and `run_tool`, the single entry point the loop calls. |
 | `prompt.py`, `prompts/` | The session system prompt and the prompt / tool-definition texts. |
 | `skills.py` | Skill discovery through the sandbox and the prompt index. |
-| `titles.py` | Derived session titles. |
+| `titles.py` | Session titles, derived and model-generated. |
+| `background.py` | Best-effort tasks outside a run: a model title, a memory review. |
+| `memory.py` | Curated entries for the two memory targets, and the checks on a write. |
+| `review.py` | A background memory review. It writes memory only. |
 
 Interfaces exist only where there is more than one implementation: `Store` (SQLite, Postgres), `EventBus` (in-memory,
 Postgres), `ModelProvider` (Bedrock, OpenAI, a fake for tests), `SandboxBackend` (Docker, local). Everything else is
@@ -96,6 +99,7 @@ concrete code.
 ```mermaid
 erDiagram
     profiles ||--o{ sessions : "has"
+    profiles ||--o{ memories : "facts"
     sessions ||--o{ messages : "transcript"
     sessions ||--o{ runs : "turns"
     sessions ||--o{ blobs : "images"
@@ -105,9 +109,15 @@ erDiagram
     profiles {
         text id PK
         text models "allow-list: provider + model"
-        text sandbox "policy JSON, empty = no tools"
+        text sandbox "policy JSON, empty = no sandbox tools; memory is separate and follows the flag"
         text soul "the persona"
         text skills "enabled skill names"
+        bool memory "off when omitted"
+    }
+    memories {
+        text profile_id PK
+        text target PK "memory or user"
+        text entries "JSON list"
     }
     sessions {
         text id PK
@@ -279,7 +289,7 @@ and stores a "cancelled" result for each, so the next request always pairs every
 ```mermaid
 flowchart TB
     A["load profile and session<br/>parse the sandbox policy"] --> B{"policy set and<br/>KEEL_SANDBOX=docker?"}
-    B -->|no| C["no tools: the model only answers"]
+    B -->|no| C["no sandbox tools<br/>memory still offered when on"]
     B -->|yes| D["sandbox.ensure(profile)<br/>discover skills"]
     C --> E
     D --> E["system prompt:<br/>reuse the session's, or build and freeze it"]
@@ -378,8 +388,9 @@ every waiter is woken, because a notify sent meanwhile was lost; each reader the
 
 ## 8. Sandboxes
 
-A profile gets tools only if its `sandbox` policy is non-empty **and** the service runs with `KEEL_SANDBOX=docker`.
-With an empty policy, or `KEEL_SANDBOX=none`, the run is a plain chat: the model answers and has no tools.
+A profile gets sandbox tools only if its `sandbox` policy is non-empty **and** the service runs with
+`KEEL_SANDBOX=docker`. With an empty policy, or `KEEL_SANDBOX=none`, there are no sandbox tools. The `memory` tool
+is still offered when the profile's `memory` flag is on.
 
 ### The policy
 
@@ -447,7 +458,8 @@ development.
 
 ## 9. Tools
 
-Eight tools are offered when a profile has a sandbox; their schemas live in `prompts/tools/*.json`.
+Eight tools are offered when a profile has a sandbox; their schemas live in `prompts/tools/*.json`. The `memory`
+tool is separate: it is offered when the profile's `memory` flag is on, with or without a sandbox.
 
 | Tool | What it does | Limits |
 |---|---|---|
@@ -470,6 +482,20 @@ Cross-cutting behaviour (`tools/base.py`):
 - **Previews.** Each call has a short preview (`tool.started` / `tool.completed`) so a client can show progress
   without the full arguments.
 
+### Memory
+
+The `memory` tool adds, replaces or removes entries, and several changes can go in one batch. A write does not
+change the session's stored system prompt.
+
+Two targets, each a list of short strings: `user` is who the user is, and `memory` is notes about the environment.
+The joined text of each is limited by `KEEL_USER_CHARS` (1375) and `KEEL_MEMORY_CHARS` (2200).
+
+The system prompt includes a snapshot of both, taken when the prompt is built. It stays frozen for that session. A
+write appears in the next session's prompt, and in this session when the prompt is rebuilt at a compaction.
+
+Every `KEEL_MEMORY_REVIEW_TURNS` (10) completed runs of a memory-enabled profile, a background review may save
+facts. It does not add messages to the session, and a review already running for that profile is skipped.
+
 ### Skills
 
 A skill is a directory with a `SKILL.md` whose front matter has a name and a description. keel reads them **through
@@ -485,10 +511,11 @@ Built **once per session** (and again only at a compaction, §6) and stored in `
 later turn sends a byte-identical prefix, which is what makes provider-side prompt caching work. In order, stable first:
 
 1. **Identity** — the profile's `soul`, or `You are a helpful assistant.`
-2. **Guidance** and **platform** texts (tool use and environment rules).
+2. **Guidance**, then memory guidance when memory is on, then the **platform** text (tool use and environment rules).
 3. **Skills** header, index and footer, when there are skills.
 4. **Volatile context** — the current date (as of the build, so refreshed at a compaction), the model and the provider.
-5. **Environment** — the working directory.
+5. **Memory snapshot** — both targets, when memory is on.
+6. **Environment** — the working directory.
 
 Without tools the prompt is the identity alone. Per-run `instructions` (text a client sends with each run) are a
 separate field of the model request and never change the stored prompt; the provider appends them after the system
@@ -539,7 +566,7 @@ All under `/v1/profiles/{profile_id}` except `/healthz`. Details are in the [API
 
 | Route | Purpose |
 |---|---|
-| `PUT /` | Create or replace a profile: `models`, `sandbox`, `soul`, `skills`. |
+| `PUT /` | Create or replace a profile: `models`, `sandbox`, `soul`, `skills`, `memory`. |
 | `POST /runs` | Start a run; `202` with `run_id`, `status`, `session_id`. |
 | `GET /runs`, `GET /runs/{id}` | List runs (`status=active` by default) or read one. |
 | `POST /runs/{id}/stop` | Stop a run. |
@@ -559,8 +586,10 @@ its users to profiles and keeps the key secret.
 
 - **Sessions** are created by the first run that names them (or get a generated id). They persist the transcript,
   the system prompt (fixed between compactions) and the working directory.
-- **Titles** come from the first user message (cleaned, bounded, and made unique with `#2` … `#9`), carry a rank
-  (`derived` < `llm` < `user`), and a user's title is never overwritten by a lower-ranked one.
+- **Titles** come from the first user message (cleaned and bounded), then from a model call after the first
+  completed run (`title_source` `llm`, between `derived` and `user`). Collisions get `#2`, `#3`, … with no cap.
+  Rank is `user` > `llm` > `derived`, and a user's title is never overwritten by a lower-ranked one. There is no
+  new event; a client reads the title from the session.
 - **Images** (PNG, JPEG, GIF, WebP; at most 4 per run, 5 MiB each, length checked before decoding) are stored as
   blobs; messages keep only a reference, and the bytes are loaded when the model request is built. A missing blob
   becomes the text `[image no longer available]`. A model without vision refuses them.
@@ -614,8 +643,8 @@ The reporting policy for vulnerabilities is in [SECURITY.md](../SECURITY.md).
 
 ## 15. Known limits
 
-- **Not built:** long-term memory, scheduled jobs, approvals, web search or browsing, MCP servers, agent-written
-  skills, a provider for Anthropic's own API.
+- **Not built:** scheduled jobs, approvals, web search or browsing, MCP servers, agent-written skills, a provider
+  for Anthropic's own API.
 - **Postgres needs direct connections** for `LISTEN`; a transaction-mode pooler will not do.
 - **Pre-1.0:** the API and schema may change between releases (see the [changelog](../CHANGELOG.md)).
 

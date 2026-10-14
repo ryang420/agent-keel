@@ -53,12 +53,17 @@ class ToolOutcome:
 
 @dataclass
 class ToolContext:
-    backend: SandboxBackend
-    sandbox: Sandbox
-    cwd: str
+    backend: SandboxBackend | None = None
+    sandbox: Sandbox | None = None
+    cwd: str = ""
     tool_call_id: str = ""
     skills: tuple = ()
     on_exec: Callable[[str | None], Awaitable[None]] | None = None
+    store: object | None = None
+    profile_id: str = ""
+    session_id: str = ""
+    memory_chars: int = 2200
+    user_chars: int = 1375
 
     def resolve(self, path: str) -> str:
         return posixpath.normpath(posixpath.join(self.cwd, path))

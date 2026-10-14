@@ -2,10 +2,13 @@
 
 Adapted from Hermes (Nous Research hermes-agent, MIT, v2026.9.24 `f97608f178`): the guidance blocks of the
 stable tier in agent/system_prompt.py, the api_server platform hint, the skills index header, the
-iteration-cap request, the compaction summary prefix and checkpoint prompt (agent/context_compressor.py) and the
-eight tool schemas as model_tools sends them. Edits remove what keel does not have: background processes, a
-persistent kernel, skill authoring, document extraction, other tools, and the compressor's skill, session-log and
-memory-provider sections. See THIRD_PARTY_NOTICES.md.
+iteration-cap request, the compaction summary prefix and checkpoint prompt (agent/context_compressor.py), the
+session title prompt (agent/title_generator.py), the memory-review prompt (agent/background_review.py) and the
+eight tool schemas as model_tools sends them. Edits remove
+what keel does not have: background processes, a persistent kernel, skill authoring, document extraction, other
+tools, and the compressor's skill, session-log and
+memory-provider sections. The memory guidance and its tool schema are keel's, and memory is not one of the
+eight tools in TOOL_ORDER. See THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations
@@ -29,5 +32,7 @@ def text(name: str) -> str:
 
 
 @lru_cache(maxsize=None)
-def tool_definitions() -> tuple[dict, ...]:
-    return tuple(json.loads((_DIR / "tools" / f"{name}.json").read_text(encoding="utf-8")) for name in TOOL_ORDER)
+def tool_definitions(names: tuple[str, ...] | None = None) -> tuple[dict, ...]:
+    """The sandbox tools, in TOOL_ORDER, unless `names` lists a subset (memory is opt-in and not in that order)."""
+    chosen = TOOL_ORDER if names is None else names
+    return tuple(json.loads((_DIR / "tools" / f"{name}.json").read_text(encoding="utf-8")) for name in chosen)

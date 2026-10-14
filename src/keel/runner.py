@@ -8,12 +8,13 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import logging
 import time
-from typing import Callable
+from typing import Awaitable, Callable
 
 from keel import prompts
 from keel import compress
 from keel.compactor import Compactor, SessionContext
 from keel.compress import Boundaries
+from keel.memory import snapshot as memory_snapshot
 from keel.models import (
     Completed, ImagePart, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
     part_from_dict,
@@ -24,7 +25,9 @@ from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy
 from keel.skills import discover_skills
 from keel.store.base import Event, Run, StoredMessage, TitleInUse
-from keel.titles import derive_title, title_candidates
+from keel.titles import (
+    MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
+)
 from keel.tools import ToolContext, ToolOutcome, run_tool
 from keel.tools.base import preview_for
 
@@ -64,7 +67,7 @@ class _Turn:
     context: SessionContext
     tools: tuple[dict, ...]
     window: int
-    rebuild: Callable[[], str]
+    rebuild: Callable[[], Awaitable[str]]
     blobs: dict = field(default_factory=dict)  # image bytes loaded during this run, by blob id
 
 
@@ -80,11 +83,16 @@ class RunExecutor:
     def __init__(self, store, bus, providers: ProviderRegistry, *, sandbox=None, sleep=asyncio.sleep,
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None, kill_timeout_s: float = 10.0,
                  skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC),
-                 compression_threshold: float = 0.75) -> None:
+                 compression_threshold: float = 0.75, background=None, memory_chars: int = 2200,
+                 user_chars: int = 1375, memory_review_turns: int = 10) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
         self.sandbox = sandbox
+        self.background = background
+        self.memory_chars = memory_chars
+        self.user_chars = user_chars
+        self.memory_review_turns = memory_review_turns
         self.max_iterations = max_iterations
         self.mount_root = mount_root
         self.kill_timeout_s = kill_timeout_s
@@ -262,17 +270,33 @@ class RunExecutor:
                 except SandboxError as exc:
                     raise RunFailure("sandbox_unavailable", str(exc)) from exc
             ctx = ToolContext(self.sandbox, sandbox, cwd=(session.cwd if session and session.cwd else policy.workdir),
-                              skills=tuple(skills), on_exec=self._exec_recorder(run, state))
+                              skills=tuple(skills), on_exec=self._exec_recorder(run, state), store=self.store,
+                              profile_id=run.profile_id, session_id=run.session_id, memory_chars=self.memory_chars,
+                              user_chars=self.user_chars)
+        names: list[str] = []
+        if ctx is not None:
+            names.extend(prompts.TOOL_ORDER)
+        if profile is not None and profile.memory:
+            names.append("memory")
+        if ctx is None and names:
+            cwd = session.cwd if session and session.cwd else "/"
+            ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id, session_id=run.session_id,
+                              memory_chars=self.memory_chars, user_chars=self.user_chars)
         saved_cwd = ctx.cwd if ctx else None
 
-        def rebuild() -> str:
-            return build_system_prompt(soul=profile.soul if profile else "", model=run.model, provider=run.provider,
-                                       now=self._now(), tools=ctx is not None, skills=skills,
-                                       workdir=policy.workdir if policy else None)
+        async def rebuild() -> str:
+            snapshot = ""
+            if profile is not None and profile.memory:
+                entries = await self.store.memory_entries(run.profile_id)
+                snapshot = memory_snapshot(entries["memory"], entries["user"])
+            return build_system_prompt(
+                soul=profile.soul if profile else "", model=run.model, provider=run.provider, now=self._now(),
+                tools=bool(names), skills=skills, workdir=policy.workdir if policy else None,
+                memory=bool(profile and profile.memory), memory_snapshot=snapshot)
 
         system = session.system_prompt if session else None
         if system is None:
-            system = (await self.store.set_session_prompt(run.session_id, rebuild(), run.provider,
+            system = (await self.store.set_session_prompt(run.session_id, await rebuild(), run.provider,
                                                           run.model)).system_prompt
         stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
@@ -290,7 +314,7 @@ class RunExecutor:
             anchor_id=session.context_message_id if session else None,
             failed_at=session.compaction_failed_at if session else None)
         turn = _Turn(provider=provider, stored=stored, context=context,
-                     tools=prompts.tool_definitions() if ctx is not None else (),
+                     tools=prompts.tool_definitions(tuple(names)) if names else (),
                      window=provider.capabilities(run.model).context_window, rebuild=rebuild)
         for iteration in range(self.max_iterations + 1):
             final = iteration == self.max_iterations and bool(turn.tools)
@@ -310,6 +334,7 @@ class RunExecutor:
                 await self._finish(run, "completed", output=output, usage=state.usage, event="run.completed",
                                    data={"output": output, "usage": state.usage.to_dict(),
                                          **({"incomplete": True} if incomplete else {})})
+                await self._after_complete(run, profile)
                 return
             for call in calls:
                 outcome, duration, preview = await self._call_tool(run, call, ctx, state)
@@ -454,10 +479,55 @@ class RunExecutor:
         title = derive_title(user.text)
         if not title:
             return
-        for candidate in title_candidates(title):
+        for candidate in title_candidates(title, limit=TITLE_LIMIT):
             try:
                 await self.store.set_title(run.profile_id, run.session_id, candidate, "derived")
                 return
             except TitleInUse:
                 continue
-        # Ten sessions already share this title; the model title (M3) will name this one.
+
+    async def _after_complete(self, run: Run, profile) -> None:
+        """A completed run may be renamed, and every memory_review_turns runs may start a memory review."""
+        await self._maybe_title(run)
+        if profile is not None and profile.memory and self.background is not None:
+            if await self.store.note_memory_turn(run.session_id, self.memory_review_turns):
+                from keel.review import claim, release, run_review
+                if claim(run.profile_id):
+                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}"):
+                        release(run.profile_id)
+
+    async def _maybe_title(self, run: Run) -> None:
+        """After the first completed run, ask the model to name a session that still has a derived title."""
+        if self.background is None:
+            return
+        session = await self.store.get_session(run.profile_id, run.session_id)
+        if session is None or session.title_source in ("user", "llm"):
+            return
+        earlier = await self.store.completed_run_count(run.session_id, except_id=run.id)
+        if earlier:
+            return
+        text = " ".join(part.get("text", "") for part in run.input if part.get("type") == "text")[:TITLE_INPUT_CHARS]
+        if not text.strip():
+            return
+        self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}")
+
+    async def _title(self, run: Run, text: str) -> None:
+        """One model call, no tools and no events. A bad reply or a provider error leaves the derived title."""
+        provider = self.providers.get(run.provider)
+        request = ModelRequest(
+            provider=run.provider, model=run.model, system=prompts.text("title"),
+            messages=(Message("user", (TextPart(text),)),), tools=(), reasoning_effort="low",
+            max_output_tokens=512, cache_scope="")
+        chunks: list[str] = []
+        async for event in stream_with_retries(provider, request, sleep=self._sleep):
+            if isinstance(event, TextDelta):
+                chunks.append(event.text)
+        title = parse_model_title("".join(chunks))
+        if not title:
+            return
+        for candidate in title_candidates(title, limit=MODEL_TITLE_LIMIT):
+            try:
+                await self.store.set_title(run.profile_id, run.session_id, candidate, "llm")
+                return
+            except TitleInUse:
+                continue
