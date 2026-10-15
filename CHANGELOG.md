@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0-rc.1] - 2026-10-15
+
 ### Added
 - Tenant-bound service keys with signed 32-bit integer tenant IDs (0 and negatives included) (`KEEL_API_KEYS`, or
   `KEEL_API_KEY` plus `KEEL_API_KEY_TENANT`). Migration 4 records tenant ownership of profiles; an existing database
@@ -83,6 +85,7 @@ All notable changes to this project are documented here. The format follows
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.1...HEAD
+[0.3.0-rc.1]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0-rc.1
 [0.2.0]: https://github.com/ryang420/agent-keel/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ryang420/agent-keel/releases/tag/v0.1.0
