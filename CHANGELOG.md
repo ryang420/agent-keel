@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- A model call that receives no data for `KEEL_MODEL_STALL_SECONDS` (default 180, previously a fixed 600) now fails
+  as `timeout` and is retried if it had streamed nothing. A stalled Bedrock Mantle stream had held a run for the full
+  ten minutes.
+
 ## [0.3.0-rc.1] - 2026-10-15
 
 ### Added

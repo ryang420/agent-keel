@@ -45,6 +45,7 @@ See [sandbox.md](sandbox.md) for the profile's sandbox policy.
 | `KEEL_OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL of the OpenAI-compatible Responses server (`/responses` is appended). Must start with `http://` or `https://`; plain `http://` logs a warning because the key travels in clear text. |
 | `KEEL_OPENAI_COMPAT` | unset | `1`, `true` or `yes` omits `include`, `prompt_cache_key` and `reasoning.summary` from requests, for strict servers such as vLLM, LiteLLM or Ollama. |
 | `KEEL_OPENAI_CONTEXT_WINDOW` | `128000` | Context window the `openai` provider reports. |
+| `KEEL_MODEL_STALL_SECONDS` | `180` | Seconds a model call may go without receiving any data (to connect allows 10 s). Past that the call fails with `timeout`; if it had streamed nothing yet it is retried, up to three attempts in all. Applies to every provider. Positive. |
 
 See [providers.md](providers.md).
 

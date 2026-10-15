@@ -175,3 +175,10 @@ def test_memory_limits_default_and_must_be_positive():
     assert (custom.memory_review_turns, custom.memory_chars, custom.user_chars) == (3, 100, 80)
     with pytest.raises(ValueError, match="KEEL_USER_CHARS"):
         Settings.from_env({**BASE, "KEEL_USER_CHARS": "0"})
+
+
+def test_the_model_stall_timeout_defaults_to_three_minutes_and_must_be_positive():
+    assert Settings.from_env(BASE).model_stall_seconds == 180.0
+    assert Settings.from_env({**BASE, "KEEL_MODEL_STALL_SECONDS": "45"}).model_stall_seconds == 45.0
+    with pytest.raises(ValueError, match="KEEL_MODEL_STALL_SECONDS"):
+        Settings.from_env({**BASE, "KEEL_MODEL_STALL_SECONDS": "0"})

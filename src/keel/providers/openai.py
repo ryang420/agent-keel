@@ -9,7 +9,7 @@ from typing import AsyncIterator
 import httpx
 
 from keel.models import ModelEvent, ModelRequest
-from keel.providers.base import Capabilities, ModelError
+from keel.providers.base import DEFAULT_STALL_SECONDS, Capabilities, ModelError
 from keel.providers.responses import ResponsesTransport
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -24,7 +24,7 @@ OPENAI_CAPABILITIES = Capabilities(context_window=DEFAULT_CONTEXT_WINDOW, vision
 
 class OpenAIProvider:
     def __init__(self, api_key: str, *, base_url: str = DEFAULT_BASE_URL, name: str = "openai",
-                 client: httpx.AsyncClient | None = None, timeout: float = 600.0, compat: bool = False,
+                 client: httpx.AsyncClient | None = None, timeout: float = DEFAULT_STALL_SECONDS, compat: bool = False,
                  context_window: int = DEFAULT_CONTEXT_WINDOW) -> None:
         self.name = name
         self._key = api_key
