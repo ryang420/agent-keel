@@ -114,7 +114,7 @@ class Compactor:
         """The summary text and the call's usage; the text is empty when the summary was cut at the output limit,
         so a truncated summary is never stored."""
         text, usage, incomplete = [], Usage(), False
-        async for event in stream_with_retries(provider, request, sleep=self._sleep):
+        async for event in stream_with_retries(provider, request, sleep=self._sleep, context="compaction summary"):
             if isinstance(event, TextDelta):
                 text.append(event.text)
             elif isinstance(event, Completed):

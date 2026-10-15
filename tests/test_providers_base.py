@@ -82,3 +82,25 @@ def test_model_error_carries_code_and_message():
     assert (error.code, str(error), error.retry_after) == ("rate_limited", "slow down", 3.0)
     with pytest.raises(ValueError):
         ModelError("nonsense", "x")
+
+
+async def test_a_retry_is_logged_with_its_reason_attempt_and_delay(caplog):
+    caplog.set_level("INFO", logger="keel.providers.retry")
+    provider = FakeProvider(script=[[ModelError("timeout", "The model sent no response event for 60 s.")],
+                                    [TextDelta("hi"), Completed(Usage(1, 1, 0, 0))]])
+    await collect(provider, rng=lambda: 0.0, context="run r1")
+    [record] = [r for r in caplog.records if r.name == "keel.providers.retry"]
+    assert record.levelname == "WARNING"
+    message = record.getMessage()
+    for part in ("run r1", "fake/m", "timeout", "no response event for 60 s", "attempt 1/3", "retrying in 5.0 s"):
+        assert part in message
+
+
+async def test_giving_up_after_the_last_attempt_is_logged(caplog):
+    caplog.set_level("INFO", logger="keel.providers.retry")
+    provider = FakeProvider(script=[[ModelError("timeout", "slow")]] * 3)
+    with pytest.raises(ModelError):
+        await collect(provider, context="run r2")
+    records = [r for r in caplog.records if r.name == "keel.providers.retry"]
+    assert [r.levelname for r in records] == ["WARNING", "WARNING", "ERROR"]
+    assert "run r2" in records[-1].getMessage() and "giving up after 3 attempts" in records[-1].getMessage()
