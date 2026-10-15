@@ -5,7 +5,8 @@ import time
 import pytest
 
 from keel.sandbox import base
-from keel.sandbox.base import TIMEOUT_EXIT_CODE, Mount, PolicyError, parse_policy
+from keel.sandbox.base import (TIMEOUT_EXIT_CODE, Mount, PolicyError, parse_policy, private_mount_conflict,
+                               profile_mount_root)
 from keel.sandbox.local import LocalSandbox
 
 
@@ -13,7 +14,7 @@ def test_a_full_policy_parses():
     policy = parse_policy({
         "image": "img:1", "workdir": "/work", "runtime": "runsc", "network": "net",
         "mounts": [{"source": "/host/a", "target": "/a", "read_only": True}], "env": {"B": "2", "A": "1"},
-        "user": "1000:1000", "cpus": 1.5, "memory_mb": 512, "pids_limit": 64, "skills_path": "/skills"})
+        "user": "1000:1000", "cpus": 1.5, "memory_mb": 512, "pids_limit": 64, "skills_path": "/skills"}, "/")
     assert policy.mounts == (Mount("/host/a", "/a", True),)
     assert policy.env == (("A", "1"), ("B", "2"))
     assert (policy.cpus, policy.memory_mb, policy.pids_limit) == (1.5, 512, 64)
@@ -47,6 +48,62 @@ def test_mount_sources_can_be_confined_to_a_root():
         parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": "/etc", "target": "/x"}]}, "/srv")
     with pytest.raises(PolicyError, match="under /srv"):
         parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": "/srv/../etc", "target": "/x"}]}, "/srv")
+
+
+def test_mounts_require_a_profile_specific_root(tmp_path):
+    root = tmp_path / "mounts"
+    p1 = profile_mount_root(str(root), "p1")
+    p2 = profile_mount_root(str(root), "p2")
+    assert p1 != p2
+    parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": p1 + "/data", "target": "/data"}]}, p1)
+    with pytest.raises(PolicyError, match="mount root"):
+        parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": p1, "target": "/data"}]})
+    with pytest.raises(PolicyError, match="under"):
+        parse_policy({"image": "i", "workdir": "/w", "mounts": [{"source": p2, "target": "/data"}]}, p1)
+
+
+def test_nested_mounts_are_refused_even_for_one_profile(tmp_path):
+    root = str(tmp_path / "p1")
+    with pytest.raises(PolicyError, match="overlap"):
+        parse_policy({"image": "i", "workdir": "/w", "mounts": [
+            {"source": root + "/parent", "target": "/parent"},
+            {"source": root + "/parent/child", "target": "/data"}]}, root)
+
+
+def test_private_mounts_may_not_overlap_another_profile():
+    def policy(source, read_only=False):
+        return parse_policy({"image": "i", "workdir": "/work", "mounts": [
+            {"source": source, "target": "/data", "read_only": read_only}]}, "/")
+
+    assert private_mount_conflict(policy("/data/one/child"), [policy("/data/one")]) is not None
+    assert private_mount_conflict(policy("/data/one", True), [policy("/data/one")]) is not None
+    assert private_mount_conflict(policy("/data/one"), [policy("/data/one", True)]) is not None
+    assert private_mount_conflict(policy("/data/one", True), [policy("/data/one", True)]) is not None
+    assert private_mount_conflict(policy("/data/one"), [policy("/data/one-other")]) is None
+
+
+def test_private_mounts_detect_a_host_symlink_alias(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(private, target_is_directory=True)
+
+    def policy(source):
+        return parse_policy({"image": "i", "workdir": "/work", "mounts": [
+            {"source": str(source), "target": "/data"}]}, "/")
+
+    assert private_mount_conflict(policy(alias), [policy(private)]) is not None
+
+
+def test_mount_root_checks_the_resolved_host_path(tmp_path):
+    root = tmp_path / "root"
+    private = tmp_path / "private"
+    root.mkdir()
+    private.mkdir()
+    (root / "alias").symlink_to(private, target_is_directory=True)
+    with pytest.raises(PolicyError, match="under"):
+        parse_policy({"image": "i", "workdir": "/work", "mounts": [
+            {"source": str(root / "alias"), "target": "/data"}]}, str(root))
 
 
 @pytest.fixture
@@ -131,7 +188,7 @@ async def test_a_missing_program_is_exit_127(local):
 ])
 def test_unsafe_policies_are_refused(data, message):
     with pytest.raises(PolicyError, match=message):
-        parse_policy(data)
+        parse_policy(data, "/")
 
 
 async def test_large_stdin_does_not_deadlock_a_streaming_command(local):

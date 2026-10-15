@@ -28,8 +28,16 @@ class TitleInUse(StoreError):
     pass
 
 
+class ProfileTenantMismatch(StoreError):
+    pass
+
+
 class UniqueViolation(Exception):
     """Raised by a Db adapter when a unique constraint rejects a write."""
+
+
+class OwnershipError(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -41,6 +49,7 @@ class Profile:
     skills: list[str]
     updated_at: float
     memory: bool = False
+    tenant_id: int | None = None
 
 
 @dataclass(frozen=True)

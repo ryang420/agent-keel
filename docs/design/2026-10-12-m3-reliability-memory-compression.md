@@ -6,8 +6,9 @@ sessions and multi-instance deployments safe: faults are survived and tested, se
 long-term memory, and a conversation can outgrow the model's context window. Tenant ownership and authorization
 are explicit, while every profile keeps its own runtime state (§12).
 
-Status: draft. Tenant/profile isolation requirements agreed on 2026-10-14 and added to M3; §12 describes the
-required behavior, not an already implemented capability.
+Status: implemented, pending acceptance. Tenant/profile isolation requirements agreed on 2026-10-14 are
+implemented in keel; §12 remains the acceptance contract. The consumer's account-authorization and quality checks,
+the live long-session eval, and a deployment cutover rehearsal are required before a real-user pilot.
 
 ## Goal and gate
 
@@ -99,8 +100,10 @@ SQLite and for Postgres. Version 1 is the 0.2.0 schema exactly as released; vers
 
 - **Version table.** `schema_version (version INTEGER NOT NULL)`, one row.
 - **At start.** `open_store` reads the version and applies every newer migration in order, each in its own
-  transaction that also writes the new version. On Postgres the whole pass runs under the advisory lock the schema
-  already uses, so instances starting together migrate once. On SQLite the transaction is `BEGIN IMMEDIATE`.
+  transaction that also writes the new version. Service startup wraps the migration pass and tenant ownership
+  backfill in one outer transaction, so invalid cutover input rolls all of it back. On Postgres the pass runs under
+  the advisory lock the schema already uses, so instances starting together migrate once. On SQLite the transaction
+  is `BEGIN IMMEDIATE`.
 - **Three starting states.** An empty database applies every migration from version 1, so a fresh database and an
   upgraded one go through the same code. A database with keel's tables but no `schema_version` is a 0.2.0 database
   and is treated as version 1. A version newer than the code knows makes the service refuse to start: a downgrade
@@ -432,8 +435,9 @@ tenant B -> account profile B -> sessions, runs, memory, sandbox and private fil
 ```
 
 Profiles in the same tenant are independent too. There is no tenant-wide memory, shared knowledge store or shared
-user-file directory. Public model configuration, base sandbox images and read-only deployment skills may be
-reused; they must contain no profile's private state. Profile ownership is immutable through the runtime API.
+user-file directory. Public model configuration, base sandbox images and read-only deployment skills packaged in
+those images may be reused; they must contain no profile's private state. Profile ownership is immutable through
+the runtime API.
 Changing tenant means using another profile; it never continues the old identity's session or reassigns its data.
 
 ### Consumer and runtime responsibilities
@@ -463,10 +467,11 @@ profile. IDs are locators, never evidence of permission.
 
 ### Stored ownership and execution
 
-Add `tenants` with a stable primary key and `profiles.tenant_id` referencing it, with an index for tenant-scoped
-lookups. Retain globally unique internal profile and session IDs; adding tenant ownership does not silently make
-existing IDs tenant-local. If a consumer has tenant-local account or conversation IDs, its adapter maps the full
-scoped identity to distinct keel IDs. A naming convention alone is not authorization.
+Add `tenants` with a signed 32-bit integer primary key (any value from −2³¹ to 2³¹−1, including 0, so a consumer's own
+tenant IDs are used unchanged) and `profiles.tenant_id` of the same integer type referencing it, with an index for
+tenant-scoped lookups. Retain globally unique internal profile and session IDs; adding tenant ownership does not
+silently make existing IDs tenant-local. If a consumer has tenant-local account or conversation IDs, its adapter maps
+the full scoped identity to distinct keel IDs. A naming convention alone is not authorization.
 
 Sessions and runs retain their profile ownership; messages, events and blobs are reached through that ownership
 chain. Memory remains keyed by profile. Every API-to-store operation uses validated ownership, and all resource
@@ -475,10 +480,16 @@ unverified caller field. The executor, title generation, memory review, compress
 that scope after the HTTP request ends. Internal maintenance can scan multiple tenants, but each action must use
 the persisted resource's own profile and sandbox.
 
-Keep containers, writable directories, private mounts, tool credentials and any private caches separate per
-profile, even within one tenant. Provisioning must not bind two profiles to the same private host directory or
-give one profile credentials capable of reading another's private data. Container naming alone does not enforce
-this. Deployment-owned public read-only assets are the only shared mounts in this design. Infrastructure model
+Keep containers, writable directories, mounts, tool credentials and any private caches separate per profile, even
+within one tenant. Provisioning must not bind two profiles to the same host directory, including read-only mounts,
+or give one profile credentials capable of reading another's private data. Container naming alone does not enforce
+this. A bind mount is permitted only under the deployment-owned `KEEL_SANDBOX_MOUNT_ROOT/<sha256(profile_id)>`;
+without the root setting, bind mounts are refused. The operator creates and protects each profile directory. A
+profile cannot mount another profile's directory or both a host directory and its descendant. The source is checked
+again when a container is created, so a path retargeted after `PUT` cannot expose another profile. Once a profile
+has mounts, its mount list cannot be changed through `PUT`: an older live container could
+otherwise retain a removed mount while another profile claims the path. Public skills may be packaged into the
+shared image instead of a shared host mount. Infrastructure model
 provider credentials may remain service-wide; they are not exposed as sandbox tool credentials. Tenant ownership
 does not change the existing sandbox hardening or the requirement for deployment-enforced network access policy.
 
@@ -487,7 +498,7 @@ does not change the existing sandbox hardening or the requirement for deployment
 Use the next numbered migration after those already present. Preserve existing profile and session IDs, messages,
 runs, blobs, memory, and their sandbox/file associations. Do not edit migrations 1–3 or recreate the database.
 
-For an existing database, require an explicit operator-provided assignment of every existing profile to a tenant.
+For an existing database, require an explicit operator-provided assignment of every existing profile to an integer tenant ID.
 A single-tenant installation may explicitly assign all profiles to one named tenant; never infer assignments from
 an email, an ID prefix or the natural person behind an account. Validate coverage, tenant references and conflicting
 assignments before applying the backfill transaction. An incomplete or conflicting mapping leaves the database

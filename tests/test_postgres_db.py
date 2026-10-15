@@ -19,7 +19,7 @@ async def test_instances_starting_together_do_not_race_on_the_schema():
     url = os.environ["KEEL_TEST_POSTGRES_DSN"]
     conn = await asyncpg.connect(url)
     await conn.execute("DROP TABLE IF EXISTS schema_version, memories, run_events, runs, messages, sessions, "
-                       "profiles, blobs")
+                       "profiles, tenants, blobs")
     await conn.close()
     stores = await asyncio.gather(*(open_store(url) for _ in range(6)))
     for store in stores:

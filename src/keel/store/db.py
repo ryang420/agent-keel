@@ -38,6 +38,8 @@ class SqliteDb:
     async def connect(cls, path: str) -> "SqliteDb":
         conn = await aiosqlite.connect(path)
         conn.row_factory = aiosqlite.Row
+        # foreign_keys is ignored inside a transaction, so it is set and committed with journal_mode.
+        await conn.execute("PRAGMA foreign_keys=ON")
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.commit()
         return cls(conn)

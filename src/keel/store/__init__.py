@@ -6,12 +6,14 @@ import time
 from typing import Callable
 
 from keel.store.db import SqliteDb
+from keel.store.ownership import require_tenant_ownership
 from keel.store.sql import SqlStore
 
 
 async def open_store(url: str, clock: Callable[[], float] = time.time, *,
-                     command_timeout: float | None = None) -> SqlStore:
-    """`command_timeout` bounds every Postgres query; SQLite ignores it."""
+                     command_timeout: float | None = None, tenant_ids: tuple[int, ...] | None = None,
+                     tenant_backfill: dict[str, int] | None = None) -> SqlStore:
+    """Open the store; service startup migrates and enforces ownership atomically when tenant_ids are provided."""
     if url.startswith("sqlite:///"):
         db = await SqliteDb.connect(url[len("sqlite:///"):])
     elif url.startswith(("postgresql://", "postgres://")):
@@ -23,7 +25,12 @@ async def open_store(url: str, clock: Callable[[], float] = time.time, *,
         raise ValueError(f"unsupported database URL: {url.split(':', 1)[0]}")
     store = SqlStore(db, clock=clock)
     try:
-        await store.init()
+        if tenant_ids is None:
+            await store.init()
+        else:
+            async with db.transaction():
+                await store.init()
+                await require_tenant_ownership(db, tenant_ids, tenant_backfill or {})
     except BaseException:
         await store.close()
         raise

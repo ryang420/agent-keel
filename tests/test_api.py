@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from keel.api import Keel, create_app
+from keel.config import ServiceCredential
 from keel.events import InMemoryEventBus
 from keel.models import TextDelta
 from keel.providers.base import Capabilities, ProviderRegistry
@@ -25,7 +26,8 @@ async def service(store):
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, registry)
     pool = WorkerPool(store, bus, executor, owner="w1", workers=2, poll_seconds=0.01)
-    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key="test-key", max_running=2)
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
+                credentials=(ServiceCredential(1, "test-key"),), max_running=2)
     app = create_app(keel)
     await pool.start()
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel", headers=AUTH)
@@ -57,6 +59,14 @@ async def test_health_is_open_and_everything_else_needs_the_key(service):
     wrong = await bare.get("/v1/profiles/p1/sessions", headers={"Authorization": "Bearer nope"})
     assert wrong.status_code == 401
     await bare.aclose()
+
+
+async def test_host_mounts_need_a_configured_profile_root(service):
+    client, _, store = service
+    response = await client.put("/v1/profiles/p1", json={**PROFILE, "sandbox": {
+        "image": "python:3.12-slim", "workdir": "/work", "mounts": [{"source": "/", "target": "/host"}]}})
+    assert response.status_code == 400
+    assert await store.get_profile("p1") is None
 
 
 async def test_a_run_completes_streams_and_is_stored(service):
@@ -396,7 +406,7 @@ async def test_no_blob_is_left_behind_when_a_later_step_fails(service, monkeypat
     image = {"type": "image", "media_type": "image/png", "data": PNG}
     with pytest.raises(RuntimeError):
         await send(client, text=[image, image])
-    assert await store.get_blobs(stored) == {}
+    assert await store.get_blobs(stored, profile_id="p1", session_id="chat-1") == {}
     monkeypatch.undo()
 
     async def create_fails(**kwargs):
@@ -412,7 +422,7 @@ async def test_no_blob_is_left_behind_when_a_later_step_fails(service, monkeypat
     monkeypatch.setattr(store, "put_blob", recording_put)
     with pytest.raises(RuntimeError):
         await send(client, text=[image])
-    assert puts and await store.get_blobs(puts) == {}
+    assert puts and await store.get_blobs(puts, profile_id="p1", session_id="chat-1") == {}
 
 
 async def test_profile_memory_is_a_boolean_and_omitted_means_false(service):
@@ -435,3 +445,31 @@ async def test_the_stream_of_a_pruned_run_closes_at_once(service):
     assert await store.prune_events(store.clock() - 7 * 86_400) > 0
     response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 2)
     assert response.status_code == 200 and response.text == ""
+
+
+async def test_either_bound_key_is_accepted_and_an_unbound_key_is_not(store):
+    from keel.config import ServiceCredential
+    provider = FakeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    bus = InMemoryEventBus()
+    executor = RunExecutor(store, bus, registry)
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
+                credentials=(ServiceCredential(1, "key-a"), ServiceCredential(2, "key-b")),
+                max_running=2)
+    app = create_app(keel)
+    transport = httpx.ASGITransport(app=app)
+
+    async def call(key, **headers):
+        client = httpx.AsyncClient(transport=transport, base_url="http://keel",
+                                   headers={"Authorization": f"Bearer {key}", **headers})
+        response = await client.get("/v1/profiles/p1/sessions")
+        await client.aclose()
+        return response
+
+    owned = await call("key-a")
+    assert owned.status_code == 404 and owned.json()["error"]["code"] == "profile_not_found"
+    other = await call("key-b", **{"X-Tenant-Id": "1"})
+    assert other.status_code == 404 and other.json()["error"]["code"] == "profile_not_found"
+    denied = await call("nope")
+    assert denied.status_code == 401 and denied.json()["error"]["code"] == "unauthorized"

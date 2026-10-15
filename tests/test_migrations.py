@@ -1,15 +1,21 @@
 import asyncio
 from contextlib import closing
+import json
 import os
+import shutil
 import sqlite3
 
 import pytest
 
+from keel.config import ServiceCredential, Settings
+from keel.service import build
+from keel.sandbox.base import parse_policy, profile_mount_root
 from keel.store import migrations, open_store
+from keel.store.base import OwnershipError
 from keel.store.db import SqliteDb
 from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
 
-ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, blobs"
+ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, blobs"
 BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("KEEL_TEST_POSTGRES_DSN") else [])
 needs_postgres = pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"),
                                     reason="needs KEEL_TEST_POSTGRES_DSN")
@@ -162,6 +168,99 @@ async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_
         await fresh.close()
 
 
+async def test_invalid_tenant_cutover_does_not_change_the_old_database(db_url):
+    await run_script(db_url, v020_script(db_url) + SEED)
+    db = await connect(db_url)
+    try:
+        before = await schema_shape(db)
+    finally:
+        await db.close()
+    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=db_url, sandbox="none")
+    with pytest.raises(OwnershipError, match="BACKFILL"):
+        await build(settings)
+    db = await connect(db_url)
+    try:
+        assert await schema_version(db) == 1
+        assert await schema_shape(db) == before
+        assert (await db.fetchrow("SELECT soul FROM profiles WHERE id = ?", "p1"))["soul"] == "You help."
+    finally:
+        await db.close()
+
+
+async def test_complete_tenant_cutover_preserves_old_data_and_matches_fresh_schema(db_url):
+    await run_script(db_url, v020_script(db_url) + SEED + """
+        INSERT INTO blobs (id, profile_id, session_id, media_type, data, created_at)
+        VALUES ('b1', 'p1', 's1', 'image/png', 'aGVsbG8=', 1);
+    """)
+    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=db_url, sandbox="none",
+                        tenant_backfill={"p1": 1})
+    keel, _pool, closables, _backend = await build(settings)
+    try:
+        store = keel.store
+        assert (await store.get_profile("p1")).tenant_id == 1
+        assert (await store.get_session("p1", "s1")).title == "Old chat"
+        assert [message.message.text for message in await store.messages("s1")] == ["hello"]
+        assert (await store.get_run_by_id("run_1")).status == "completed"
+        assert [event.type for event in await store.events_after("run_1", 0)] == ["run.completed"]
+        assert (await store.db.fetchrow("SELECT data FROM blobs WHERE id = ?", "b1"))["data"] == "aGVsbG8="
+        upgraded = await schema_shape(store.db)
+    finally:
+        for item in closables:
+            await (getattr(item, "aclose", None) or getattr(item, "close"))()
+    fresh_url = await empty_database(db_url)
+    fresh_settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=fresh_url, sandbox="none")
+    fresh, _pool, closables, _backend = await build(fresh_settings)
+    try:
+        assert await schema_shape(fresh.store.db) == upgraded
+    finally:
+        for item in closables:
+            await (getattr(item, "aclose", None) or getattr(item, "close"))()
+
+
+async def test_stopped_service_cutover_preserves_a_legacy_mount_and_its_file(db_url, tmp_path):
+    await run_script(db_url, v020_script(db_url) + SEED)
+    old = tmp_path / "legacy-p1"
+    old.mkdir()
+    (old / "marker.txt").write_text("kept")
+    root = tmp_path / "mounts"
+    root.mkdir()
+    new = tmp_path / "mounts" / os.path.basename(profile_mount_root(str(root), "p1"))
+    old_policy = {"image": "python:3.12-slim", "workdir": "/work", "mounts": [
+        {"source": str(old), "target": "/private"}]}
+    db = await connect(db_url)
+    try:
+        await db.execute("UPDATE profiles SET sandbox = ? WHERE id = ?", json.dumps(old_policy), "p1")
+    finally:
+        await db.close()
+
+    # With old instances stopped, the operator copies and verifies files before changing the stored source.
+    shutil.copytree(old, new)
+    assert (new / "marker.txt").read_bytes() == (old / "marker.txt").read_bytes()
+    new_policy = {**old_policy, "mounts": [{"source": str(new), "target": "/private"}]}
+    db = await connect(db_url)
+    try:
+        async with db.transaction():
+            await db.execute("UPDATE profiles SET sandbox = ? WHERE id = ? AND sandbox = ?",
+                             json.dumps(new_policy), "p1", json.dumps(old_policy))
+    finally:
+        await db.close()
+
+    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=db_url, sandbox="none",
+                        sandbox_mount_root=str(root), tenant_backfill={"p1": 1})
+    keel, _pool, closables, _backend = await build(settings)
+    try:
+        profile = await keel.store.get_profile("p1")
+        policy = parse_policy(profile.sandbox, profile_mount_root(str(root), "p1"))
+        assert policy.mounts[0].source == str(new)
+        assert (new / "marker.txt").read_text() == "kept"
+        assert (old / "marker.txt").read_text() == "kept"  # leave the original until cutover is verified
+        assert (await keel.store.get_session("p1", "s1")).title == "Old chat"
+        assert [message.message.text for message in await keel.store.messages("s1")] == ["hello"]
+    finally:
+        for item in closables:
+            await (getattr(item, "aclose", None) or getattr(item, "close"))()
+
+
 async def test_opening_again_changes_nothing(db_url):
     first = await open_store(db_url)
     await first.ensure_session("p1", "s1")
@@ -273,3 +372,38 @@ async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
         assert session.pruned_id is None
     finally:
         await store.close()
+
+
+async def test_migration_4_keeps_existing_profiles_unowned(db_url):
+    store = await open_store(db_url)
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
+    await store.db.execute("UPDATE schema_version SET version = 3")
+    # SQLite refuses DROP COLUMN while profiles_tenant still indexes tenant_id.
+    await store.db.execute("DROP INDEX IF EXISTS profiles_tenant")
+    await store.db.execute("ALTER TABLE profiles DROP COLUMN tenant_id")
+    await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == 4
+        profile = await upgraded.get_profile("p1")
+        assert profile.soul == "kept" and profile.tenant_id is None
+        assert await upgraded.db.fetchrow("SELECT id FROM tenants") is None
+        columns = await schema_shape(upgraded.db)
+        assert "tenants" in columns["columns"]
+        assert "profiles_tenant" in columns["indexes"]
+        if upgraded.db.dialect == "sqlite":
+            tenant_type = await upgraded.db.fetchrow(
+                "SELECT type FROM pragma_table_info('tenants') WHERE name = 'id'")
+            owner_type = await upgraded.db.fetchrow(
+                "SELECT type FROM pragma_table_info('profiles') WHERE name = 'tenant_id'")
+            assert tenant_type["type"] == owner_type["type"] == "INTEGER"
+        else:
+            tenant_type = await upgraded.db.fetchrow(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'tenants' AND column_name = 'id'")
+            owner_type = await upgraded.db.fetchrow(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'profiles' AND column_name = 'tenant_id'")
+            assert tenant_type["data_type"] == owner_type["data_type"] == "integer"
+    finally:
+        await upgraded.close()

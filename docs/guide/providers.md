@@ -20,7 +20,7 @@ Any server that implements the Responses API (`POST <base>/responses`, streaming
 registered when `KEEL_OPENAI_API_KEY` (or `OPENAI_API_KEY`) is set.
 
 ```bash
-KEEL_API_KEY=dev KEEL_DATABASE_URL=sqlite:///keel.sqlite3 \
+KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 KEEL_DATABASE_URL=sqlite:///keel.sqlite3 \
 KEEL_OPENAI_API_KEY=<your-key> \
 KEEL_OPENAI_BASE_URL=http://my-server:8000/v1 \
 KEEL_OPENAI_COMPAT=1 \

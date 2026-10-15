@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-keel"
-version = "0.2.0"
+version = "0.3.0rc1"
 description = "A server-side, multi-tenant agent runtime."
 readme = "README.md"
 requires-python = ">=3.12"

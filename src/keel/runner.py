@@ -22,7 +22,7 @@ from keel.models import (
 from keel.prompt import DEFAULT_IDENTITY, build_system_prompt
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.retry import stream_with_retries
-from keel.sandbox.base import PolicyError, SandboxError, parse_policy
+from keel.sandbox.base import PolicyError, SandboxError, parse_policy, profile_mount_root
 from keel.skills import discover_skills
 from keel.store.base import Event, Run, StoredMessage, TitleInUse
 from keel.titles import (
@@ -186,7 +186,7 @@ class RunExecutor:
             try:
                 profile = await self.store.get_profile(run.profile_id)
                 if profile is not None and profile.sandbox:
-                    policy = parse_policy(profile.sandbox, self.mount_root)
+                    policy = parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
                     sandbox = self.sandbox.reference(run.profile_id, policy)
                     await asyncio.wait_for(self.sandbox.kill_tree(sandbox, run.current_exec_id), self.kill_timeout_s)
             except Exception:
@@ -254,7 +254,7 @@ class RunExecutor:
         policy = None
         if self.sandbox is not None and profile is not None and profile.sandbox:
             try:
-                policy = parse_policy(profile.sandbox, self.mount_root)
+                policy = parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
             except PolicyError as exc:
                 raise RunFailure("sandbox_unavailable", f"The sandbox policy is invalid: {exc}") from exc
         ctx, skills = None, []
@@ -365,7 +365,8 @@ class RunExecutor:
         state.usage = state.usage + spent
         retried = False
         while True:
-            messages = await self._with_images([item.message for item in items], turn.blobs)
+            messages = await self._with_images([item.message for item in items], turn.blobs,
+                                               profile_id=run.profile_id, session_id=run.session_id)
             if final:
                 messages.append(Message("user", (TextPart(prompts.MAX_ITERATIONS_REQUEST),)))
             request = ModelRequest(
@@ -452,7 +453,8 @@ class RunExecutor:
                 log.warning("run %s: could not record the current command", run.id, exc_info=True)
         return record
 
-    async def _with_images(self, messages: list[Message], cache: dict) -> list[Message]:
+    async def _with_images(self, messages: list[Message], cache: dict, *,
+                           profile_id: str, session_id: str) -> list[Message]:
         """Load the bytes of stored image references, each once per run; an image whose blob is gone becomes a
         text note."""
         wanted = {part.blob_id for message in messages for part in message.parts
@@ -461,7 +463,7 @@ class RunExecutor:
             return list(messages)
         missing = [blob_id for blob_id in wanted if blob_id not in cache]
         if missing:
-            found = await self.store.get_blobs(missing)
+            found = await self.store.get_blobs(missing, profile_id=profile_id, session_id=session_id)
             cache.update({blob_id: found.get(blob_id) for blob_id in missing})
 
         def load(part):

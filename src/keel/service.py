@@ -36,14 +36,16 @@ def default_providers(settings: Settings) -> ProviderRegistry:
 
 
 async def build(settings: Settings, *, providers: ProviderRegistry | None = None):
-    store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout)
+    store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout,
+                             tenant_ids=tuple(credential.tenant_id for credential in settings.credentials),
+                             tenant_backfill=settings.tenant_backfill)
     bus = PostgresEventBus(settings.database_url) if settings.is_postgres else InMemoryEventBus()
     await bus.start()
     registry = providers or default_providers(settings)
     backend = None
     if settings.sandbox == "docker":
         backend = DockerSandbox(docker=settings.docker, deployment=settings.deployment,
-                                idle_seconds=settings.sandbox_idle_seconds)
+                                idle_seconds=settings.sandbox_idle_seconds, mount_root=settings.sandbox_mount_root)
     background = Background(limit=settings.background_limit)
     executor = RunExecutor(store, bus, registry, sandbox=backend, max_iterations=settings.max_iterations,
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold,
@@ -51,7 +53,7 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
                           memory_review_turns=settings.memory_review_turns)
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
                       lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0)
-    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, api_key=settings.api_key,
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor, credentials=settings.credentials,
                 max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root,
                 background=background)
     return keel, pool, [registry, bus, store], backend

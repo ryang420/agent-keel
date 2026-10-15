@@ -8,7 +8,7 @@ run. You need Docker, `curl`, and either AWS credentials with Bedrock access or 
 From a clone of the repository:
 
 ```bash
-KEEL_API_KEY=dev docker compose -f docker-compose.dev.yml up --build
+KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 docker compose -f docker-compose.dev.yml up --build
 ```
 
 This starts Postgres and keel on `127.0.0.1:8700`. keel calls Bedrock with the AWS profile in `~/.aws`
@@ -20,7 +20,8 @@ it through (an empty key leaves the provider unregistered). Optionally export `K
 compatible server) and `KEEL_OPENAI_COMPAT=1` (strict servers). The `~/.aws` mount is only needed for Bedrock.
 
 Without Docker you can run `pip install -e .` and then
-`KEEL_API_KEY=dev KEEL_DATABASE_URL=sqlite:///keel.sqlite3 python -m keel`; with `KEEL_SANDBOX=none` the agent
+`KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 KEEL_DATABASE_URL=sqlite:///keel.sqlite3 python -m keel`;
+with `KEEL_SANDBOX=none` the agent
 answers without tools.
 
 Check it is up:

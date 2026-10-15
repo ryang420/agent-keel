@@ -41,7 +41,11 @@ Only these keys are accepted; any other key is refused. `image` and `workdir` ar
 | `memory_mb`, `pids_limit` | Whole numbers of at least 1. |
 | `skills_path` | Absolute path inside the container where skills live (see below). |
 
-When `KEEL_SANDBOX_MOUNT_ROOT` is set, each mount `source` must equal that root or be under it.
+Bind mounts require `KEEL_SANDBOX_MOUNT_ROOT`. Each profile's sources must be under a dedicated directory whose
+name is the SHA-256 hex digest of the keel profile ID, directly under that root. For example, an operator can
+compute the directory with `python3 -c 'import hashlib; print(hashlib.sha256(b"p1").hexdigest())'`, create it, and
+give only that profile's sandbox access to it. No profile can mount the common root or another profile's directory.
+Sources within one policy cannot overlap each other, including a directory and its descendant.
 
 ## Image requirements
 
@@ -83,8 +87,15 @@ the local sandbox); otherwise the command runs until its own timeout. The sweep 
 
 The service starts containers by running the docker CLI against the Docker daemon. Giving it the Docker socket is
 **root-equivalent on the host**: anyone who can make the service run arbitrary docker commands controls the host.
-Mitigate by protecting `KEEL_API_KEY`, limiting host mounts with `KEEL_SANDBOX_MOUNT_ROOT`, and running the daemon
-rootless or on a dedicated host where that is an option.
+Mitigate by protecting tenant-bound service keys, limiting host mounts with `KEEL_SANDBOX_MOUNT_ROOT`, and running
+the daemon rootless or on a dedicated host where that is an option.
+
+Host mount paths and tool credentials belong to one profile, including profiles in the same tenant.
+`PUT /v1/profiles/{p}` rejects any mount outside that profile's directory or overlapping another profile's mount,
+including read-only sources.
+After a profile has mounts, its mount list cannot be changed through `PUT`; older live containers may still use
+those mounts. Public skills can be packaged into a shared image. The mount source is checked again when creating
+a container. Protect the common root and each profile directory from changes by other profiles or host users.
 
 The image runs as uid 10001, so a deployment must also give it the socket's group (compose
 `group_add: ["<socket gid>"]`, or `docker run --group-add <gid>`). The dev compose file runs as root only because

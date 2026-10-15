@@ -1,10 +1,16 @@
 # HTTP API
 
-Base path `/v1`. Every request except `GET /healthz` needs `Authorization: Bearer <KEEL_API_KEY>`. Bodies and
-responses are JSON, except the event stream. IDs (profile, session) are 1-128 characters: letters, digits, `.`,
-`_`, `-`, starting with a letter or digit.
+Base path `/v1`. Every request except `GET /healthz` needs `Authorization: Bearer <tenant-bound key>`. The verified
+key selects one integer tenant ID. Bodies and responses are JSON, except the event stream. IDs (profile, session)
+are 1-128 characters: letters, digits, `.`, `_`, `-`, starting with a letter or digit.
 
 Timestamps (`created_at`, `updated_at`, `at`, …) are numbers.
+
+`PUT` creates a profile in the caller's tenant and cannot move an existing profile. A tenant value in a request
+header or body does not change the key's scope. An unknown profile and one from another tenant both return 404;
+sessions, runs and event streams outside the selected profile are also 404. The consumer authenticates end users
+and checks which account may use a profile before calling keel. Within a tenant, keel trusts its service caller
+to select the authorized profile.
 
 Errors have one shape, with a machine-readable code:
 
@@ -156,6 +162,7 @@ A turn cut short (cancelled, crashed or swept) can leave tool calls without resu
 | 401 | `unauthorized` | Missing or wrong key. |
 | 404 | `profile_not_found`, `session_not_found`, `run_not_found` | No such object. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |
+| 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |
 | 409 | `title_in_use` | Another session already has that title. |
 | 429 | `at_capacity` | `KEEL_MAX_RUNNING` runs are in flight. Has a `Retry-After: 1` header. |
 | 500 | `internal_error` | An unexpected error. |

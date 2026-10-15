@@ -5,7 +5,8 @@ import uuid
 
 import pytest
 
-from keel.sandbox.base import ExecResult, Sandbox, TIMEOUT_EXIT_CODE, SandboxError, parse_policy
+from keel.sandbox.base import (ExecResult, Sandbox, TIMEOUT_EXIT_CODE, SandboxError, parse_policy,
+                               profile_mount_root)
 from keel.sandbox.docker import DockerSandbox
 
 IMAGE = os.environ.get("KEEL_TEST_DOCKER_IMAGE", "python:3.12-slim")
@@ -19,11 +20,14 @@ def test_the_container_name_is_stable_per_deployment_and_profile():
     assert a.container_name("p1").startswith("keel-sbx-")
 
 
-def test_run_args_carry_the_policy():
+def test_run_args_carry_the_policy(tmp_path):
+    root = str(tmp_path / "mounts")
+    source = profile_mount_root(root, "p1") + "/h"
     policy = parse_policy({"image": "img:1", "workdir": "/w", "runtime": "runsc", "network": "net",
-                           "mounts": [{"source": "/h", "target": "/t", "read_only": True}], "env": {"A": "1"},
-                           "user": "10:10", "cpus": 1, "memory_mb": 256, "pids_limit": 32})
-    args = DockerSandbox(deployment="d1").run_args("p1", policy, "/env/file")
+                           "mounts": [{"source": source, "target": "/t", "read_only": True}], "env": {"A": "1"},
+                           "user": "10:10", "cpus": 1, "memory_mb": 256, "pids_limit": 32},
+                          profile_mount_root(root, "p1"))
+    args = DockerSandbox(deployment="d1", mount_root=root).run_args("p1", policy, "/env/file")
 
     def has(flag, value):
         return any(args[i] == flag and args[i + 1] == value for i in range(len(args) - 1))
@@ -34,12 +38,28 @@ def test_run_args_carry_the_policy():
                         ("--cap-add", "FOWNER"), ("--security-opt", "no-new-privileges"),
                         ("--tmpfs", "/tmp:rw,nosuid,size=512m"), ("--tmpfs", "/var/tmp:rw,nosuid"),
                         ("--tmpfs", "/run:rw,nosuid"),
-                        ("--mount", "type=bind,source=/h,target=/t,readonly"),
+                        ("--mount", f"type=bind,source={source},target=/t,readonly"),
                         ("--label", f"keel.policy={policy.digest()}"), ("--label", "keel.deployment=d1")):
         assert has(flag, value), (flag, value)
     assert "A" not in args and not any(a.startswith("A=") or a == "1" for a in args)
     assert args[:4] == ["run", "-d", "--init", "--name"]
     assert args[-3:] == ["img:1", "sleep", "infinity"]
+
+
+def test_recreating_a_container_rechecks_a_retarged_host_symlink(tmp_path):
+    root = str(tmp_path / "mounts")
+    own = Path(profile_mount_root(root, "p1"))
+    other = Path(profile_mount_root(root, "p2"))
+    own.mkdir(parents=True)
+    other.mkdir(parents=True)
+    alias = own / "alias"
+    alias.symlink_to(own, target_is_directory=True)
+    policy = parse_policy({"image": "i", "workdir": "/w", "mounts": [
+        {"source": str(alias), "target": "/data"}]}, str(own))
+    alias.unlink()
+    alias.symlink_to(other, target_is_directory=True)
+    with pytest.raises(SandboxError, match="mount policy"):
+        DockerSandbox(mount_root=root).run_args("p1", policy)
 
 
 async def test_a_missing_docker_cli_is_a_sandbox_error():
@@ -49,14 +69,15 @@ async def test_a_missing_docker_cli_is_a_sandbox_error():
 
 
 @pytest.fixture
-async def docker():
-    backend = DockerSandbox(deployment=f"test-{uuid.uuid4().hex[:8]}", kill_grace_s=1.0)
+async def docker(tmp_path):
+    backend = DockerSandbox(deployment=f"test-{uuid.uuid4().hex[:8]}", kill_grace_s=1.0,
+                            mount_root=str(tmp_path / "mounts"))
     yield backend
     await backend.remove_orphans()
 
 
 def policy(**extra):
-    return parse_policy({"image": IMAGE, "workdir": "/work", **extra})
+    return parse_policy({"image": IMAGE, "workdir": "/work", **extra}, "/")
 
 
 @needs_docker
@@ -76,6 +97,27 @@ async def test_files_round_trip(docker):
         await docker.read_file(sandbox, "/work/missing", 10)
     with pytest.raises(IsADirectoryError):
         await docker.read_file(sandbox, "/work/a", 10)
+
+
+@needs_docker
+async def test_two_profiles_keep_private_files_and_env_separate(docker, tmp_path):
+    left = Path(profile_mount_root(str(tmp_path / "mounts"), "p1"))
+    right = Path(profile_mount_root(str(tmp_path / "mounts"), "p2"))
+    left.mkdir(parents=True)
+    right.mkdir(parents=True)
+    (left / "marker").write_text("from-left")
+    (right / "marker").write_text("from-right")
+    a = await docker.ensure("p1", parse_policy({"image": IMAGE, "workdir": "/work", "env": {"KEEL_TOKEN": "token-left"},
+                                                "mounts": [{"source": str(left), "target": "/private"}]}, str(left)))
+    b = await docker.ensure("p2", parse_policy({"image": IMAGE, "workdir": "/work", "env": {"KEEL_TOKEN": "token-right"},
+                                                "mounts": [{"source": str(right), "target": "/private"}]}, str(right)))
+    await docker.write_file(a, "/work/only-a", b"marker-a")
+    result = await docker.exec(b, ["sh", "-c", 'echo "$KEEL_TOKEN"; ls /work; cat /private/marker'],
+                               cwd="/work", timeout_s=30, exec_id="isolation")
+    assert result.exit_code == 0 and a.name != b.name
+    assert "token-right" in result.output and "token-left" not in result.output
+    assert "from-right" in result.output and "from-left" not in result.output
+    assert "only-a" not in result.output and "marker-a" not in result.output
 
 
 @needs_docker

@@ -16,7 +16,7 @@ worker 认领它，调用模型，把模型要求的工具放进该 profile 专�
 
 ```mermaid
 flowchart TB
-    CL(["客户端 — 你的产品后端<br/>共用一个服务密钥"])
+    CL(["客户端 — 你的产品后端<br/>绑定租户的服务密钥"])
 
     subgraph inst["keel 实例（彼此相同，无状态）"]
         direction TB
@@ -37,7 +37,7 @@ flowchart TB
     SBX["沙箱容器<br/>keel-sbx-&lt;hash&gt;，每个 profile 一个<br/>terminal、文件工具、execute_code"]
     LLM["模型端点<br/>bedrock-mantle.&lt;region&gt;.api.aws<br/>api.openai.com 或兼容服务"]
 
-    CL -->|"HTTP + SSE · Bearer KEEL_API_KEY"| API
+    CL -->|"HTTP + SSE · 绑定租户的 bearer 密钥"| API
     API -->|"create_run、events_after"| DB
     API -->|"notify / wait"| BUS
     WP -->|"claim_run、renew_lease"| DB
@@ -402,7 +402,8 @@ flowchart LR
   标签 `keel.managed=1`、`keel.deployment`、`keel.profile` 和 `keel.policy`（策略摘要）让 keel 能找到、比较并清理
   属于它自己的容器，而不会碰别人的。
 - **同一 profile 的各会话共用它的容器。** 容器是按 profile 的，不是按会话或按 run。keel 为每个会话记录一个
-  工作目录，但不会在容器内把一个会话与另一个会话隔离开；如果这很重要，请为每个租户使用一个 profile。
+  工作目录，但不会在容器内把一个会话与另一个会话隔离开；需要独立状态的账号应各自使用一个 profile，
+  同一租户内也是如此。
 - **空闲回收。** 后台任务每 60 秒运行一次，删除闲置达到 `KEEL_SANDBOX_IDLE_SECONDS`（默认 30 分钟）且没有命令在
   运行的容器。下一次 run 会重新创建。
 - **遗留容器。** 启动时，`remove_orphans` 会删除带有本部署标签的容器，但保留那些在任一实例上有 queued、running
@@ -532,8 +533,9 @@ profile 可以使用哪些模型由它的允许列表（`models`）决定；run 
 | `GET /sessions`、`GET /sessions/{id}/messages`、`GET /sessions/{id}/boundary` | 列出会话；读取对话记录；最新的消息 id。 |
 | `PATCH /sessions/{id}`、`DELETE /sessions/{id}` | 重命名；删除（有 run 进行中时被拒绝）。 |
 
-**认证**使用一个共用的服务密钥：`Authorization: Bearer <KEEL_API_KEY>`，以常量时间比较。`/healthz` 不需要认证。
-keel 不认识终端用户：**profile 是租户的单位**，由前面的产品把它的用户映射到 profile，并保管好这个密钥。
+**认证**使用绑定单一租户的服务密钥：`Authorization: Bearer <key>`，以常量时间比较。`/healthz` 不需要认证。
+租户 ID 是正整数，一个租户可以拥有多个独立的 profile。前面的产品负责终端用户身份与账号授权；keel
+校验密钥所属租户与 profile 归属。会话、记忆和私有沙箱状态按 profile 隔离。
 
 **错误**始终是 `{"error": {"code", "message"}}`。客户端会看到的错误码：`unauthorized`、`unavailable`、
 `invalid_input`、`run_not_found`、`session_not_found`、`session_busy`、`at_capacity`（429）、`model_not_allowed`、
@@ -577,7 +579,7 @@ flowchart LR
 
 ## 14. 安全模型
 
-- **服务密钥**保护整个 API。拿到它的人可以读取所有 profile 的对话记录并发起 run。请把它放在产品的后端，
+- **服务密钥**绑定一个租户。拿到它的人可以访问该租户的所有 profile；请把它放在产品的后端，
   绝不要放到浏览器里。
 - **Docker socket 等同于宿主机 root。** keel 可以用策略允许的任何挂载启动任何镜像。可以这样限制：
   `KEEL_SANDBOX_MOUNT_ROOT`（挂载必须在其下）、策略只来自你自己的后端，以及加固过的守护进程（rootless Docker 或
@@ -585,8 +587,8 @@ flowchart LR
 - **沙箱是模型所运行代码的边界。** 丢弃 capabilities、`no-new-privileges`、资源限制、可选的 gVisor 或 Kata
   runtime、由你选择的网络（或不联网），以及你想要的只读挂载。沙箱不与 keel 的数据库共用网络。
 - **密钥**会从工具输出中脱敏，绝不放到命令行里，OpenAI 密钥也会从错误中清除。
-- **租户隔离**以 profile 为单位：每个路由都限定在路径中的 profile 内，属于其他 profile 的会话 id 会返回 404。
-  这并不能防御持有服务密钥的客户端。
+- **租户隔离**先校验密钥所属租户，再校验 profile、会话与 run 的归属；其他租户的资源返回 404。
+  同一租户的多个 profile 也各自保存记忆、私有文件与工具凭据。产品须先校验终端用户对 profile 的权限。
 
 漏洞报告政策见 [SECURITY.md](../SECURITY.md)。
 

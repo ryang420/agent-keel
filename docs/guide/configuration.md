@@ -1,13 +1,15 @@
 # Configuration
 
-keel reads its settings from environment variables at start. `KEEL_API_KEY` and `KEEL_DATABASE_URL` are required;
-an invalid value stops the service at start with a message naming the variable.
+keel reads its settings from environment variables at start. `KEEL_DATABASE_URL` and at least one tenant-bound
+service key are required; an invalid value stops the service at start with a message naming the variable.
 
 ## Service
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KEEL_API_KEY` | required | The bearer key every caller sends (`Authorization: Bearer <key>`). |
+| `KEEL_API_KEYS` | unset | Comma-separated `tenant-id:secret` bindings, for example `1:key-a,2:key-b`. Each tenant ID is a signed 32-bit integer (`0` and negatives such as `-5` are valid; no leading zeros or `+`) and has its own key; multiple keys may name one tenant. A key cannot name two tenants. |
+| `KEEL_API_KEY`, `KEEL_API_KEY_TENANT` | unset | Single-key form of the binding. Both must be set together; `KEEL_API_KEY_TENANT` is a signed 32-bit integer. A bare key does not start the service. |
+| `KEEL_TENANT_BACKFILL` | unset | Path to a JSON object mapping existing profile IDs to integer tenant IDs, for example `{"p1":1}`. Required while any existing profile lacks an owner. The named tenants must have configured keys; an incomplete, unknown or conflicting assignment stops startup without changing ownership. |
 | `KEEL_DATABASE_URL` | required | `postgresql://…` (or `postgres://…`) or `sqlite:///path`. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). A lost LISTEN connection is reconnected with backoff; several instances can share one database. |
 | `KEEL_HOST` | `0.0.0.0` | Listen address. |
 | `KEEL_PORT` | `8700` | Listen port. If you change it, change the image's `HEALTHCHECK` too. |
@@ -28,7 +30,7 @@ an invalid value stops the service at start with a message naming the variable.
 |---|---|---|
 | `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). |
 | `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (checked about once a minute). |
-| `KEEL_SANDBOX_MOUNT_ROOT` | unset | Absolute path prefix. When set, every `mounts[].source` in a profile policy must be under it. When unset, any host path is allowed. |
+| `KEEL_SANDBOX_MOUNT_ROOT` | unset | Deployment-owned host directory for profile bind mounts. A profile may mount only paths under `<root>/<sha256(profile_id)>`; the operator must create and protect that directory. Without this setting, bind mounts are refused. |
 | `KEEL_DOCKER` | `docker` | The docker CLI to run. |
 | `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. At start, containers carrying this label are removed (except those of profiles with a run in flight), so it must be unique per deployment that shares a Docker daemon. |
 
@@ -45,6 +47,34 @@ See [sandbox.md](sandbox.md) for the profile's sandbox policy.
 | `KEEL_OPENAI_CONTEXT_WINDOW` | `128000` | Context window the `openai` provider reports. |
 
 See [providers.md](providers.md).
+
+## Existing database cutover
+
+Drain runs, stop older keel instances, back up the database, prepare the tenant-bound keys and an explicit
+`KEEL_TENANT_BACKFILL` assignment for every existing profile, and start only this version. Check that the consumer
+maps its authorized tenant account to the correct profile. Old builds with a global key must not run alongside this
+version. If existing profiles use bind mounts, move their data into their profile-specific directories and update
+their stored policies as a reviewed database migration during the stopped-service cutover; the runtime API refuses
+to change an existing mount list. Restoring an older version requires restoring the database backup and reconciling
+any newer state.
+
+For each profile with a legacy bind mount, use this stopped-service procedure before starting tenant-aware keel:
+
+1. Read the profile's `id` and `sandbox` JSON from the database backup. Compute
+   `<KEEL_SANDBOX_MOUNT_ROOT>/<sha256(profile_id)>` as described in [sandbox.md](sandbox.md). Give each old source a
+   distinct destination under that directory; sources for one profile must not be nested.
+2. Copy the old directory and its permissions to the destination. Keep the original in place. Verify the copied
+   files (for example, compare file counts and checksums) and ensure the destination does not resolve outside the
+   profile directory. If two old profiles used the same source, make independent copies.
+3. In a database transaction, update only that profile's `sandbox` JSON `mounts[].source` fields to the new paths.
+   Preserve every target, `read_only` flag and other policy field. Use the old JSON as an optimistic condition on
+   the update, check that exactly one row changed, and roll back if any profile cannot be updated. Perform this
+   after all destinations have been verified.
+4. Start keel with the tenant keys, explicit ownership backfill and the mount root. Check each migrated profile's
+   session history and a file in its sandbox. Delete old copies only after the cutover and rollback window.
+
+The frozen 0.2.0 migration test exercises this copy, policy update, backfill and history-preservation sequence on
+SQLite and PostgreSQL. A failed ownership mapping leaves the old schema and data unchanged.
 
 ## Tests
 

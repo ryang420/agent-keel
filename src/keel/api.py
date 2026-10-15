@@ -6,7 +6,6 @@ import asyncio
 import base64
 import binascii
 from dataclasses import dataclass
-import hmac
 import json
 import logging
 import re
@@ -16,9 +15,10 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from keel.config import tenant_id_for
 from keel.models import part_to_dict, ImagePart, TextPart
-from keel.sandbox.base import PolicyError, parse_policy
-from keel.store.base import ACTIVE, SessionBusy, SessionNotFound, TitleInUse
+from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict, profile_mount_root
+from keel.store.base import ACTIVE, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse
 from keel.titles import sanitize_title
 
 log = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ class Keel:
     bus: object
     providers: object
     executor: object
-    api_key: str
+    credentials: tuple
     max_running: int
     sandbox_mount_root: str | None = None
     background: object = None
@@ -187,10 +187,10 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         if getattr(request.app.state, "keel", None) is None:
             return _error(503, "unavailable", "The service is not ready.")
         if request.url.path != "/healthz":
-            supplied = request.headers.get("authorization", "")
-            expected = "Bearer " + k(request).api_key
-            if not hmac.compare_digest(supplied.encode(), expected.encode()):
+            tenant_id = tenant_id_for(tuple(k(request).credentials), request.headers.get("authorization", ""))
+            if tenant_id is None:
                 return _error(401, "unauthorized", "A valid service key is required.")
+            request.state.tenant_id = tenant_id
         return await call_next(request)
 
     @app.get("/healthz")
@@ -204,9 +204,12 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         return {"status": "ok"}
 
     async def profile_or_404(request: Request, profile_id: str):
-        """Validate profile_id and load its profile, or raise 404 profile_not_found."""
+        """Validate profile_id and load the caller's profile, or raise 404 profile_not_found.
+
+        A missing profile and a profile owned by another tenant are the same 404.
+        """
         profile = await k(request).store.get_profile(_check_id(profile_id, "profile"))
-        if profile is None:
+        if profile is None or profile.tenant_id != request.state.tenant_id:
             raise ApiError(404, "profile_not_found", "No such profile.")
         return profile
 
@@ -245,9 +248,10 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "skills must be a list of strings.")
         if not isinstance(sandbox, dict):
             raise ApiError(400, "invalid_input", "sandbox must be an object.")
+        mount_root = profile_mount_root(k(request).sandbox_mount_root, profile_id)
         if sandbox:
             try:
-                parse_policy(sandbox, k(request).sandbox_mount_root)
+                parse_policy(sandbox, mount_root)
             except PolicyError as exc:
                 raise ApiError(400, "invalid_input", str(exc))
         if not isinstance(soul, str):
@@ -256,9 +260,37 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "memory must be a boolean.")
         if not all(isinstance(m, dict) and m.get("provider") and m.get("model") for m in models):
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
-        profile = await k(request).store.upsert_profile(
-            profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
-            sandbox=sandbox, soul=soul, skills=skills, memory=memory)
+        store = k(request).store
+        async with store.db.transaction():
+            if store.db.dialect == "postgres":
+                await store.db.execute("SELECT pg_advisory_xact_lock(7312100002)")
+            existing = await store.get_profile(profile_id)
+            if existing is not None and existing.tenant_id != request.state.tenant_id:
+                raise ApiError(404, "profile_not_found", "No such profile.")
+            policy = parse_policy(sandbox, mount_root) if sandbox else None
+            if existing is not None and existing.sandbox:
+                try:
+                    old_mounts = parse_policy(existing.sandbox, mount_root).mounts
+                except PolicyError as exc:
+                    raise ApiError(409, "sandbox_requires_migration",
+                                   "The existing sandbox mount policy needs an operator migration.") from exc
+                new_mounts = policy.mounts if policy is not None else ()
+                if old_mounts and new_mounts != old_mounts:
+                    raise ApiError(400, "invalid_input", "A profile's sandbox mounts cannot be changed.")
+            if sandbox:
+                others = []
+                for other_id, raw in await store.profile_sandboxes():
+                    if other_id != profile_id and raw:
+                        others.append(parse_policy(raw, "/"))
+                conflict = private_mount_conflict(policy, others)
+                if conflict is not None:
+                    raise ApiError(400, "invalid_input", conflict)
+            try:
+                profile = await store.upsert_profile(
+                    profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
+                    sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
+            except ProfileTenantMismatch:
+                raise ApiError(404, "profile_not_found", "No such profile.")
         return {"id": profile.id, "models": profile.models, "sandbox": profile.sandbox, "soul": profile.soul,
                 "skills": profile.skills, "memory": profile.memory, "updated_at": profile.updated_at}
 
@@ -322,6 +354,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     @app.get("/v1/profiles/{profile_id}/runs")
     async def list_runs(request: Request, profile_id: str, status: str = "active"):
         """List profile runs matching status: 'active' or a comma-separated list of states."""
+        await profile_or_404(request, profile_id)
         statuses = ACTIVE if status == "active" else tuple(s for s in status.split(",") if s)
         runs = await k(request).store.list_runs(profile_id, statuses)
         return {"data": [run_json(run) for run in runs]}
@@ -329,6 +362,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     @app.get("/v1/profiles/{profile_id}/runs/{run_id}")
     async def get_run(request: Request, profile_id: str, run_id: str):
         """Return a profile's run details, or 404 run_not_found when it does not exist."""
+        await profile_or_404(request, profile_id)
         return run_json(await run_or_404(request, profile_id, run_id))
 
     @app.post("/v1/profiles/{profile_id}/runs/{run_id}/stop")
@@ -338,6 +372,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         Cancel queued runs immediately and emit their terminal event; notify the worker to
         stop running work. A running run may still be stopping when this response is returned.
         """
+        await profile_or_404(request, profile_id)
         keel_ = k(request)
         before = await run_or_404(request, profile_id, run_id)
         run = await keel_.store.request_stop(profile_id, run_id)
@@ -355,6 +390,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         Negative cursors are treated as zero. Send keepalive comments while idle and close
         after a terminal event; disconnecting the client does not cancel the run.
         """
+        await profile_or_404(request, profile_id)
         keel_ = k(request)
         await run_or_404(request, profile_id, run_id)
 
@@ -410,6 +446,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     @app.get("/v1/profiles/{profile_id}/sessions")
     async def list_sessions(request: Request, profile_id: str, limit: int = 100):
         """List the profile's most recently active sessions, clamping limit to 1–500."""
+        await profile_or_404(request, profile_id)
         sessions = await k(request).store.list_sessions(profile_id, max(1, min(limit, 500)))
         return {"data": [session_json(s) for s in sessions]}
 
@@ -422,6 +459,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         Otherwise return a page of active messages in chronological order, selecting from the
         newest end with limit clamped to 1–500 and offset to at least zero, plus pagination metadata.
         """
+        await profile_or_404(request, profile_id)
         store = k(request).store
         await session_or_404(request, profile_id, session_id)
         if after_id is not None:
@@ -435,6 +473,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     @app.get("/v1/profiles/{profile_id}/sessions/{session_id}/boundary")
     async def boundary(request: Request, profile_id: str, session_id: str):
         """Return the session's latest message id as a cursor for incremental history reads."""
+        await profile_or_404(request, profile_id)
         await session_or_404(request, profile_id, session_id)
         return {"last_message_id": await k(request).store.last_message_id(session_id)}
 
@@ -445,6 +484,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         Return 400 for an invalid title, 404 for a missing session or 409 if the profile
         already has another session with that title.
         """
+        await profile_or_404(request, profile_id)
         body = await _json_body(request)
         title = sanitize_title(body.get("title") or "") if isinstance(body.get("title"), str) else ""
         if not title:
@@ -460,6 +500,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     @app.delete("/v1/profiles/{profile_id}/sessions/{session_id}")
     async def delete(request: Request, profile_id: str, session_id: str):
         """Delete a session; return 404 if missing or 409 if it has a run in progress."""
+        await profile_or_404(request, profile_id)
         store = k(request).store
         try:
             deleted = await store.delete_session(profile_id, session_id)

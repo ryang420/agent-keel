@@ -2,14 +2,15 @@ import asyncio
 
 import httpx
 
-from keel.config import Settings
+from keel.config import ServiceCredential, Settings
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.service import create_service
 
 
 async def test_the_service_starts_runs_and_stops(tmp_path):
-    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'keel.sqlite3'}", workers=1)
+    settings = Settings(credentials=(ServiceCredential(1, "k"),),
+                        database_url=f"sqlite:///{tmp_path / 'keel.sqlite3'}", workers=1)
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     app = create_service(settings, providers=providers)
@@ -32,7 +33,8 @@ async def test_the_service_starts_runs_and_stops(tmp_path):
 async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
     from keel.service import build
 
-    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
+    settings = Settings(credentials=(ServiceCredential(1, "k"),),
+                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
                         compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3)
     keel, pool, closables, backend = await build(settings)
     try:
@@ -71,7 +73,8 @@ async def test_a_failing_pool_start_still_closes_everything(tmp_path, monkeypatc
 
     monkeypatch.setattr(WorkerPool, "start", boom)
     monkeypatch.setattr(service, "build", build)
-    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
+    settings = Settings(credentials=(ServiceCredential(1, "k"),),
+                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
     app = service.create_service(settings)
     with pytest.raises(RuntimeError, match="no start"):
         async with app.router.lifespan_context(app):
@@ -82,7 +85,7 @@ async def test_a_failing_pool_start_still_closes_everything(tmp_path, monkeypatc
 async def test_openai_is_registered_only_when_a_key_is_set(tmp_path):
     from keel.service import default_providers
 
-    base = {"api_key": "k", "database_url": f"sqlite:///{tmp_path / 'k.db'}"}
+    base = {"credentials": (ServiceCredential(1, "k"),), "database_url": f"sqlite:///{tmp_path / 'k.db'}"}
     without = default_providers(Settings(**base))
     with_key = default_providers(Settings(**base, openai_api_key="sk-x"))
     try:
@@ -104,11 +107,12 @@ async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monke
         return await real(url)
 
     monkeypatch.setattr(service, "open_store", spy)
-    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
+    settings = Settings(credentials=(ServiceCredential(1, "k"),),
+                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
                         lease_seconds=60)
     keel, pool, closables, backend = await service.build(settings)
     try:
-        assert seen == {"command_timeout": 20.0}
+        assert seen == {"command_timeout": 20.0, "tenant_ids": (1,), "tenant_backfill": {}}
     finally:
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")
@@ -121,6 +125,7 @@ async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_p
     db = tmp_path / "keel.sqlite3"
     store = await open_store(f"sqlite:///{db}")
     await store.upsert_profile("p2", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
+    await store.db.execute("UPDATE profiles SET tenant_id = ? WHERE id = ?", 1, "p2")
     await store.ensure_session("p2", "s1")
     await store.create_run(profile_id="p2", session_id="s1", provider="fake", model="m", reasoning_effort=None,
                            input_parts=[{"type": "text", "text": "hi"}], instructions=None)
@@ -130,7 +135,8 @@ async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_p
     fake.write_text('#!/bin/sh\necho "$@" >> "' + str(log) + '"\n'
                     'case "$1" in ps) printf "c1 p1\\nc2 p2\\n";; esac\nexit 0\n')
     fake.chmod(0o755)
-    settings = Settings(api_key="k", database_url=f"sqlite:///{db}", workers=1, docker=str(fake))
+    settings = Settings(credentials=(ServiceCredential(1, "k"),),
+                        database_url=f"sqlite:///{db}", workers=1, docker=str(fake))
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     app = create_service(settings, providers=providers)
@@ -144,7 +150,8 @@ async def test_the_lifespan_closes_the_background_after_the_pool_runs(tmp_path, 
 
     from keel.background import Background
 
-    settings = Settings(api_key="k", database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
+    settings = Settings(credentials=(ServiceCredential(1, "k"),),
+                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
     app = create_service(settings)
     close = AsyncMock()
     monkeypatch.setattr(Background, "close", close)
