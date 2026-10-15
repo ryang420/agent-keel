@@ -177,8 +177,14 @@ def test_memory_limits_default_and_must_be_positive():
         Settings.from_env({**BASE, "KEEL_USER_CHARS": "0"})
 
 
-def test_the_model_stall_timeout_defaults_to_three_minutes_and_must_be_positive():
-    assert Settings.from_env(BASE).model_stall_seconds == 180.0
-    assert Settings.from_env({**BASE, "KEEL_MODEL_STALL_SECONDS": "45"}).model_stall_seconds == 45.0
-    with pytest.raises(ValueError, match="KEEL_MODEL_STALL_SECONDS"):
-        Settings.from_env({**BASE, "KEEL_MODEL_STALL_SECONDS": "0"})
+def test_model_stall_limits_have_defaults_and_must_be_positive():
+    from keel.providers.base import StallLimits
+
+    assert Settings.from_env(BASE).stall_limits == StallLimits(first_event=120.0, between_events=60.0,
+                                                                high_effort=600.0)
+    custom = Settings.from_env({**BASE, "KEEL_MODEL_FIRST_EVENT_SECONDS": "30", "KEEL_MODEL_STALL_SECONDS": "45",
+                                "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS": "900"})
+    assert custom.stall_limits == StallLimits(first_event=30.0, between_events=45.0, high_effort=900.0)
+    for name in ("KEEL_MODEL_FIRST_EVENT_SECONDS", "KEEL_MODEL_STALL_SECONDS", "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS"):
+        with pytest.raises(ValueError, match=name):
+            Settings.from_env({**BASE, name: "0"})

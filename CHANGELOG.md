@@ -7,13 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
-- `KEEL_MODEL_STALL_SECONDS` now times the gap between response events, not between bytes. A stalled Bedrock
-  Mantle stream sends keep-alives but no events, which kept resetting the read timeout, so the limit never fired.
-
-### Changed
-- A model call that receives no data for `KEEL_MODEL_STALL_SECONDS` (default 180, previously a fixed 600) now fails
-  as `timeout` and is retried if it had streamed nothing. A stalled Bedrock Mantle stream had held a run for the full
-  ten minutes.
+- A stalled model stream now fails as `timeout` and is retried if it had streamed nothing. A stalled Bedrock Mantle
+  stream sends keep-alives but no response events; they kept resetting the fixed 600 s read timeout, so a run waited
+  until its client gave up. Stalls are now timed between response events (`response.*` or `error`), in two stages:
+  - `KEEL_MODEL_FIRST_EVENT_SECONDS` (default 120): until the first response event.
+  - `KEEL_MODEL_STALL_SECONDS` (default 60): between response events, raised to 120 s above about 50,000 estimated
+    request tokens and 180 s above about 100,000.
+  - At `high`, `xhigh` or `max` effort both are at least `KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS` (default 600).
+  The 600 s byte-level read timeout stays as a backstop for a dead connection.
 
 ## [0.3.0-rc.1] - 2026-10-15
 

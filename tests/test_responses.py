@@ -7,7 +7,7 @@ from keel.models import (
     Completed, ImagePart, Message, ModelRequest, ReasoningItem, ReasoningReady, TextDelta, TextPart, ToolCall,
     ToolCallReady, Usage,
 )
-from keel.providers.base import ModelError
+from keel.providers.base import ModelError, StallLimits
 from keel.providers.responses import (
     ResponsesTransport, cache_key, error_from_http, parse_usage, to_input_items,
 )
@@ -229,7 +229,7 @@ async def test_keep_alives_do_not_hide_a_stalled_stream():
             yield b'data: {"type": "keepalive"}\n\n'
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=keep_alive())))
-    transport = ResponsesTransport("bedrock", URL, client, stall_seconds=0.2)
+    transport = ResponsesTransport("bedrock", URL, client, stall=StallLimits(5, 0.2, 5))
     with pytest.raises(ModelError) as caught:
         await asyncio.wait_for(collect(transport, request()), 5)
     assert caught.value.code == "timeout" and "no response event" in str(caught.value)
@@ -245,7 +245,33 @@ async def test_a_slow_stream_that_keeps_sending_response_events_is_not_cut_off()
         yield sse(COMPLETED)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=slow())))
-    transport = ResponsesTransport("bedrock", URL, client, stall_seconds=0.25)
+    transport = ResponsesTransport("bedrock", URL, client, stall=StallLimits(5, 0.25, 5))
     events = await collect(transport, request())
     assert "".join(e.text for e in events if isinstance(e, TextDelta)) == "abcd"
     assert isinstance(events[-1], Completed)
+
+
+async def test_a_stream_that_never_starts_fails_on_the_first_event_limit():
+    import asyncio
+
+    async def silent():
+        while True:
+            await asyncio.sleep(0.02)
+            yield b": keep-alive\n\n"
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=silent())))
+    transport = ResponsesTransport("bedrock", URL, client, stall=StallLimits(0.2, 5, 5))
+    with pytest.raises(ModelError) as caught:
+        await asyncio.wait_for(collect(transport, request()), 5)
+    assert caught.value.code == "timeout" and "first response event" in str(caught.value)
+
+
+@pytest.mark.parametrize(("effort", "body_bytes", "expected"), [
+    ("low", 1_000, (120.0, 60.0)),
+    (None, 4 * 60_000, (120.0, 120.0)),     # ~60k tokens: prefill can be silent for longer
+    ("medium", 4 * 120_000, (120.0, 180.0)),
+    ("high", 1_000, (600.0, 600.0)),        # high effort may think for minutes before any event
+    ("xhigh", 4 * 120_000, (600.0, 600.0)),
+])
+def test_stall_limits_grow_with_request_size_and_effort(effort, body_bytes, expected):
+    assert StallLimits().for_request(effort, body_bytes) == expected

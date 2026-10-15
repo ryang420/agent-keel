@@ -19,7 +19,7 @@ from keel.models import (
     Completed, ImagePart, Message, ModelEvent, ModelRequest, ReasoningItem, ReasoningReady, TextDelta,
     TextPart, ToolCall, ToolCallReady, Usage,
 )
-from keel.providers.base import ModelError
+from keel.providers.base import ModelError, StallLimits
 
 
 def cache_key(scope: str, system: str, tools: tuple[dict, ...]) -> str:
@@ -144,19 +144,16 @@ async def _sse_events(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, dic
         yield decoded
 
 
-async def _until_stalled(events: AsyncIterator[tuple[str, dict]],
-                         stall_seconds: float | None) -> AsyncIterator[tuple[str, dict]]:
-    """Pass events through, failing as "timeout" once no response event has arrived for `stall_seconds`.
+async def _until_stalled(events: AsyncIterator[tuple[str, dict]], first_event: float,
+                         between_events: float) -> AsyncIterator[tuple[str, dict]]:
+    """Pass events through, failing as "timeout" when no response event arrives in time: `first_event` seconds
+    for the first one, then `between_events` seconds between them.
 
     A read timeout alone cannot see a stall: Mantle keeps a stalled stream open with keep-alive traffic, which
     resets it. So only `response.*` and `error` events count as progress; comments and other events do not.
     """
-    if stall_seconds is None:
-        async for event in events:
-            yield event
-        return
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + stall_seconds
+    deadline, started = loop.time() + first_event, False
     while True:
         try:
             async with asyncio.timeout_at(deadline):
@@ -164,9 +161,11 @@ async def _until_stalled(events: AsyncIterator[tuple[str, dict]],
         except StopAsyncIteration:
             return
         except TimeoutError:
-            raise ModelError("timeout", f"The model sent no response event for {stall_seconds:g} s.") from None
+            message = (f"The model sent no response event for {between_events:g} s." if started else
+                       f"The model sent no first response event within {first_event:g} s.")
+            raise ModelError("timeout", message) from None
         if kind.startswith("response.") or kind == "error":
-            deadline = loop.time() + stall_seconds
+            deadline, started = loop.time() + between_events, True
         yield kind, data
 
 
@@ -224,10 +223,10 @@ class _Assembler:
 
 class ResponsesTransport:
     def __init__(self, provider_name: str, url: str, client: httpx.AsyncClient, *, compat: bool = False,
-                 stall_seconds: float | None = None) -> None:
+                 stall: StallLimits | None = None) -> None:
         # compat: omit include, prompt_cache_key and reasoning.summary, which strict servers may reject.
         self.compat = compat
-        self.stall_seconds = stall_seconds
+        self.stall = stall
         self.provider_name = provider_name
         self.url = url
         self.client = client
@@ -269,7 +268,11 @@ class ResponsesTransport:
                 if response.status_code >= 400:
                     text = (await response.aread()).decode("utf-8", errors="replace")
                     raise error_from_http(response.status_code, text, response.headers.get("retry-after"))
-                async for kind, data in _until_stalled(_sse_events(response.aiter_lines()), self.stall_seconds):
+                events = _sse_events(response.aiter_lines())
+                if self.stall is not None:
+                    first, between = self.stall.for_request(request.reasoning_effort, len(json.dumps(body)))
+                    events = _until_stalled(events, first, between)
+                async for kind, data in events:
                     for event in assembler.feed(kind, data):
                         yield event
                     if assembler.done:

@@ -7,7 +7,7 @@ from typing import AsyncIterator
 import httpx
 
 from keel.models import ModelEvent, ModelRequest
-from keel.providers.base import DEFAULT_STALL_SECONDS, Capabilities
+from keel.providers.base import READ_TIMEOUT_SECONDS, Capabilities, StallLimits
 from keel.providers.responses import ResponsesTransport
 from keel.providers.sigv4 import SigV4Auth
 
@@ -25,13 +25,13 @@ class BedrockMantleProvider:
     name = "bedrock"
 
     def __init__(self, region: str, *, client: httpx.AsyncClient | None = None, credentials=None,
-                 timeout: float = DEFAULT_STALL_SECONDS) -> None:
+                 timeout: float = READ_TIMEOUT_SECONDS, stall: StallLimits = StallLimits()) -> None:
         self.region = region
         self._client = client or httpx.AsyncClient(
             auth=SigV4Auth(region, credentials=credentials),
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
-        self._transport = ResponsesTransport(self.name, mantle_url(region), self._client, stall_seconds=timeout)
+        self._transport = ResponsesTransport(self.name, mantle_url(region), self._client, stall=stall)
 
     def capabilities(self, model: str) -> Capabilities:
         return MANTLE_CAPABILITIES

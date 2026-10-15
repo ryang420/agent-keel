@@ -107,9 +107,12 @@ async def test_live_bedrock_mantle_answers():
     assert "OK" in text and isinstance(events[-1], Completed) and events[-1].usage.input_tokens
 
 
-async def test_a_silent_stream_times_out_well_before_a_ten_minute_turn():
+async def test_the_default_provider_times_stalls_between_events():
+    from keel.providers.base import StallLimits
+
     provider = BedrockMantleProvider("us-east-1")
     try:
-        assert provider._client.timeout.read == 180.0
+        assert provider._client.timeout.read == 600.0
+        assert provider._transport.stall == StallLimits()
     finally:
         await provider.aclose()

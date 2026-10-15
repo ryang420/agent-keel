@@ -9,7 +9,7 @@ from typing import AsyncIterator
 import httpx
 
 from keel.models import ModelEvent, ModelRequest
-from keel.providers.base import DEFAULT_STALL_SECONDS, Capabilities, ModelError
+from keel.providers.base import READ_TIMEOUT_SECONDS, Capabilities, ModelError, StallLimits
 from keel.providers.responses import ResponsesTransport
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -24,8 +24,8 @@ OPENAI_CAPABILITIES = Capabilities(context_window=DEFAULT_CONTEXT_WINDOW, vision
 
 class OpenAIProvider:
     def __init__(self, api_key: str, *, base_url: str = DEFAULT_BASE_URL, name: str = "openai",
-                 client: httpx.AsyncClient | None = None, timeout: float = DEFAULT_STALL_SECONDS, compat: bool = False,
-                 context_window: int = DEFAULT_CONTEXT_WINDOW) -> None:
+                 client: httpx.AsyncClient | None = None, timeout: float = READ_TIMEOUT_SECONDS, compat: bool = False,
+                 context_window: int = DEFAULT_CONTEXT_WINDOW, stall: StallLimits = StallLimits()) -> None:
         self.name = name
         self._key = api_key
         self._capabilities = dataclasses.replace(OPENAI_CAPABILITIES, context_window=context_window,
@@ -37,7 +37,7 @@ class OpenAIProvider:
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
         self._transport = ResponsesTransport(self.name, base_url.rstrip("/") + "/responses", self._client,
-                                           compat=compat, stall_seconds=timeout)
+                                           compat=compat, stall=stall)
 
     def capabilities(self, model: str) -> Capabilities:
         return self._capabilities

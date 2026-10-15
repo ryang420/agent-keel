@@ -12,6 +12,8 @@ import re
 import socket
 from typing import Mapping
 
+from keel.providers.base import StallLimits
+
 _DB_SCHEMES = ("postgresql://", "postgres://", "sqlite:///")
 _DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -160,13 +162,20 @@ class Settings:
     openai_base_url: str = "https://api.openai.com/v1"
     openai_compat: bool = False
     openai_context_window: int = 128_000
-    model_stall_seconds: float = 180.0
+    model_first_event_seconds: float = 120.0
+    model_stall_seconds: float = 60.0
+    model_high_effort_stall_seconds: float = 600.0
     instance_id: str = field(default_factory=_instance_id)
     tenant_backfill: dict[str, int] = field(default_factory=dict)
 
     @property
     def is_postgres(self) -> bool:
         return self.database_url.startswith(("postgresql://", "postgres://"))
+
+    @property
+    def stall_limits(self) -> StallLimits:
+        return StallLimits(first_event=self.model_first_event_seconds, between_events=self.model_stall_seconds,
+                           high_effort=self.model_high_effort_stall_seconds)
 
     @property
     def db_command_timeout(self) -> float:
@@ -219,6 +228,8 @@ class Settings:
             openai_base_url=base_url,
             openai_compat=(env.get("KEEL_OPENAI_COMPAT") or "").strip().lower() in ("1", "true", "yes"),
             openai_context_window=_positive_int(env, "KEEL_OPENAI_CONTEXT_WINDOW", 128_000),
-            model_stall_seconds=_positive_float(env, "KEEL_MODEL_STALL_SECONDS", 180.0),
+            model_first_event_seconds=_positive_float(env, "KEEL_MODEL_FIRST_EVENT_SECONDS", 120.0),
+            model_stall_seconds=_positive_float(env, "KEEL_MODEL_STALL_SECONDS", 60.0),
+            model_high_effort_stall_seconds=_positive_float(env, "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS", 600.0),
             tenant_backfill=backfill,
         )

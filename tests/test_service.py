@@ -96,17 +96,19 @@ async def test_openai_is_registered_only_when_a_key_is_set(tmp_path):
         await with_key.aclose()
 
 
-async def test_both_providers_give_up_on_a_silent_model_stream_after_the_stall_timeout(tmp_path):
+async def test_both_providers_use_the_configured_stall_limits(tmp_path):
     from keel.service import default_providers
 
     settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=f"sqlite:///{tmp_path / 'k.db'}",
-                        openai_api_key="sk-x", model_stall_seconds=42.0)
+                        openai_api_key="sk-x", model_first_event_seconds=7.0, model_stall_seconds=42.0,
+                        model_high_effort_stall_seconds=300.0)
     registry = default_providers(settings)
     try:
         for name in ("bedrock", "openai"):
             provider = registry.get(name)
-            assert provider._client.timeout.read == 42.0 and provider._client.timeout.connect == 10.0
-            assert provider._transport.stall_seconds == 42.0
+            # The byte-level read timeout is only a backstop; the stall limits are timed between events.
+            assert provider._client.timeout.read == 600.0 and provider._client.timeout.connect == 10.0
+            assert provider._transport.stall == settings.stall_limits
     finally:
         await registry.aclose()
 
