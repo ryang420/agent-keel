@@ -37,7 +37,7 @@ class OpenAIProvider:
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
         self._transport = ResponsesTransport(self.name, base_url.rstrip("/") + "/responses", self._client,
-                                           compat=compat)
+                                           compat=compat, stall_seconds=timeout)
 
     def capabilities(self, model: str) -> Capabilities:
         return self._capabilities

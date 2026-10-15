@@ -31,7 +31,7 @@ class BedrockMantleProvider:
             auth=SigV4Auth(region, credentials=credentials),
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
-        self._transport = ResponsesTransport(self.name, mantle_url(region), self._client)
+        self._transport = ResponsesTransport(self.name, mantle_url(region), self._client, stall_seconds=timeout)
 
     def capabilities(self, model: str) -> Capabilities:
         return MANTLE_CAPABILITIES

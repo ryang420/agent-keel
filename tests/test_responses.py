@@ -216,3 +216,36 @@ def test_cache_write_is_none_unless_the_provider_reports_it():
     assert parse_usage({"input_tokens": 5, "output_tokens": 1}) == Usage(5, 1, None, None)
     assert (Usage(5, 1, 3, None) + Usage(2, 1, 0, None)).cache_write_tokens is None
     assert Usage(5, 1, 3, None).to_dict()["cache_write_tokens"] is None
+
+
+async def test_keep_alives_do_not_hide_a_stalled_stream():
+    import asyncio
+
+    async def keep_alive():
+        yield sse({"type": "response.created", "response": {}})
+        while True:  # what a stalled Mantle stream sends: bytes, but no response event
+            await asyncio.sleep(0.02)
+            yield b": keep-alive\n\n"
+            yield b'data: {"type": "keepalive"}\n\n'
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=keep_alive())))
+    transport = ResponsesTransport("bedrock", URL, client, stall_seconds=0.2)
+    with pytest.raises(ModelError) as caught:
+        await asyncio.wait_for(collect(transport, request()), 5)
+    assert caught.value.code == "timeout" and "no response event" in str(caught.value)
+
+
+async def test_a_slow_stream_that_keeps_sending_response_events_is_not_cut_off():
+    import asyncio
+
+    async def slow():
+        for word in ("a", "b", "c", "d"):
+            await asyncio.sleep(0.1)
+            yield sse({"type": "response.output_text.delta", "delta": word})
+        yield sse(COMPLETED)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=slow())))
+    transport = ResponsesTransport("bedrock", URL, client, stall_seconds=0.25)
+    events = await collect(transport, request())
+    assert "".join(e.text for e in events if isinstance(e, TextDelta)) == "abcd"
+    assert isinstance(events[-1], Completed)

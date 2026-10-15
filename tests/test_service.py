@@ -104,8 +104,9 @@ async def test_both_providers_give_up_on_a_silent_model_stream_after_the_stall_t
     registry = default_providers(settings)
     try:
         for name in ("bedrock", "openai"):
-            timeout = registry.get(name)._client.timeout
-            assert timeout.read == 42.0 and timeout.connect == 10.0
+            provider = registry.get(name)
+            assert provider._client.timeout.read == 42.0 and provider._client.timeout.connect == 10.0
+            assert provider._transport.stall_seconds == 42.0
     finally:
         await registry.aclose()
 
