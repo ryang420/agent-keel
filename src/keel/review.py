@@ -50,7 +50,8 @@ async def _review(executor, run) -> None:
                                messages=tuple(messages), tools=tools, reasoning_effort="low",
                                cache_scope=run.session_id)
         calls, text, reasoning = [], [], []
-        async for event in stream_with_retries(provider, request, sleep=executor._sleep):
+        async for event in stream_with_retries(provider, request, sleep=executor._sleep,
+                                                 context=f"run {run.id} memory review"):
             if isinstance(event, TextDelta):
                 text.append(event.text)
             elif isinstance(event, ReasoningReady):

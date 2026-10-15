@@ -401,7 +401,7 @@ class RunExecutor:
                       state: _RunState) -> tuple[list[ToolCall], list, bool, Usage]:
         state.text, state.streamed = [], False
         calls, reasoning, incomplete, usage = [], [], False, Usage()
-        async for event in stream_with_retries(provider, request, sleep=self._sleep):
+        async for event in stream_with_retries(provider, request, sleep=self._sleep, context=f"run {run.id}"):
             state.streamed = True
             if isinstance(event, TextDelta):
                 state.text.append(event.text)
@@ -521,7 +521,7 @@ class RunExecutor:
             messages=(Message("user", (TextPart(text),)),), tools=(), reasoning_effort="low",
             max_output_tokens=512, cache_scope="")
         chunks: list[str] = []
-        async for event in stream_with_retries(provider, request, sleep=self._sleep):
+        async for event in stream_with_retries(provider, request, sleep=self._sleep, context=f"run {run.id} title"):
             if isinstance(event, TextDelta):
                 chunks.append(event.text)
         title = parse_model_title("".join(chunks))

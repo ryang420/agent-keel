@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 import random
 from typing import AsyncIterator, Awaitable, Callable
@@ -10,6 +11,7 @@ from typing import AsyncIterator, Awaitable, Callable
 from keel.models import ModelEvent, ModelRequest
 from keel.providers.base import ModelError, ModelProvider
 
+log = logging.getLogger(__name__)
 RETRYABLE = {"rate_limited", "server_error", "timeout"}
 _BASE_SECONDS, _MAX_SECONDS, _MAX_RETRY_AFTER = 5.0, 120.0, 600.0
 
@@ -32,8 +34,13 @@ async def stream_with_retries(
     max_attempts: int = 3,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: Callable[[], float] = random.random,
+    context: str = "",
 ) -> AsyncIterator[ModelEvent]:
-    """Retry a call only while it has produced nothing: output already forwarded cannot be taken back."""
+    """Retry a call only while it has produced nothing: output already forwarded cannot be taken back.
+
+    Each retry is logged, so a stalled or failing provider shows up in the service log; `context` (for example
+    "run <id>") says which call it was."""
+    where = f"{context}: " if context else ""
     stripped = False
     attempt = 0
     while True:
@@ -50,6 +57,13 @@ async def stream_with_retries(
             if error.code == "invalid_reasoning" and not stripped:
                 request, stripped = strip_reasoning(request), True
                 continue
-            if error.code not in RETRYABLE or attempt >= max_attempts:
+            if error.code not in RETRYABLE:
                 raise
-            await sleep(backoff_seconds(attempt, error.retry_after, rng()))
+            if attempt >= max_attempts:
+                log.error("%smodel call %s/%s failed with %s (%s); giving up after %d attempts", where,
+                          provider.name, request.model, error.code, error, attempt)
+                raise
+            delay = backoff_seconds(attempt, error.retry_after, rng())
+            log.warning("%smodel call %s/%s failed with %s (%s); attempt %d/%d, retrying in %.1f s", where,
+                        provider.name, request.model, error.code, error, attempt, max_attempts, delay)
+            await sleep(delay)

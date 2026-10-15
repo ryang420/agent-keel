@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Model-call retries are logged: a warning per retry (call, provider/model, error code and message, attempt,
+  delay) and an error when the last attempt fails, so a stalled or failing provider shows up in the service log.
+
 ### Fixed
 - A stalled model stream now fails as `timeout` and is retried if it had streamed nothing. A stalled Bedrock Mantle
   stream sends keep-alives but no response events; they kept resetting the fixed 600 s read timeout, so a run waited
