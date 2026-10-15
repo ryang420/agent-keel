@@ -47,7 +47,7 @@ See [sandbox.md](sandbox.md) for the profile's sandbox policy.
 | `KEEL_OPENAI_CONTEXT_WINDOW` | `128000` | Context window the `openai` provider reports. |
 | `KEEL_MODEL_FIRST_EVENT_SECONDS` | `120` | Seconds a model call may wait for its first response event (`response.*` or `error`). Keep-alive traffic does not count. Past that the call fails with `timeout`; a call that has streamed nothing is retried, up to three attempts in all. Applies to every provider. Positive. |
 | `KEEL_MODEL_STALL_SECONDS` | `60` | Seconds allowed between response events once the stream has started. Raised to 120 s for requests above about 50,000 estimated tokens and 180 s above about 100,000 (estimated as request bytes / 4), since a large prompt can be silent while it is prefilled. Positive. |
-| `KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS` | `600` | At `high`, `xhigh` or `max` reasoning effort both limits above are at least this, since the model may think for minutes before its next event. Positive. The byte-level read timeout (600 s, connect 10 s) remains a backstop for a dead connection. |
+| `KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS` | `300` | At `high`, `xhigh` or `max` reasoning effort both limits above are at least this, since the model may think for minutes before its next event. Kept well under ten minutes so a retried stall still finishes inside a client's wait. Positive. The byte-level read timeout (600 s, connect 10 s) remains a backstop for a dead connection. |
 
 See [providers.md](providers.md).
 

@@ -164,7 +164,7 @@ class Settings:
     openai_context_window: int = 128_000
     model_first_event_seconds: float = 120.0
     model_stall_seconds: float = 60.0
-    model_high_effort_stall_seconds: float = 600.0
+    model_high_effort_stall_seconds: float = 300.0
     instance_id: str = field(default_factory=_instance_id)
     tenant_backfill: dict[str, int] = field(default_factory=dict)
 
@@ -230,6 +230,6 @@ class Settings:
             openai_context_window=_positive_int(env, "KEEL_OPENAI_CONTEXT_WINDOW", 128_000),
             model_first_event_seconds=_positive_float(env, "KEEL_MODEL_FIRST_EVENT_SECONDS", 120.0),
             model_stall_seconds=_positive_float(env, "KEEL_MODEL_STALL_SECONDS", 60.0),
-            model_high_effort_stall_seconds=_positive_float(env, "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS", 600.0),
+            model_high_effort_stall_seconds=_positive_float(env, "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS", 300.0),
             tenant_backfill=backfill,
         )

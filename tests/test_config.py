@@ -181,7 +181,7 @@ def test_model_stall_limits_have_defaults_and_must_be_positive():
     from keel.providers.base import StallLimits
 
     assert Settings.from_env(BASE).stall_limits == StallLimits(first_event=120.0, between_events=60.0,
-                                                                high_effort=600.0)
+                                                                high_effort=300.0)
     custom = Settings.from_env({**BASE, "KEEL_MODEL_FIRST_EVENT_SECONDS": "30", "KEEL_MODEL_STALL_SECONDS": "45",
                                 "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS": "900"})
     assert custom.stall_limits == StallLimits(first_event=30.0, between_events=45.0, high_effort=900.0)

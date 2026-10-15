@@ -17,7 +17,8 @@ All notable changes to this project are documented here. The format follows
   - `KEEL_MODEL_FIRST_EVENT_SECONDS` (default 120): until the first response event.
   - `KEEL_MODEL_STALL_SECONDS` (default 60): between response events, raised to 120 s above about 50,000 estimated
     request tokens and 180 s above about 100,000.
-  - At `high`, `xhigh` or `max` effort both are at least `KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS` (default 600).
+  - At `high`, `xhigh` or `max` effort both are at least `KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS` (default 300, Hermes's
+    high-effort floor; 600 left no time to retry a stall inside a ten-minute client wait).
   The 600 s byte-level read timeout stays as a backstop for a dead connection.
 
 ## [0.3.0-rc.1] - 2026-10-15

@@ -270,8 +270,8 @@ async def test_a_stream_that_never_starts_fails_on_the_first_event_limit():
     ("low", 1_000, (120.0, 60.0)),
     (None, 4 * 60_000, (120.0, 120.0)),     # ~60k tokens: prefill can be silent for longer
     ("medium", 4 * 120_000, (120.0, 180.0)),
-    ("high", 1_000, (600.0, 600.0)),        # high effort may think for minutes before any event
-    ("xhigh", 4 * 120_000, (600.0, 600.0)),
+    ("high", 1_000, (300.0, 300.0)),        # high effort may think for minutes before any event
+    ("xhigh", 4 * 120_000, (300.0, 300.0)),
 ])
 def test_stall_limits_grow_with_request_size_and_effort(effort, body_bytes, expected):
     assert StallLimits().for_request(effort, body_bytes) == expected
