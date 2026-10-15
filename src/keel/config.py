@@ -160,6 +160,7 @@ class Settings:
     openai_base_url: str = "https://api.openai.com/v1"
     openai_compat: bool = False
     openai_context_window: int = 128_000
+    model_stall_seconds: float = 180.0
     instance_id: str = field(default_factory=_instance_id)
     tenant_backfill: dict[str, int] = field(default_factory=dict)
 
@@ -218,5 +219,6 @@ class Settings:
             openai_base_url=base_url,
             openai_compat=(env.get("KEEL_OPENAI_COMPAT") or "").strip().lower() in ("1", "true", "yes"),
             openai_context_window=_positive_int(env, "KEEL_OPENAI_CONTEXT_WINDOW", 128_000),
+            model_stall_seconds=_positive_float(env, "KEEL_MODEL_STALL_SECONDS", 180.0),
             tenant_backfill=backfill,
         )

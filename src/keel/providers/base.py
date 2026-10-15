@@ -7,6 +7,11 @@ from typing import AsyncIterator, Protocol
 
 from keel.models import ModelEvent, ModelRequest
 
+# Seconds without a byte from the model before the call fails as "timeout", which is retried while nothing has
+# been streamed yet. A stalled Mantle stream once used up the whole of the old ten-minute limit, longer than a
+# client usually waits for a run.
+DEFAULT_STALL_SECONDS = 180.0
+
 ERROR_CODES = ("auth", "rate_limited", "server_error", "timeout", "context_overflow",
                "invalid_reasoning", "bad_request")
 

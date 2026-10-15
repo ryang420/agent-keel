@@ -105,3 +105,11 @@ async def test_live_bedrock_mantle_answers():
         await provider.aclose()
     text = "".join(e.text for e in events if isinstance(e, TextDelta))
     assert "OK" in text and isinstance(events[-1], Completed) and events[-1].usage.input_tokens
+
+
+async def test_a_silent_stream_times_out_well_before_a_ten_minute_turn():
+    provider = BedrockMantleProvider("us-east-1")
+    try:
+        assert provider._client.timeout.read == 180.0
+    finally:
+        await provider.aclose()
