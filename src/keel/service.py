@@ -27,12 +27,12 @@ _REAP_SECONDS = 60.0
 
 def default_providers(settings: Settings) -> ProviderRegistry:
     registry = ProviderRegistry()
-    registry.register(BedrockMantleProvider(settings.aws_region, timeout=settings.model_stall_seconds))
+    registry.register(BedrockMantleProvider(settings.aws_region, stall=settings.stall_limits))
     if settings.openai_api_key:
         registry.register(OpenAIProvider(settings.openai_api_key, base_url=settings.openai_base_url,
                                         compat=settings.openai_compat,
                                         context_window=settings.openai_context_window,
-                                        timeout=settings.model_stall_seconds))
+                                        stall=settings.stall_limits))
     return registry
 
 

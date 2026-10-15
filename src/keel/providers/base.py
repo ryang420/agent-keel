@@ -7,10 +7,33 @@ from typing import AsyncIterator, Protocol
 
 from keel.models import ModelEvent, ModelRequest
 
-# Seconds without a response event (or, before the stream opens, without a byte) before a model call fails as
-# "timeout", which is retried while nothing has been streamed yet. A stalled Mantle stream sends keep-alives but
-# no events, so a byte-level read timeout alone never fires on it.
-DEFAULT_STALL_SECONDS = 180.0
+# Seconds without any byte before a model call fails as "timeout". Only a backstop for a dead connection: a
+# stalled Mantle stream sends keep-alives but no events, which keeps resetting it. StallLimits catch that.
+READ_TIMEOUT_SECONDS = 600.0
+HIGH_EFFORTS = frozenset({"high", "xhigh", "max"})
+
+
+@dataclass(frozen=True)
+class StallLimits:
+    """How long a model call may go without a response event before it fails as "timeout", which is retried
+    while nothing has been streamed yet.
+
+    The first event (response.created) normally arrives within seconds. After it, a service may stay silent
+    while it prefills a large prompt or reasons, so the gap between events is allowed to grow with the request
+    size; at high effort both limits are raised to `high_effort`, since the model may think for minutes first.
+    """
+
+    first_event: float = 120.0
+    between_events: float = 60.0
+    high_effort: float = 600.0
+
+    def for_request(self, effort: str | None, body_bytes: int) -> tuple[float, float]:
+        """(first-event limit, between-events limit) for one call. Tokens are estimated as body bytes / 4;
+        images inflate the estimate, which only lengthens the limit."""
+        tokens = body_bytes // 4
+        between = max(self.between_events, 180.0 if tokens > 100_000 else 120.0 if tokens > 50_000 else 0.0)
+        floor = self.high_effort if effort in HIGH_EFFORTS else 0.0
+        return max(self.first_event, floor), max(between, floor)
 
 ERROR_CODES = ("auth", "rate_limited", "server_error", "timeout", "context_overflow",
                "invalid_reasoning", "bad_request")
