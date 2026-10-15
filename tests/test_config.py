@@ -142,18 +142,27 @@ def test_a_key_without_a_tenant_is_refused_and_two_keys_can_share_a_tenant(tmp_p
     path.write_text("[1]")
     with pytest.raises(ValueError, match="KEEL_TENANT_BACKFILL"):
         Settings.from_env({**BASE, "KEEL_TENANT_BACKFILL": str(path)})
-    for invalid in ('{"p1": "1"}', '{"p1": 2147483648}', '{"p1": 0}', '{"p1": true}'):
+    for invalid in ('{"p1": "1"}', '{"p1": 2147483648}', '{"p1": -2147483649}', '{"p1": true}'):
         path.write_text(invalid)
         with pytest.raises(ValueError, match="KEEL_TENANT_BACKFILL"):
             Settings.from_env({**BASE, "KEEL_TENANT_BACKFILL": str(path)})
-    for invalid in ("0:key", "2147483648:key", "01:key", "-1:key"):
+    path.write_text('{"p1": 0, "p2": -2147483648}')
+    settings = Settings.from_env({"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"],
+                                  "KEEL_API_KEYS": "0:key-zero,-2147483648:key-min,2147483647:key-max",
+                                  "KEEL_TENANT_BACKFILL": str(path)})
+    assert [c.tenant_id for c in settings.credentials] == [0, -2_147_483_648, 2_147_483_647]
+    assert settings.tenant_backfill == {"p1": 0, "p2": -2_147_483_648}
+    single = Settings.from_env({**BASE, "KEEL_API_KEY_TENANT": "-7"})
+    assert [c.tenant_id for c in single.credentials] == [-7]
+    for invalid in ("2147483648:key", "-2147483649:key", "01:key", "-0:key", "-01:key", "+1:key", "- 1:key"):
         with pytest.raises(ValueError, match="tenant id"):
             Settings.from_env({"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"], "KEEL_API_KEYS": invalid})
 
 
 def test_a_direct_service_credential_requires_an_integer_tenant_id():
-    assert ServiceCredential(1, "key").tenant_id == 1
-    for invalid in ("1", True, 0, 2_147_483_648):
+    for valid in (1, 0, -1, 2_147_483_647, -2_147_483_648):
+        assert ServiceCredential(valid, "key").tenant_id == valid
+    for invalid in ("1", True, 2_147_483_648, -2_147_483_649):
         with pytest.raises(ValueError, match="tenant id"):
             ServiceCredential(invalid, "key")
 

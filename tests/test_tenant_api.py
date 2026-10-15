@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 
 import httpx
 import pytest
@@ -14,8 +15,8 @@ from keel.worker import WorkerPool
 from tests.test_api import PROFILE
 
 
-@pytest.fixture
-async def clients(store, tmp_path):
+@contextlib.asynccontextmanager
+async def _clients(store, tmp_path, tenants: tuple[int, int]):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
@@ -23,7 +24,7 @@ async def clients(store, tmp_path):
     executor = RunExecutor(store, bus, registry)
     pool = WorkerPool(store, bus, executor, owner="w1", workers=2, poll_seconds=0.01)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
-                credentials=(ServiceCredential(1, "key-a"), ServiceCredential(2, "key-b")),
+                credentials=(ServiceCredential(tenants[0], "key-a"), ServiceCredential(tenants[1], "key-b")),
                 max_running=2, sandbox_mount_root=str(tmp_path / "mounts"))
     app = create_app(keel)
     await pool.start()
@@ -32,10 +33,31 @@ async def clients(store, tmp_path):
                               headers={"Authorization": "Bearer key-a"})
     other = httpx.AsyncClient(transport=transport, base_url="http://keel",
                               headers={"Authorization": "Bearer key-b"})
-    yield owner, other
-    await owner.aclose()
-    await other.aclose()
-    await pool.close(drain_seconds=0.1)
+    try:
+        yield owner, other
+    finally:
+        await owner.aclose()
+        await other.aclose()
+        await pool.close(drain_seconds=0.1)
+
+
+@pytest.fixture
+async def clients(store, tmp_path):
+    async with _clients(store, tmp_path, (1, 2)) as pair:
+        yield pair
+
+
+async def test_tenant_zero_and_negative_tenants_are_isolated_like_any_other(store, tmp_path):
+    async with _clients(store, tmp_path, (0, -2_147_483_648)) as (zero, negative):
+        created = await zero.put("/v1/profiles/acct", json=PROFILE)
+        assert created.status_code == 200
+        assert (await store.get_profile("acct")).tenant_id == 0
+        assert (await negative.put("/v1/profiles/acct", json={**PROFILE, "soul": "stolen"})).status_code == 404
+        assert (await negative.get("/v1/profiles/acct/sessions")).status_code == 404
+        assert (await zero.get("/v1/profiles/acct/sessions")).status_code == 200
+        assert (await negative.put("/v1/profiles/neg", json=PROFILE)).status_code == 200
+        assert (await store.get_profile("neg")).tenant_id == -2_147_483_648
+        assert (await zero.get("/v1/profiles/neg/sessions")).status_code == 404
 
 
 async def test_a_foreign_profile_is_a_404_and_cannot_be_replaced(clients, store):

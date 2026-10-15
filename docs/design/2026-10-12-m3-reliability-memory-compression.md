@@ -467,11 +467,11 @@ profile. IDs are locators, never evidence of permission.
 
 ### Stored ownership and execution
 
-Add `tenants` with a positive 32-bit integer primary key and `profiles.tenant_id` of the same integer type
-referencing it, with an index for tenant-scoped
-lookups. Retain globally unique internal profile and session IDs; adding tenant ownership does not silently make
-existing IDs tenant-local. If a consumer has tenant-local account or conversation IDs, its adapter maps the full
-scoped identity to distinct keel IDs. A naming convention alone is not authorization.
+Add `tenants` with a signed 32-bit integer primary key (any value from −2³¹ to 2³¹−1, including 0, so a consumer's own
+tenant IDs are used unchanged) and `profiles.tenant_id` of the same integer type referencing it, with an index for
+tenant-scoped lookups. Retain globally unique internal profile and session IDs; adding tenant ownership does not
+silently make existing IDs tenant-local. If a consumer has tenant-local account or conversation IDs, its adapter maps
+the full scoped identity to distinct keel IDs. A naming convention alone is not authorization.
 
 Sessions and runs retain their profile ownership; messages, events and blobs are reached through that ownership
 chain. Memory remains keyed by profile. Every API-to-store operation uses validated ownership, and all resource

@@ -575,9 +575,9 @@ All under `/v1/profiles/{profile_id}` except `/healthz`. Details are in the [API
 | `PATCH /sessions/{id}`, `DELETE /sessions/{id}` | Rename; delete (refused while a run is in flight). |
 
 **Authentication** uses tenant-bound service keys: `Authorization: Bearer <key>`, compared in constant time.
-`/healthz` is open. Tenant IDs are positive integers; each tenant owns multiple independent profiles. The product
-authenticates end users and maps each tenant account to its profile. keel validates the key's tenant and the
-profile's ownership, while sessions, memory and private sandbox state stay per profile.
+`/healthz` is open. Tenant IDs are signed 32-bit integers (0 and negatives included); each tenant owns multiple
+independent profiles. The product authenticates end users and maps each tenant account to its profile. keel validates
+the key's tenant and the profile's ownership, while sessions, memory and private sandbox state stay per profile.
 
 **Errors** are always `{"error": {"code", "message"}}`. The codes a client sees: `unauthorized`, `unavailable`,
 `invalid_input`, `run_not_found`, `session_not_found`, `session_busy`, `at_capacity` (429), `model_not_allowed`,

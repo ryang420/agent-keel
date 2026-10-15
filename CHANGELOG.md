@@ -7,11 +7,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Tenant-bound service keys with positive integer tenant IDs (`KEEL_API_KEYS`, or `KEEL_API_KEY` plus
-  `KEEL_API_KEY_TENANT`). Migration 4 records tenant ownership of profiles; an existing database needs an explicit
-  `KEEL_TENANT_BACKFILL`. Other tenants' profiles and their sessions, runs and events return 404. Image blobs are
-  loaded only for their profile and session; sandbox mounts cannot overlap another profile's mounts and cannot be
-  changed once assigned to a profile.
+- Tenant-bound service keys with signed 32-bit integer tenant IDs (0 and negatives included) (`KEEL_API_KEYS`, or
+  `KEEL_API_KEY` plus `KEEL_API_KEY_TENANT`). Migration 4 records tenant ownership of profiles; an existing database
+  needs an explicit `KEEL_TENANT_BACKFILL`. Other tenants' profiles and their sessions, runs and events return 404.
+  Image blobs are loaded only for their profile and session; sandbox mounts cannot overlap another profile's mounts
+  and cannot be changed once assigned to a profile.
 - Background memory review: with memory on, every `KEEL_MEMORY_REVIEW_TURNS` completed runs of a profile, a review
   may save facts. It does not add messages or events to the session. A review already running for that profile is
   skipped, and one dropped because the background limit is full does not block the next.

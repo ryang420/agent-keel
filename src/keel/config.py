@@ -15,7 +15,10 @@ from typing import Mapping
 _DB_SCHEMES = ("postgresql://", "postgres://", "sqlite:///")
 _DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TENANT_INT_MIN = -2_147_483_648
 _TENANT_INT_MAX = 2_147_483_647
+# A canonical decimal: no sign on zero, no plus sign, no leading zeros.
+_TENANT = re.compile(r"^(?:0|-?[1-9][0-9]{0,9})$")
 _SECRET = re.compile(r"^[^\s,]+$")
 
 
@@ -64,8 +67,8 @@ class ServiceCredential:
     secret: str = field(repr=False)
 
     def __post_init__(self) -> None:
-        if type(self.tenant_id) is not int or not 0 < self.tenant_id <= _TENANT_INT_MAX:
-            raise ValueError("tenant id must be a positive 32-bit integer")
+        if type(self.tenant_id) is not int or not _TENANT_INT_MIN <= self.tenant_id <= _TENANT_INT_MAX:
+            raise ValueError("tenant id must be a 32-bit integer")
 
 
 def tenant_id_for(credentials: tuple[ServiceCredential, ...], authorization: str) -> int | None:
@@ -82,11 +85,9 @@ def tenant_id_for(credentials: tuple[ServiceCredential, ...], authorization: str
 
 
 def _credential(tenant_id: str, secret: str, source: str) -> ServiceCredential:
-    if not tenant_id.isascii() or not tenant_id.isdecimal() or tenant_id.startswith("0"):
-        raise ValueError(f"{source} tenant id must be a positive 32-bit integer")
+    if not _TENANT.fullmatch(tenant_id) or not _TENANT_INT_MIN <= int(tenant_id) <= _TENANT_INT_MAX:
+        raise ValueError(f"{source} tenant id must be a 32-bit integer")
     value = int(tenant_id)
-    if value > _TENANT_INT_MAX:
-        raise ValueError(f"{source} tenant id must be a positive 32-bit integer")
     if not secret or not _SECRET.fullmatch(secret):
         raise ValueError(f"{source} entry must be tenant:secret")
     return ServiceCredential(value, secret)
@@ -130,7 +131,7 @@ def _backfill(env: Mapping[str, str]) -> dict[str, int]:
     if not isinstance(data, dict) or not all(isinstance(k, str) and type(v) is int for k, v in data.items()):
         raise ValueError("KEEL_TENANT_BACKFILL must map profile ids to integer tenant ids")
     for profile_id, tenant_id in data.items():
-        if not _ID.fullmatch(profile_id) or not 0 < tenant_id <= _TENANT_INT_MAX:
+        if not _ID.fullmatch(profile_id) or not _TENANT_INT_MIN <= tenant_id <= _TENANT_INT_MAX:
             raise ValueError("KEEL_TENANT_BACKFILL has an invalid profile or integer tenant id")
     return dict(data)
 

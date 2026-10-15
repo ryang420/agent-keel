@@ -21,9 +21,11 @@ async def test_a_fresh_database_rejects_a_null_or_unknown_owner(store):
         await store.db.execute(
             "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
             "VALUES ('bare', '[]', '{}', '', '[]', 0, 0, 999999)")
-    for invalid in (0, -1, 2_147_483_648):
+    for invalid in (2_147_483_648, -2_147_483_649):
         with pytest.raises(Exception):
             await store.db.execute("INSERT INTO tenants (id) VALUES (?)", invalid)
+    for valid in (0, -1, 2_147_483_647, -2_147_483_648):
+        await store.db.execute("INSERT INTO tenants (id) VALUES (?)", valid)
     assert await store.get_profile("bare") is None
 
 

@@ -7,8 +7,8 @@ service key are required; an invalid value stops the service at start with a mes
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KEEL_API_KEYS` | unset | Comma-separated `tenant-id:secret` bindings, for example `1:key-a,2:key-b`. Each positive 32-bit integer tenant ID has its own key; multiple keys may name one tenant. A key cannot name two tenants. |
-| `KEEL_API_KEY`, `KEEL_API_KEY_TENANT` | unset | Single-key form of the binding. Both must be set together; `KEEL_API_KEY_TENANT` is a positive 32-bit integer. A bare key does not start the service. |
+| `KEEL_API_KEYS` | unset | Comma-separated `tenant-id:secret` bindings, for example `1:key-a,2:key-b`. Each tenant ID is a signed 32-bit integer (`0` and negatives such as `-5` are valid; no leading zeros or `+`) and has its own key; multiple keys may name one tenant. A key cannot name two tenants. |
+| `KEEL_API_KEY`, `KEEL_API_KEY_TENANT` | unset | Single-key form of the binding. Both must be set together; `KEEL_API_KEY_TENANT` is a signed 32-bit integer. A bare key does not start the service. |
 | `KEEL_TENANT_BACKFILL` | unset | Path to a JSON object mapping existing profile IDs to integer tenant IDs, for example `{"p1":1}`. Required while any existing profile lacks an owner. The named tenants must have configured keys; an incomplete, unknown or conflicting assignment stops startup without changing ownership. |
 | `KEEL_DATABASE_URL` | required | `postgresql://…` (or `postgres://…`) or `sqlite:///path`. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). A lost LISTEN connection is reconnected with backoff; several instances can share one database. |
 | `KEEL_HOST` | `0.0.0.0` | Listen address. |
