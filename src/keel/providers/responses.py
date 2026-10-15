@@ -8,6 +8,7 @@ agent/codex_runtime.py. See THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from typing import AsyncIterator, Iterable
@@ -143,6 +144,32 @@ async def _sse_events(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, dic
         yield decoded
 
 
+async def _until_stalled(events: AsyncIterator[tuple[str, dict]],
+                         stall_seconds: float | None) -> AsyncIterator[tuple[str, dict]]:
+    """Pass events through, failing as "timeout" once no response event has arrived for `stall_seconds`.
+
+    A read timeout alone cannot see a stall: Mantle keeps a stalled stream open with keep-alive traffic, which
+    resets it. So only `response.*` and `error` events count as progress; comments and other events do not.
+    """
+    if stall_seconds is None:
+        async for event in events:
+            yield event
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + stall_seconds
+    while True:
+        try:
+            async with asyncio.timeout_at(deadline):
+                kind, data = await anext(events)
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            raise ModelError("timeout", f"The model sent no response event for {stall_seconds:g} s.") from None
+        if kind.startswith("response.") or kind == "error":
+            deadline = loop.time() + stall_seconds
+        yield kind, data
+
+
 class _Assembler:
     def __init__(self, provider: str, model: str) -> None:
         self.provider, self.model = provider, model
@@ -196,9 +223,11 @@ class _Assembler:
 
 
 class ResponsesTransport:
-    def __init__(self, provider_name: str, url: str, client: httpx.AsyncClient, *, compat: bool = False) -> None:
+    def __init__(self, provider_name: str, url: str, client: httpx.AsyncClient, *, compat: bool = False,
+                 stall_seconds: float | None = None) -> None:
         # compat: omit include, prompt_cache_key and reasoning.summary, which strict servers may reject.
         self.compat = compat
+        self.stall_seconds = stall_seconds
         self.provider_name = provider_name
         self.url = url
         self.client = client
@@ -240,7 +269,7 @@ class ResponsesTransport:
                 if response.status_code >= 400:
                     text = (await response.aread()).decode("utf-8", errors="replace")
                     raise error_from_http(response.status_code, text, response.headers.get("retry-after"))
-                async for kind, data in _sse_events(response.aiter_lines()):
+                async for kind, data in _until_stalled(_sse_events(response.aiter_lines()), self.stall_seconds):
                     for event in assembler.feed(kind, data):
                         yield event
                     if assembler.done:
