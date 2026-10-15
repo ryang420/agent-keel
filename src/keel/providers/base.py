@@ -21,11 +21,13 @@ class StallLimits:
     The first event (response.created) normally arrives within seconds. After it, a service may stay silent
     while it prefills a large prompt or reasons, so the gap between events is allowed to grow with the request
     size; at high effort both limits are raised to `high_effort`, since the model may think for minutes first.
+    300 s is Hermes's high-effort silence floor: long enough for real thinking, short enough that a retried stall
+    still finishes inside a client's ten-minute wait (600 s did not).
     """
 
     first_event: float = 120.0
     between_events: float = 60.0
-    high_effort: float = 600.0
+    high_effort: float = 300.0
 
     def for_request(self, effort: str | None, body_bytes: int) -> tuple[float, float]:
         """(first-event limit, between-events limit) for one call. Tokens are estimated as body bytes / 4;
