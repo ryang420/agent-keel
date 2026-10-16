@@ -11,6 +11,9 @@ All notable changes to this project are documented here. The format follows
   delay) and an error when the last attempt fails, so a stalled or failing provider shows up in the service log.
 
 ### Fixed
+- The SQLite store closes every cursor it opens (`BEGIN IMMEDIATE`, the connect-time PRAGMAs, `executescript`). One
+  left to the garbage collector was freed on the event loop thread while the connection's worker thread ran another
+  statement, which crashed the test suite with a segmentation fault in about 1 of 40 runs. PostgreSQL is not affected.
 - A session's model title is written from every user message so far, not only the first completed run's input. A
   conversation whose first turn was stopped or failed was titled from its second turn alone (a bare greeting).
 - A stalled model stream now fails as `timeout` and is retried if it had streamed nothing. A stalled Bedrock Mantle
