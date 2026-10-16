@@ -29,6 +29,9 @@ class SqliteDb:
 
     dialect = "sqlite"
 
+    # Every cursor is closed through aiosqlite, on the connection's worker thread: one left to the garbage collector
+    # is freed on the event loop thread, possibly while the worker runs another statement (a segfault in tests).
+
     def __init__(self, conn: aiosqlite.Connection) -> None:
         self._conn = conn
         self._lock = asyncio.Lock()
@@ -39,8 +42,10 @@ class SqliteDb:
         conn = await aiosqlite.connect(path)
         conn.row_factory = aiosqlite.Row
         # foreign_keys is ignored inside a transaction, so it is set and committed with journal_mode.
-        await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.execute("PRAGMA journal_mode=WAL")
+        async with conn.execute("PRAGMA foreign_keys=ON"):
+            pass
+        async with conn.execute("PRAGMA journal_mode=WAL"):
+            pass
         await conn.commit()
         return cls(conn)
 
@@ -78,7 +83,7 @@ class SqliteDb:
 
     async def executescript(self, script: str) -> None:
         async with self._lock:
-            await self._conn.executescript(script)
+            await (await self._conn.executescript(script)).close()
             await self._conn.commit()
 
     @asynccontextmanager
@@ -90,7 +95,8 @@ class SqliteDb:
             token = self._in_tx.set(True)
             try:
                 try:
-                    await self._conn.execute("BEGIN IMMEDIATE")
+                    async with self._conn.execute("BEGIN IMMEDIATE"):
+                        pass
                     yield
                 except BaseException:
                     await self._conn.rollback()
