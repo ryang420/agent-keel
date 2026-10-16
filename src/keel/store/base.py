@@ -85,6 +85,16 @@ class StoredMessage:
 
 
 @dataclass(frozen=True)
+class ImportResult:
+    """What SqlStore.import_session did with one conversation."""
+
+    status: str  # "imported" or "exists"
+    profile_created: bool
+    message_ids: tuple[int, ...]
+    title: str | None = None
+
+
+@dataclass(frozen=True)
 class Run:
     id: str
     profile_id: str

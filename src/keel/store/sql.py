@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Callable
+from typing import Callable, Sequence
 
 from keel.memory import apply_entries
 from keel.models import (
@@ -13,7 +13,7 @@ from keel.models import (
     tool_call_from_dict, tool_call_to_dict,
 )
 from keel.store.base import (
-    TITLE_RANK, WORKER_LOST_MESSAGE, Event, Profile, ProfileTenantMismatch, Run, Session, SessionBusy,
+    TITLE_RANK, WORKER_LOST_MESSAGE, Event, ImportResult, Profile, ProfileTenantMismatch, Run, Session, SessionBusy,
     SessionNotFound, StoredMessage, TitleInUse, UniqueViolation,
 )
 from keel.store.migrations import migrate
@@ -165,6 +165,48 @@ class SqlStore:
         if row["profile_id"] != profile_id:
             raise SessionNotFound(session_id)
         return _session(row)
+
+    async def import_session(self, *, profile_id: str, tenant_id: int, session_id: str, title: str | None,
+                             title_source: str | None, created_at: float, last_active_at: float,
+                             messages: Sequence[tuple[Message, float]]) -> ImportResult:
+        """Write one conversation copied from another system as it was: its title, times and messages.
+
+        A session id that exists already, under any profile, is left alone. A missing profile is created empty for
+        `tenant_id`; the service's next profile update fills it in. One transaction: a failure writes nothing."""
+        async with self.db.transaction():
+            if await self.db.fetchrow("SELECT id FROM sessions WHERE id = ?", session_id) is not None:
+                return ImportResult("exists", False, ())
+            profile = await self.get_profile(profile_id)
+            if profile is None:
+                await self.upsert_profile(profile_id, models=[], sandbox={}, soul="", skills=[], tenant_id=tenant_id)
+            elif profile.tenant_id != tenant_id:
+                raise ProfileTenantMismatch(profile_id)
+            title = await self._free_title(profile_id, title)
+            await self.db.execute(
+                "INSERT INTO sessions (id, profile_id, title, title_source, created_at, last_active_at, "
+                "message_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                session_id, profile_id, title, title_source if title is not None else None, created_at,
+                last_active_at, len(messages))
+            ids = []
+            for message, at in messages:
+                row = await self.db.fetchrow(
+                    "INSERT INTO messages (session_id, run_id, role, parts, tool_calls, tool_call_id, tool_name, "
+                    "reasoning, active, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?, '[]', 1, ?) RETURNING id",
+                    session_id, message.role, _j([part_to_dict(p) for p in message.parts]),
+                    _j([tool_call_to_dict(c) for c in message.tool_calls]), message.tool_call_id,
+                    message.tool_name, at)
+                ids.append(row["id"])
+        return ImportResult("imported", profile is None, tuple(ids), title)
+
+    async def _free_title(self, profile_id: str, title: str | None) -> str | None:
+        """`title`, or `title (n)` for the first n from 2 the profile does not use (titles are unique per profile)."""
+        if title is None:
+            return None
+        candidate, n = title, 2
+        while await self.db.fetchrow("SELECT id FROM sessions WHERE profile_id = ? AND title = ?",
+                                     profile_id, candidate) is not None:
+            candidate, n = f"{title} ({n})", n + 1
+        return candidate
 
     async def get_session(self, profile_id: str, session_id: str) -> Session | None:
         row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ? AND profile_id = ?",
