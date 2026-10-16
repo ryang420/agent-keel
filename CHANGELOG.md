@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format follows
   delay) and an error when the last attempt fails, so a stalled or failing provider shows up in the service log.
 
 ### Fixed
+- A session's model title is written from every user message so far, not only the first completed run's input. A
+  conversation whose first turn was stopped or failed was titled from its second turn alone (a bare greeting).
 - A stalled model stream now fails as `timeout` and is retried if it had streamed nothing. A stalled Bedrock Mantle
   stream sends keep-alives but no response events; they kept resetting the fixed 600 s read timeout, so a run waited
   until its client gave up. Stalls are now timed between response events (`response.*` or `error`), in two stages:
