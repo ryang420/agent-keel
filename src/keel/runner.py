@@ -499,7 +499,8 @@ class RunExecutor:
                         release(run.profile_id)
 
     async def _maybe_title(self, run: Run) -> None:
-        """After the first completed run, ask the model to name a session that still has a derived title."""
+        """After the first completed run, ask the model to name a session that still has a derived title, from every
+        user message so far."""
         if self.background is None:
             return
         session = await self.store.get_session(run.profile_id, run.session_id)
@@ -508,7 +509,11 @@ class RunExecutor:
         earlier = await self.store.completed_run_count(run.session_id, except_id=run.id)
         if earlier:
             return
-        text = " ".join(part.get("text", "") for part in run.input if part.get("type") == "text")[:TITLE_INPUT_CHARS]
+        # The whole conversation so far, not just this run's input: a first turn that was stopped or failed
+        # still says what the conversation is about (titling from "hello" alone gave "Friendly greeting").
+        users = [stored.message.text for stored in await self.store.messages(run.session_id)
+                 if stored.message.role == "user" and stored.message.text.strip()]
+        text = "\n".join(users)[:TITLE_INPUT_CHARS]
         if not text.strip():
             return
         self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}")

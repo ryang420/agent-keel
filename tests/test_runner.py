@@ -368,3 +368,20 @@ async def test_a_profile_with_neither_still_gets_no_tools(setup):
     await executor.execute(await start(store))
     assert provider.requests[0].tools == ()
 
+
+
+async def test_the_title_covers_the_conversation_when_its_first_run_did_not_complete(setup):
+    # 2026-10-16: a session whose first turn was stopped was titled from its second turn, a bare "hello"
+    # ("友好问候"), because the title read only the first completed run's input.
+    from keel.providers.base import ModelError
+
+    store, provider, executor, background = with_background(setup)
+    provider.script = [[ModelError("bad_request", "refused")], DONE, TITLE_OK]
+    first = await start(store, OPENING)
+    await executor.execute(first)
+    assert (await store.get_run("p1", first.id)).status == "failed"
+    await executor.execute(await start(store, "hello"))
+    await wait_for_background(background)
+    title_request = provider.requests[-1]
+    assert OPENING in title_request.messages[0].text and "hello" in title_request.messages[0].text
+    assert (await store.get_session("p1", "s1")).title == "Pool exhausts under load"
