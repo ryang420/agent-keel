@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `python -m keel.admin import-sessions` imports conversations copied from another system: JSON lines on stdin, one
+  result line per conversation on stdout ([operations guide](docs/guide/operations.md)). A conversation keeps its
+  title (numbered if the profile already uses it), times and messages, and never any reasoning. An existing session
+  id is skipped, and a missing profile is created empty for its tenant. Each conversation is one transaction, and
+  `--dry-run` validates without writing.
 - Model-call retries are logged: a warning per retry (call, provider/model, error code and message, attempt,
   delay) and an error when the last attempt fails, so a stalled or failing provider shows up in the service log.
 
