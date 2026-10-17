@@ -13,8 +13,9 @@ from keel.models import (
     tool_call_from_dict, tool_call_to_dict,
 )
 from keel.store.base import (
-    TITLE_RANK, WORKER_LOST_MESSAGE, Event, ImportResult, Profile, ProfileTenantMismatch, Run, Session, SessionBusy,
-    SessionNotFound, StoredMessage, TitleInUse, UniqueViolation,
+    TERMINAL, TERMINAL_EVENT, TITLE_RANK, WORKER_LOST_MESSAGE, Event, ImportResult, Profile, ProfileTenantMismatch,
+    Run, RunTransition, Session, SessionBusy, SessionNotFound, StoredMessage, TerminalEventType, TitleInUse,
+    UniqueViolation, UnknownRun,
 )
 from keel.store.migrations import migrate
 
@@ -425,53 +426,133 @@ class SqlStore:
             lease_until, run_id, owner)
         return row["status"] if row else None
 
-    async def request_stop(self, profile_id: str, run_id: str) -> Run | None:
-        await self.db.execute(
-            "UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ? AND profile_id = ? "
-            "AND status = 'queued'", self.clock(), run_id, profile_id)
-        await self.db.execute(
-            "UPDATE runs SET status = 'stopping' WHERE id = ? AND profile_id = ? AND status = 'running'",
-            run_id, profile_id)
-        return await self.get_run(profile_id, run_id)
+    async def _locked_run(self, run_id: str, profile_id: str | None = None) -> dict | None:
+        """Read a run under the transaction's row lock (Postgres) or its BEGIN IMMEDIATE write lock (SQLite)."""
+        lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
+        if profile_id is None:
+            return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ?{lock}", run_id)
+        return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ? AND profile_id = ?{lock}",
+                                      run_id, profile_id)
+
+    async def request_stop(self, profile_id: str, run_id: str) -> RunTransition | None:
+        """Move a run toward cancellation, committing the queued-run transition and its event together.
+
+        A queued run becomes cancelled with its `run.cancelled` event; a running run becomes stopping with no event
+        yet; a stopping or terminal run is returned as it is. Exactly one caller can commit the cancellation.
+        """
+        async with self.db.transaction():
+            row = await self._locked_run(run_id, profile_id)
+            if row is None:
+                return None
+            if row["status"] == "queued":
+                now = self.clock()
+                updated = await self.db.fetchrow(
+                    "UPDATE runs SET status = 'cancelled', finished_at = ?, lease_owner = NULL, "
+                    "lease_expires_at = NULL WHERE id = ? AND status = 'queued' RETURNING *", now, run_id)
+                if updated is None:  # unreachable under the lock; never invent an event
+                    return RunTransition(_run(row), None)
+                event = await self._insert_event_locked(run_id, "run.cancelled", {}, now)
+                return RunTransition(_run(updated), event)
+            if row["status"] == "running":
+                updated = await self.db.fetchrow(
+                    "UPDATE runs SET status = 'stopping' WHERE id = ? AND status = 'running' RETURNING *", run_id)
+                return RunTransition(_run(updated if updated is not None else row), None)
+            return RunTransition(_run(row), None)
 
     async def set_current_exec(self, run_id: str, exec_id: str | None) -> None:
         await self.db.execute("UPDATE runs SET current_exec_id = ? WHERE id = ?", exec_id, run_id)
 
     async def finish_run(self, run_id: str, status: str, *, output: str = "", usage: Usage = Usage(),
-                         error_code: str | None = None, error: str | None = None) -> bool:
-        row = await self.db.fetchrow(
-            "UPDATE runs SET status = ?, output = ?, usage = ?, error_code = ?, error = ?, finished_at = ?, "
-            f"lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN {_IN_FLIGHT} RETURNING id",
-            status, output, _j(usage.to_dict()), error_code, error, self.clock(), run_id)
-        return row is not None
+                         error_code: str | None = None, error: str | None = None,
+                         incomplete: bool = False) -> RunTransition | None:
+        """Finish an active run and insert its terminal event in one transaction.
 
-    async def expire_leases(self) -> list[Run]:
+        A missing run returns None. An already-terminal run is returned unchanged with no event, so retrying a
+        transition cannot overwrite its outcome. Outcome arguments are validated before anything is read or written.
+        """
+        if status not in TERMINAL:
+            raise ValueError(f"unknown terminal status {status!r}")
+        if status == "failed" and (not error_code or not error):
+            raise ValueError("a failed run needs an error code and a message")
+        if incomplete and status != "completed":
+            raise ValueError("only a completed run can be incomplete")
+        async with self.db.transaction():
+            row = await self._locked_run(run_id)
+            if row is None:
+                return None
+            if row["status"] in TERMINAL:
+                return RunTransition(_run(row), None)
+            now = self.clock()
+            updated = await self.db.fetchrow(
+                "UPDATE runs SET status = ?, output = ?, usage = ?, error_code = ?, error = ?, finished_at = ?, "
+                f"lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN {_IN_FLIGHT} RETURNING *",
+                status, output, _j(usage.to_dict()), error_code, error, now, run_id)
+            if updated is None:  # unreachable under the lock; never invent an event
+                return RunTransition(_run(row), None)
+            if status == "completed":
+                data = {"output": output, "usage": usage.to_dict()}
+                if incomplete:
+                    data["incomplete"] = True
+            elif status == "failed":
+                data = {"error_code": error_code, "message": error}
+            else:
+                data = {}
+            event = await self._insert_event_locked(run_id, TERMINAL_EVENT[status], data, now)
+            return RunTransition(_run(updated), event)
+
+    async def expire_leases(self, *, batch: int = 100) -> list[RunTransition]:
+        """Fail one bounded batch of runs whose lease expired, their terminal events committing with them.
+
+        Postgres locks the selected rows with SKIP LOCKED, so a sweep, a renewal and a finish serialise on the run
+        row. SQLite serialises writers with BEGIN IMMEDIATE. A failure rolls the whole batch back; the next pass
+        selects the same runs again.
+        """
         now = self.clock()
-        rows = await self.db.fetch(
-            "UPDATE runs SET status = 'failed', error_code = 'worker_lost', error = ?, finished_at = ?, "
-            "lease_owner = NULL, lease_expires_at = NULL "
-            "WHERE status IN ('running', 'stopping') AND lease_expires_at < ? RETURNING *",
-            WORKER_LOST_MESSAGE, now, now)
-        return [_run(row) for row in rows]
+        async with self.db.transaction():
+            lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
+            rows = await self.db.fetch(
+                "SELECT * FROM runs WHERE status IN ('running', 'stopping') AND lease_expires_at < ? "
+                f"ORDER BY id LIMIT ?{lock}", now, batch)
+            transitions = []
+            for row in rows:
+                updated = await self.db.fetchrow(
+                    "UPDATE runs SET status = 'failed', error_code = 'worker_lost', error = ?, finished_at = ?, "
+                    "lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN ('running', 'stopping') "
+                    "AND lease_expires_at < ? RETURNING *", WORKER_LOST_MESSAGE, now, row["id"], now)
+                if updated is None:  # renewed or finished despite the lock (defense in depth)
+                    continue
+                event = await self._insert_event_locked(
+                    row["id"], "run.failed", {"error_code": "worker_lost", "message": WORKER_LOST_MESSAGE}, now)
+                transitions.append(RunTransition(_run(updated), event))
+            return transitions
 
     # events
 
-    async def append_event(self, run_id: str, type_: str, data: dict) -> Event:
-        now = self.clock()
-        for attempt in range(3):
-            try:
-                async with self.db.transaction():
-                    row = await self.db.fetchrow(
-                        "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?", run_id)
-                    seq = int(row["seq"])
-                    await self.db.execute(
-                        "INSERT INTO run_events (run_id, seq, type, data, at) VALUES (?, ?, ?, ?, ?)",
-                        run_id, seq, type_, _j(data), now)
-                return Event(run_id, seq, type_, data, now)
-            except UniqueViolation:
-                if attempt == 2:
-                    raise
-        raise AssertionError("unreachable")
+    async def _insert_event_locked(self, run_id: str, type_: str, data: dict, at: float) -> Event:
+        """Insert one event. The caller holds the transaction and the run lock, so sequence allocation serialises."""
+        row = await self.db.fetchrow(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id = ?", run_id)
+        seq = int(row["seq"])
+        await self.db.execute(
+            "INSERT INTO run_events (run_id, seq, type, data, at) VALUES (?, ?, ?, ?, ?)",
+            run_id, seq, type_, _j(data), at)
+        return Event(run_id, seq, type_, data, at)
+
+    async def append_event(self, run_id: str, type_: str, data: dict) -> Event | None:
+        """Append an ordinary event, serialising with termination on the run row.
+
+        Terminal event types belong to the lifecycle operations and are rejected; an unknown run is rejected
+        rather than left with orphan events. A terminal run returns None, which a late writer can stop quietly on.
+        """
+        if type_ in TERMINAL_EVENT.values():
+            raise TerminalEventType(f"terminal event {type_!r} is written by the run transition itself")
+        async with self.db.transaction():
+            row = await self._locked_run(run_id)
+            if row is None:
+                raise UnknownRun(f"no such run {run_id!r}")
+            if row["status"] in TERMINAL:
+                return None
+            return await self._insert_event_locked(run_id, type_, data, self.clock())
 
     async def events_after(self, run_id: str, after_seq: int) -> list[Event]:
         rows = await self.db.fetch("SELECT * FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq",

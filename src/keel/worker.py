@@ -58,9 +58,10 @@ class WorkerPool:
             await asyncio.wait(workers, timeout=drain_seconds)
         for run in list(self._inflight.values()):
             try:
-                if await self.store.finish_run(run.id, "failed", error_code="worker_lost", error=SHUTDOWN_MESSAGE):
-                    await self.executor.emit(run.id, "run.failed",
-                                             {"error_code": "worker_lost", "message": SHUTDOWN_MESSAGE})
+                transition = await self.store.finish_run(run.id, "failed", error_code="worker_lost",
+                                                         error=SHUTDOWN_MESSAGE)
+                if transition is not None and transition.event is not None:
+                    await self.bus.notify(run.id)
             except Exception:
                 log.exception("could not fail %s at shutdown", run.id)
         for task in workers:
@@ -70,18 +71,18 @@ class WorkerPool:
         self._inflight.clear()
 
     async def sweep_once(self) -> int:
-        """Fail every run whose lease expired, then kill the commands their dead workers left running. The events
-        go first so a slow sandbox cannot delay them."""
-        expired = await self.store.expire_leases()
-        for run in expired:
-            try:
-                await self.executor.emit(run.id, "run.failed",
-                                         {"error_code": "worker_lost", "message": WORKER_LOST_MESSAGE})
-            except Exception:
-                log.exception("could not emit run.failed for %s", run.id)
-        for run in expired:
-            await self.executor.kill_orphaned_command(run)
-        return len(expired)
+        """Fail one bounded batch of expired runs, then kill the commands their dead workers left running. The
+        notifications go first so a slow sandbox cannot delay terminal visibility."""
+        transitions = await self.store.expire_leases()
+        for transition in transitions:
+            if transition.event is not None:
+                try:
+                    await self.bus.notify(transition.run.id)
+                except Exception:
+                    log.warning("could not notify about %s", transition.run.id, exc_info=True)
+        for transition in transitions:
+            await self.executor.kill_orphaned_command(transition.run)
+        return len(transitions)
 
     async def _sweep(self) -> None:
         while not self._closing:

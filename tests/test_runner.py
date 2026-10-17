@@ -55,6 +55,22 @@ async def test_a_completed_turn_stores_both_messages_usage_and_events(setup):
     assert (await store.get_session("p1", "s1")).title == "What is two plus two?"
 
 
+async def test_completion_work_runs_only_when_the_terminal_transition_was_won(setup):
+    store, provider, executor = setup
+    run = await start(store)
+    await store.finish_run(run.id, "cancelled")  # a stop lands while the model call is in flight
+    called = []
+
+    async def spy(*args):
+        called.append(args)
+
+    executor._after_complete = spy
+    await executor.execute(run)
+    assert called == []
+    assert [e.type for e in await store.events_after(run.id, 0)] == ["run.cancelled"]
+    assert (await store.get_run("p1", run.id)).status == "cancelled"
+
+
 async def test_the_request_carries_identity_instructions_and_history(setup):
     store, provider, executor = setup
     await executor.execute(await start(store, "first"))
