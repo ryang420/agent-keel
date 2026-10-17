@@ -8,12 +8,21 @@ from keel.models import Message, Usage
 
 ACTIVE = ("queued", "running", "stopping")
 TERMINAL = ("completed", "failed", "cancelled")
+TERMINAL_EVENT = {"completed": "run.completed", "failed": "run.failed", "cancelled": "run.cancelled"}
 TITLE_RANK = {"derived": 0, "llm": 1, "user": 2}
 WORKER_LOST_MESSAGE = "The worker running this run stopped responding."
 
 
 class StoreError(Exception):
     pass
+
+
+class UnknownRun(ValueError):
+    """An event write named a run that does not exist; nothing was written."""
+
+
+class TerminalEventType(ValueError):
+    """A terminal event may only be written by the run transition that commits it."""
 
 
 class SessionNotFound(StoreError):
@@ -124,3 +133,11 @@ class Event:
     type: str
     data: dict
     at: float
+
+
+@dataclass(frozen=True)
+class RunTransition:
+    """A terminal transition's outcome: the run, and the event this call committed (None when it did not win)."""
+
+    run: Run
+    event: Event | None

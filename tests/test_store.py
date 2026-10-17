@@ -3,7 +3,8 @@ import asyncio
 import pytest
 
 from keel.models import ImagePart, Message, ReasoningItem, TextPart, ToolCall, Usage
-from keel.store.base import SessionBusy, SessionNotFound, TitleInUse
+from keel.store.base import (WORKER_LOST_MESSAGE, SessionBusy, SessionNotFound, TerminalEventType, TitleInUse,
+                             UnknownRun)
 
 MODELS = [{"provider": "fake", "model": "m"}]
 
@@ -100,11 +101,14 @@ async def test_a_run_is_claimed_once_leased_and_finished_once(store, clock):
     assert await store.renew_lease(run.id, "w1", clock.now + 60) == "running"
     assert await store.renew_lease(run.id, "w2", clock.now + 60) is None
     stopping = await store.request_stop("p1", run.id)
-    assert stopping.status == "stopping"
+    assert stopping.run.status == "stopping" and stopping.event is None
     assert await store.renew_lease(run.id, "w1", clock.now + 90) == "stopping"
     usage = Usage(10, 2, 8, 0)
-    assert await store.finish_run(run.id, "completed", output="done", usage=usage) is True
-    assert await store.finish_run(run.id, "failed", error_code="x") is False
+    transition = await store.finish_run(run.id, "completed", output="done", usage=usage)
+    assert transition is not None and transition.event is not None
+    assert transition.event.type == "run.completed"
+    again = await store.finish_run(run.id, "failed", error_code="x", error="late")
+    assert again is not None and again.event is None and again.run.status == "completed"
     finished = await store.get_run("p1", run.id)
     assert (finished.status, finished.output, finished.usage) == ("completed", "done", usage)
     assert finished.lease_owner is None and finished.finished_at == clock.now
@@ -114,7 +118,11 @@ async def test_a_run_is_claimed_once_leased_and_finished_once(store, clock):
 
 async def test_stopping_a_queued_run_cancels_it(store):
     run = await make_run(store)
-    assert (await store.request_stop("p1", run.id)).status == "cancelled"
+    first = await store.request_stop("p1", run.id)
+    assert first.run.status == "cancelled" and first.event is not None
+    assert first.event.type == "run.cancelled" and first.event.data == {}
+    again = await store.request_stop("p1", run.id)
+    assert again.run.status == "cancelled" and again.event is None
     assert await store.request_stop("p1", "run_missing") is None
 
 
@@ -124,8 +132,170 @@ async def test_expired_leases_fail_their_runs(store, clock):
     assert await store.expire_leases() == []
     clock.now += 31
     expired = await store.expire_leases()
-    assert [r.id for r in expired] == [run.id]
-    assert expired[0].status == "failed" and expired[0].error_code == "worker_lost"
+    assert [t.run.id for t in expired] == [run.id]
+    assert expired[0].run.status == "failed" and expired[0].run.error_code == "worker_lost"
+    assert expired[0].event is not None and expired[0].event.type == "run.failed"
+
+
+async def test_finish_run_commits_the_canonical_event_with_the_state(store, clock):
+    usage = Usage(10, 2, 8, 0)
+    completed = await make_run(store, "completed")
+    await store.claim_run("w1", clock.now + 30)
+    await store.set_current_exec(completed.id, "x1")
+    transition = await store.finish_run(completed.id, "completed", output="done", usage=usage, incomplete=True)
+    assert transition.run.finished_at == transition.event.at == clock.now
+    assert transition.event.type == "run.completed"
+    assert transition.event.data == {"output": "done", "usage": usage.to_dict(), "incomplete": True}
+    saved = await store.get_run("p1", completed.id)
+    assert saved.current_exec_id == "x1"  # the sweeper still needs it to kill a leftover command
+    assert saved.lease_owner is None and saved.lease_expires_at is None
+
+    failed = await make_run(store, "failed")
+    transition = await store.finish_run(failed.id, "failed", error_code="bad_request", error="nope")
+    assert transition.event.type == "run.failed"
+    assert transition.event.data == {"error_code": "bad_request", "message": "nope"}
+
+    cancelled = await make_run(store, "cancelled")
+    transition = await store.finish_run(cancelled.id, "cancelled")
+    assert transition.event.type == "run.cancelled" and transition.event.data == {}
+    assert [e.data for e in await store.events_after(cancelled.id, 0)] == [{}]
+
+
+async def test_finish_run_validates_its_arguments_before_reading_the_run(store):
+    run = await make_run(store)
+    invalid = [
+        dict(status="running"),
+        dict(status="failed"),
+        dict(status="failed", error_code="x"),
+        dict(status="failed", error="x"),
+        dict(status="cancelled", incomplete=True),
+    ]
+    for kwargs in invalid:
+        with pytest.raises(ValueError):
+            await store.finish_run(run.id, **kwargs)
+    assert (await store.get_run("p1", run.id)).status == "queued"
+    assert await store.events_after(run.id, 0) == []
+    assert await store.finish_run("missing", "completed") is None
+    # Validation does not depend on the run still being active: a retry with bad arguments is a bug, not a no-op.
+    await store.finish_run(run.id, "completed")
+    with pytest.raises(ValueError):
+        await store.finish_run(run.id, "failed", error_code="x", error="")
+    assert len(await store.events_after(run.id, 0)) == 1
+
+
+async def test_expire_leases_handles_a_bounded_batch(store, clock):
+    runs = []
+    for index in range(5):
+        run = await make_run(store, f"s{index}")
+        await store.claim_run("dead", clock.now + 30)
+        runs.append(run)
+    clock.now += 31
+    assert [len(await store.expire_leases(batch=2)) for _ in range(3)] == [2, 2, 1]
+    assert await store.expire_leases(batch=2) == []
+    for run in runs:
+        events = await store.events_after(run.id, 0)
+        assert [e.type for e in events] == ["run.failed"]
+        assert events[0].data == {"error_code": "worker_lost", "message": WORKER_LOST_MESSAGE}
+        assert events[0].at == clock.now
+        saved = await store.get_run("p1", run.id)
+        assert (saved.status, saved.finished_at, saved.lease_owner) == ("failed", clock.now, None)
+
+
+async def test_a_failure_while_writing_events_rolls_the_whole_expiry_batch_back(store, clock):
+    runs = []
+    for index in range(3):
+        runs.append(await make_run(store, f"s{index}"))
+        await store.claim_run("dead", clock.now + 30)
+    clock.now += 31
+    real = store._insert_event_locked
+    calls = 0
+
+    async def flaky(run_id, type_, data, at):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("event write failed")
+        return await real(run_id, type_, data, at)
+
+    store._insert_event_locked = flaky
+    try:
+        with pytest.raises(RuntimeError):
+            await store.expire_leases()
+    finally:
+        store._insert_event_locked = real
+    for run in runs:
+        saved = await store.get_run("p1", run.id)
+        assert saved.status == "running" and saved.lease_owner == "dead"
+        assert await store.events_after(run.id, 0) == []
+    assert len(await store.expire_leases()) == 3
+
+
+async def test_cancelling_a_finish_before_commit_rolls_the_transition_back(store, clock):
+    run = await make_run(store)
+    await store.claim_run("w1", clock.now + 30)
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = store._insert_event_locked
+
+    async def blocking(*args):
+        entered.set()
+        await release.wait()
+        return await real(*args)
+
+    store._insert_event_locked = blocking
+    task = asyncio.create_task(store.finish_run(run.id, "completed", output="x"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    store._insert_event_locked = real
+    saved = await store.get_run("p1", run.id)
+    assert saved.status == "running" and saved.finished_at is None
+    assert await store.events_after(run.id, 0) == []
+    assert (await store.finish_run(run.id, "completed", output="x")).event is not None
+
+
+async def test_a_lost_acknowledgement_can_be_retried_without_a_second_event(store):
+    run = await make_run(store)
+    real = store.finish_run
+
+    async def commit_then_lose(*args, **kwargs):
+        await real(*args, **kwargs)
+        raise RuntimeError("the connection dropped after commit")
+
+    store.finish_run = commit_then_lose
+    try:
+        with pytest.raises(RuntimeError):
+            await store.finish_run(run.id, "completed", output="first")
+    finally:
+        store.finish_run = real
+    retry = await store.finish_run(run.id, "completed", output="second")
+    assert retry.event is None
+    assert (retry.run.output, retry.run.status) == ("first", "completed")
+    assert [e.data["output"] for e in await store.events_after(run.id, 0)] == ["first"]
+
+
+async def test_append_event_rejects_terminal_types_and_unknown_runs(store):
+    run = await make_run(store)
+    for type_ in ("run.completed", "run.failed", "run.cancelled"):
+        with pytest.raises(TerminalEventType):
+            await store.append_event(run.id, type_, {})
+    assert await store.events_after(run.id, 0) == []
+    with pytest.raises(UnknownRun):
+        await store.append_event("run_missing", "run.started", {})
+    rows = await store.db.fetch("SELECT COUNT(*) AS n FROM run_events WHERE run_id = ?", "run_missing")
+    assert rows[0]["n"] == 0
+
+
+async def test_append_event_stops_at_the_terminal_event(store, clock):
+    run = await make_run(store)
+    assert (await store.append_event(run.id, "run.started", {})).seq == 1
+    await store.claim_run("w1", clock.now + 30)
+    await store.request_stop("p1", run.id)  # stopping: still accepts ordinary events
+    assert (await store.append_event(run.id, "message.delta", {"text": "x"})).seq == 2
+    await store.finish_run(run.id, "cancelled")
+    assert await store.append_event(run.id, "message.delta", {"text": "late"}) is None
+    assert [e.type for e in await store.events_after(run.id, 0)] == [
+        "run.started", "message.delta", "run.cancelled"]
 
 
 async def test_list_runs_by_status(store, clock):
@@ -140,9 +310,10 @@ async def test_list_runs_by_status(store, clock):
 
 async def test_events_are_numbered_per_run(store):
     run = await make_run(store)
+    other_run = await make_run(store, "s2")
     first = await store.append_event(run.id, "run.started", {"model": "m"})
     second = await store.append_event(run.id, "message.delta", {"text": "hi"})
-    other = await store.append_event("run_other", "run.started", {})
+    other = await store.append_event(other_run.id, "run.started", {})
     assert (first.seq, second.seq, other.seq) == (1, 2, 1)
     assert [e.type for e in await store.events_after(run.id, 0)] == ["run.started", "message.delta"]
     assert [e.data for e in await store.events_after(run.id, 1)] == [{"text": "hi"}]
@@ -156,7 +327,8 @@ async def test_stopping_a_finished_run_leaves_it_finished(store):
     run = await make_run(store)
     await store.claim_run("w1", 9_999)
     await store.finish_run(run.id, "completed", output="done")
-    assert (await store.request_stop("p1", run.id)).status == "completed"
+    transition = await store.request_stop("p1", run.id)
+    assert transition.run.status == "completed" and transition.event is None
     assert await store.request_stop("p2", run.id) is None
 
 
@@ -276,7 +448,7 @@ async def test_in_flight_profiles_are_those_with_a_queued_or_running_run(store):
     await store.finish_run(runs["p3"].id, "completed")
     while (await store.get_run("p4", runs["p4"].id)).status != "running":
         assert await store.claim_run("w1", 9_999_999) is not None
-    assert (await store.request_stop("p4", runs["p4"].id)).status == "stopping"
+    assert (await store.request_stop("p4", runs["p4"].id)).run.status == "stopping"
     assert await store.in_flight_profiles() == {"p1", "p2", "p4"}
 
 
@@ -297,9 +469,9 @@ async def test_pruning_deletes_only_events_of_runs_finished_before_the_cutoff(st
     await store.finish_run(runs[0].id, "completed", output="old")  # finished at 1000
     clock.now += 100
     await store.finish_run(runs[1].id, "completed", output="new")  # finished at 1100; runs[2] is still queued
-    assert await store.prune_events(1050, batch=2) == 5
+    assert await store.prune_events(1050, batch=2) == 6  # five deltas and the terminal event
     assert await store.events_after(runs[0].id, 0) == []
-    assert len(await store.events_after(runs[1].id, 0)) == 5
+    assert len(await store.events_after(runs[1].id, 0)) == 6
     assert len(await store.events_after(runs[2].id, 0)) == 5
     old = await store.get_run("p1", runs[0].id)
     assert (old.status, old.output) == ("completed", "old")
@@ -319,10 +491,10 @@ async def test_pruning_with_a_lower_bound_keeps_the_events_of_runs_finished_befo
             await store.append_event(runs[-1].id, "message.delta", {"text": "x"})
         await store.finish_run(runs[-1].id, "completed")  # at 1000, then at 1100
         clock.now += 100
-    assert await store.prune_events(1200, finished_after=1050, batch=2) == 3
-    assert len(await store.events_after(runs[0].id, 0)) == 3
+    assert await store.prune_events(1200, finished_after=1050, batch=2) == 4  # three deltas and the terminal event
+    assert len(await store.events_after(runs[0].id, 0)) == 4
     assert await store.events_after(runs[1].id, 0) == []
-    assert await store.prune_events(1200, finished_after=1000) == 3
+    assert await store.prune_events(1200, finished_after=1000) == 4
 
 
 async def test_memory_writes_are_a_transaction(store):

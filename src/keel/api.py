@@ -18,15 +18,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from keel.config import tenant_id_for
 from keel.models import part_to_dict, ImagePart, TextPart
 from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict, profile_mount_root
-from keel.store.base import ACTIVE, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse
+from keel.store.base import (
+    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse,
+)
 from keel.titles import sanitize_title
 
 log = logging.getLogger(__name__)
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
+_TERMINAL_EVENTS = frozenset(TERMINAL_EVENT.values())
 _KEEPALIVE_SECONDS = 15.0
-_TERMINAL_GRACE_SECONDS = 5.0
-_FINISHED_LONG_AGO_SECONDS = 60.0
 _HEALTH_TIMEOUT_SECONDS = 3.0
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 MAX_IMAGES = 4
@@ -102,6 +102,12 @@ def session_json(session) -> dict:
     return {"id": session.id, "title": session.title, "title_source": session.title_source,
             "created_at": session.created_at, "last_active_at": session.last_active_at,
             "message_count": session.message_count}
+
+
+def _sse_frame(event) -> str:
+    """Serialize one stored event as an SSE frame, preserving the existing payload and cursor fields."""
+    payload = {**event.data, "seq": event.seq, "type": event.type, "run_id": event.run_id, "at": event.at}
+    return f"id: {event.seq}\nevent: {event.type}\ndata: {json.dumps(payload)}\n\n"
 
 
 def _input_parts(body: dict) -> list[dict]:
@@ -369,19 +375,18 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     async def stop_run(request: Request, profile_id: str, run_id: str):
         """Request a run's cancellation and return its current details.
 
-        Cancel queued runs immediately and emit their terminal event; notify the worker to
-        stop running work. A running run may still be stopping when this response is returned.
+        A queued run is cancelled and its terminal event committed in one store transaction; a running run moves
+        to stopping and its worker is woken. The response may still show stopping.
         """
         await profile_or_404(request, profile_id)
         keel_ = k(request)
-        before = await run_or_404(request, profile_id, run_id)
-        run = await keel_.store.request_stop(profile_id, run_id)
-        if run is None:
+        transition = await keel_.store.request_stop(profile_id, run_id)
+        if transition is None:
             raise ApiError(404, "run_not_found", "No such run.")
-        if before.status == "queued" and run.status == "cancelled":
-            await keel_.executor.emit(run_id, "run.cancelled", {})
+        if transition.event is not None:
+            await keel_.bus.notify(run_id)
         await keel_.bus.notify("stop:" + run_id)
-        return run_json(run)
+        return run_json(transition.run)
 
     @app.get("/v1/profiles/{profile_id}/runs/{run_id}/events")
     async def run_events(request: Request, profile_id: str, run_id: str, after: int = 0):
@@ -395,15 +400,14 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         await run_or_404(request, profile_id, run_id)
 
         async def frames():
-            """Yield persisted SSE frames, waiting for notifications and late terminal events."""
+            """Yield persisted SSE frames, waiting for notifications and closing after the terminal event."""
             cursor = max(0, after)
             while True:
                 waiter = keel_.bus.waiter(run_id)
                 events = await keel_.store.events_after(run_id, cursor)
                 for event in events:
                     cursor = event.seq
-                    payload = {**event.data, "seq": event.seq, "type": event.type, "run_id": run_id, "at": event.at}
-                    yield f"id: {event.seq}\nevent: {event.type}\ndata: {json.dumps(payload)}\n\n"
+                    yield _sse_frame(event)
                     if event.type in _TERMINAL_EVENTS:
                         return
                 if events:
@@ -411,30 +415,15 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                 run = await keel_.store.get_run(profile_id, run_id)
                 if run is None:
                     return
-                if run.status in ("completed", "failed", "cancelled"):
-                    if (run.finished_at is not None
-                            and keel_.store.clock() - run.finished_at > _FINISHED_LONG_AGO_SECONDS):
-                        return  # finished long ago: its events were pruned, or the terminal one is before the cursor
-                    # The run row turns terminal before its terminal event is appended, so wait briefly for it.
-                    loop = asyncio.get_running_loop()
-                    deadline = loop.time() + _TERMINAL_GRACE_SECONDS
-                    while True:
-                        waiter = keel_.bus.waiter(run_id)
-                        for event in await keel_.store.events_after(run_id, max(cursor - 1, 0)):
-                            if event.seq > cursor:
-                                cursor = event.seq
-                                payload = {**event.data, "seq": event.seq, "type": event.type,
-                                           "run_id": run_id, "at": event.at}
-                                yield f"id: {event.seq}\nevent: {event.type}\ndata: {json.dumps(payload)}\n\n"
-                            if event.type in _TERMINAL_EVENTS:
-                                return
-                        remaining = deadline - loop.time()
-                        if remaining <= 0:
+                if run.status in TERMINAL:
+                    # Termination may have committed between the event read above and this state read; a terminal
+                    # run accepts no later events, so one final read closes that race without polling.
+                    for event in await keel_.store.events_after(run_id, cursor):
+                        cursor = event.seq
+                        yield _sse_frame(event)
+                        if event.type in _TERMINAL_EVENTS:
                             return
-                        try:
-                            await asyncio.wait_for(waiter.wait(), min(remaining, 1.0))
-                        except TimeoutError:
-                            continue
+                    return
                 try:
                     await asyncio.wait_for(waiter.wait(), _KEEPALIVE_SECONDS)
                 except TimeoutError:

@@ -75,8 +75,9 @@ interface change.
 - **Concurrency.** A per-instance cap (worker count) and a global cap (count of runs in
   `running`); over the global cap `POST runs` answers 429, and a client can queue and retry.
 - **A dead worker.** When a lease expires, any instance marks the run `failed` with
-  `error_code = worker_lost`. A run is not resumed mid-turn in the first version; because
-  every step is committed, the session stays consistent and the user can send again.
+  `error_code = worker_lost`, committing its `run.failed` event in the same transaction. A run is
+  not resumed mid-turn in the first version; because every step is committed, the session stays
+  consistent and the user can send again.
 
 ## 2. HTTP API
 
@@ -117,6 +118,15 @@ the bus. `seq` increases per run.
 the run's model calls, where `input_tokens` is the whole prompt including cached parts — the
 semantics the first consumer's usage contract and eval gate rely on.
 
+A run has exactly one terminal transition, and its terminal event commits in the same transaction as
+the terminal state (`completed`, `failed` or `cancelled`). The terminal event is the last event the run
+accepts: ordinary writes after it are dropped, and the store rejects a terminal event type written
+outside the transition. Lifecycle changes and event sequence allocation both lock the run row (a
+`BEGIN IMMEDIATE` transaction on SQLite), so concurrent finishes, stops, lease expiries and event
+writes serialise: one caller commits the transition and its event, and the others return the stored
+run with no event. Notifications are sent only after the commit, and the SSE handler rereads events
+once it sees a terminal state, so a terminal event that races its first read is still delivered.
+
 ## 3. Data model
 
 Postgres in deployment; SQLite for local development and tests, behind the same `Store`
@@ -129,7 +139,7 @@ behind `EventBus`.
 | `sessions` | `id`, `profile_id`, `title`, `title_source` (user/llm/derived), `provider`, `model`, `system_prompt`, `parent_session_id` (compression lineage), `created_at`, `last_active_at`, `message_count` |
 | `messages` | `id` (bigserial), `session_id`, `role`, `content` (json parts; images stored as references, never flattened), `tool_calls` (json, OpenAI shape), `tool_call_id`, `tool_name`, `reasoning_items` (json, each stamped with provider and model), `active`, `created_at`, `run_id` |
 | `runs` | `id`, `profile_id`, `session_id`, `status`, `provider`, `model`, `reasoning_effort`, `input`, `instructions`, `output`, `usage` (json), `error_code`, `error`, `lease_owner`, `lease_expires_at`, `created_at`, `started_at`, `finished_at` |
-| `run_events` | `run_id`, `seq`, `type`, `data` (json), `at`; pruned some days after the run ends |
+| `run_events` | `run_id`, `seq`, `type`, `data` (json), `at`; pruned some days after the run ends, terminal event included |
 | `memories` | `profile_id`, `target` (memory/user), `entries` (json list), `updated_at` |
 
 - Message ids increase within a session and a run stores exactly one user message, so a
@@ -313,10 +323,13 @@ collides gets `#N`. Titles are sanitized (control, zero-width and bidi character
 
 ## 10. Stop and failure
 
-`POST stop` sets `stopping`; the worker cancels an in-flight model stream at once and calls
-`kill_tree` on a running command, then ends the run `cancelled`. Messages already committed
-stay; an assistant tool call without a result gets a synthetic "cancelled" tool result so the
-next turn's request is valid. Lease expiry is covered in §1.
+`POST stop` cancels a queued run at once, committing `run.cancelled` with the state; a running
+run becomes `stopping`, and the worker cancels an in-flight model stream, calls `kill_tree` on a
+running command, then ends the run `cancelled`. Messages already committed stay; an assistant
+tool call without a result gets a synthetic "cancelled" tool result so the next turn's request is
+valid. The first terminal transition to commit wins, and its event is the run's last: cleanup
+that runs after a forced termination still kills commands and repairs tool results, but its
+events are dropped. Lease expiry is covered in §1.
 
 ## 11. Importing Hermes history
 

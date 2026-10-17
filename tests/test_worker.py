@@ -210,26 +210,28 @@ async def test_a_stop_landing_during_a_renewal_is_not_lost(pool_parts):
         await pool.close()
 
 
-async def test_sweep_emits_for_every_expired_run_even_if_one_emit_fails(store, clock):
+async def test_sweep_notifies_every_expired_run_even_if_one_notify_fails(store, clock):
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, ProviderRegistry())
     runs = [await queue(store, "s1"), await queue(store, "s2")]
     await store.claim_run("dead", clock.now + 30)
     await store.claim_run("dead", clock.now + 30)
-    real_emit = executor.emit
+    real_notify = bus.notify
     calls = []
 
-    async def flaky(run_id, *args):
-        calls.append(run_id)
+    async def flaky(key):
+        calls.append(key)
         if len(calls) == 1:
-            raise RuntimeError("emit failed")
-        return await real_emit(run_id, *args)
+            raise RuntimeError("notify failed")
+        return await real_notify(key)
 
-    executor.emit = flaky
+    bus.notify = flaky
     pool = WorkerPool(store, bus, executor, owner="w1", clock=clock)
     clock.now += 31
     assert await pool.sweep_once() == 2
     assert len(calls) == 2
+    for run in runs:
+        assert [e.type for e in await store.events_after(run.id, 0)] == ["run.failed"]
 
 
 async def test_a_failing_status_check_does_not_orphan_the_execution(pool_parts):
@@ -322,6 +324,33 @@ async def test_sweeping_kills_the_command_a_lost_worker_left_running(store, cloc
         await asyncio.gather(command, return_exceptions=True)
 
 
+async def test_a_sweep_notifies_before_killing_the_leftover_command(store, clock, tmp_path):
+    order = []
+    bus = InMemoryEventBus()
+    real_notify = bus.notify
+
+    async def notify(key):
+        order.append(("notify", key))
+        await real_notify(key)
+
+    bus.notify = notify
+
+    class Recorder(LocalSandbox):
+        async def kill_tree(self, sandbox, exec_id):
+            order.append(("kill", exec_id))
+
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
+                               sandbox={"image": "local", "workdir": str(tmp_path / "w")})
+    run = await queue(store)
+    await store.claim_run("dead-worker", clock.now + 30)
+    await store.set_current_exec(run.id, "x1")
+    executor = RunExecutor(store, bus, ProviderRegistry(), sandbox=Recorder())
+    pool = WorkerPool(store, bus, executor, owner="w1", clock=clock)
+    clock.now += 31
+    assert await pool.sweep_once() == 1
+    assert order == [("notify", run.id), ("kill", "x1")]
+
+
 async def test_the_sweeper_never_creates_a_sandbox(store, clock, tmp_path):
     killed = []
 
@@ -373,7 +402,7 @@ async def test_prune_once_deletes_events_older_than_the_retention(store, clock):
     pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock, event_retention_s=7 * 86_400)
     assert await pool.prune_once() == 0
     clock.now += 8 * 86_400
-    assert await pool.prune_once() == 1
+    assert await pool.prune_once() == 2  # run.started and run.completed
 
 
 async def test_after_a_successful_prune_the_next_scans_only_runs_finished_since(store, clock):
@@ -429,4 +458,4 @@ async def test_prune_once_without_a_retention_deletes_nothing(store, clock):
     clock.now += 365 * 86_400
     pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
     assert await pool.prune_once() == 0
-    assert len(await store.events_after(run.id, 0)) == 1
+    assert len(await store.events_after(run.id, 0)) == 2

@@ -24,7 +24,7 @@ from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy, profile_mount_root
 from keel.skills import discover_skills
-from keel.store.base import Event, Run, StoredMessage, TitleInUse
+from keel.store.base import Event, Run, StoredMessage, TitleInUse, UnknownRun
 from keel.titles import (
     MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
 )
@@ -104,16 +104,27 @@ class RunExecutor:
         self._skills_cache: dict[tuple, tuple[float, list]] = {}
         self.compactor = Compactor(store, threshold=compression_threshold, sleep=sleep, now=now, emit=self.emit)
 
-    async def emit(self, run_id: str, type_: str, data: dict) -> Event:
-        event = await self.store.append_event(run_id, type_, data)
-        await self.bus.notify(run_id)
+    async def emit(self, run_id: str, type_: str, data: dict) -> Event | None:
+        """Persist an ordinary event and wake its readers; None means a late write was suppressed."""
+        try:
+            event = await self.store.append_event(run_id, type_, data)
+        except UnknownRun:
+            log.warning("run %s no longer exists; dropping a late %s event", run_id, type_)
+            return None
+        if event is not None:
+            await self.bus.notify(run_id)
         return event
 
-    async def _finish(self, run: Run, status: str, *, output: str, usage: Usage, event: str, data: dict,
-                      error_code: str | None = None, error: str | None = None) -> None:
-        if await self.store.finish_run(run.id, status, output=output, usage=usage, error_code=error_code,
-                                       error=error):
-            await self.emit(run.id, event, data)
+    async def _finish(self, run: Run, status: str, *, output: str, usage: Usage,
+                      error_code: str | None = None, error: str | None = None,
+                      incomplete: bool = False) -> bool:
+        """Commit the terminal transition; True only when this executor won it, so completion work may run."""
+        transition = await self.store.finish_run(run.id, status, output=output, usage=usage, error_code=error_code,
+                                                 error=error, incomplete=incomplete)
+        if transition is None or transition.event is None:
+            return False
+        await self.bus.notify(run.id)
+        return True
 
     async def execute(self, run: Run) -> None:
         state = _RunState()
@@ -122,8 +133,7 @@ class RunExecutor:
                                                     "reasoning_effort": run.reasoning_effort})
             await self._loop(run, state)
         except (ModelError, RunFailure) as error:
-            await self._finish(run, "failed", output="".join(state.text), usage=state.usage, event="run.failed",
-                               data={"error_code": error.code, "message": str(error)},
+            await self._finish(run, "failed", output="".join(state.text), usage=state.usage,
                                error_code=error.code, error=str(error))
         except asyncio.CancelledError:
             # Swallowed on purpose: the run ends cancelled and execute returns normally.
@@ -158,8 +168,7 @@ class RunExecutor:
         await self._kill_command(run, state)
         await self._close_tool(run, state)
         await self._answer_pending(run, state)
-        await self._finish(run, "failed", output="".join(state.text), usage=state.usage, event="run.failed",
-                           data={"error_code": "internal_error", "message": message},
+        await self._finish(run, "failed", output="".join(state.text), usage=state.usage,
                            error_code="internal_error", error=message)
 
     async def _kill_command(self, run: Run, state: _RunState) -> None:
@@ -241,8 +250,7 @@ class RunExecutor:
         await self._kill_command(run, state)
         await self._close_tool(run, state)
         await self._answer_pending(run, state)
-        await self._finish(run, "cancelled", output="".join(state.text), usage=state.usage, event="run.cancelled",
-                           data={})
+        await self._finish(run, "cancelled", output="".join(state.text), usage=state.usage)
 
     async def _loop(self, run: Run, state: _RunState) -> None:
         try:
@@ -331,10 +339,8 @@ class RunExecutor:
                 state.pending = []
                 raise
             if not calls:
-                await self._finish(run, "completed", output=output, usage=state.usage, event="run.completed",
-                                   data={"output": output, "usage": state.usage.to_dict(),
-                                         **({"incomplete": True} if incomplete else {})})
-                await self._after_complete(run, profile)
+                if await self._finish(run, "completed", output=output, usage=state.usage, incomplete=incomplete):
+                    await self._after_complete(run, profile)
                 return
             for call in calls:
                 outcome, duration, preview = await self._call_tool(run, call, ctx, state)

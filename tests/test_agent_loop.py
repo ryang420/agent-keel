@@ -388,6 +388,34 @@ async def test_a_cancel_during_internal_error_cleanup_still_finishes_the_run(loo
     assert not task.cancelling()
 
 
+async def test_a_forced_termination_suppresses_late_events_and_stays_the_last_event(loop_parts):
+    store, provider, executor, _ = loop_parts
+    tool_started = asyncio.Event()
+    real_emit = executor.emit
+
+    async def emit(run_id, type_, data):
+        event = await real_emit(run_id, type_, data)
+        if type_ == "tool.started":
+            tool_started.set()
+        return event
+
+    executor.emit = emit
+    provider.script = [[call("terminal", command="sleep 0.3"), Completed(Usage(1, 1, 0, 0))],
+                       answer("after")]
+    run = await start(store)
+    task = asyncio.create_task(executor.execute(run))
+    await tool_started.wait()
+    forced = await store.finish_run(run.id, "failed", error_code="worker_lost", error="the worker was lost")
+    assert forced.event is not None
+    assert await executor.emit(run.id, "message.delta", {"text": "late"}) is None
+    await asyncio.wait_for(task, 5)
+    assert [e.type for e in await store.events_after(run.id, 0)] == [
+        "run.started", "tool.started", "run.failed"]
+    messages = [m.message for m in await store.messages("s1")]
+    assert [m.role for m in messages] == ["user", "assistant", "tool", "assistant"]
+    assert messages[2].tool_call_id == "c1"  # the tool's result was still stored; only events are suppressed
+
+
 async def test_the_internal_error_path_kills_a_running_command(loop_parts):
     store, provider, executor, work = loop_parts
     provider.script = [[call("terminal", "c1", command="(sleep 1; touch late) & sleep 30"),

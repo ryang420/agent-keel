@@ -75,7 +75,7 @@ async def test_a_run_completes_streams_and_is_stored(service):
     started = await send(client, instructions="Be brief.", reasoning_effort="low")
     assert started.status_code == 202
     body = started.json()
-    assert body["status"] == "queued" and body["session_id"] == "chat-1"
+    assert body["status"] in ("queued", "running") and body["session_id"] == "chat-1"
     run = await settle(client, body["run_id"])
     assert run["status"] == "completed" and run["output"] == "ok"
     assert run["usage"] == {"input_tokens": 10, "output_tokens": 2, "cache_read_tokens": 0, "cache_write_tokens": 0}
@@ -233,61 +233,93 @@ async def test_other_profiles_cannot_reach_a_profiles_sessions_or_runs(service):
     assert (await client.get("/v1/profiles/p1/sessions/s1/messages")).status_code == 200
 
 
-async def _finished_without_terminal_event(client, provider, store):
+def _frames(response):
+    return [json.loads(l[6:]) for l in response.text.splitlines() if l.startswith("data: ")]
+
+
+async def _completed_run(client, store):
     await client.put("/v1/profiles/p1", json=PROFILE)
-    provider.script = [["hang"]]
     run_id = (await send(client)).json()["run_id"]
-    for _ in range(200):
-        if (await client.get(f"/v1/profiles/p1/runs/{run_id}")).json()["status"] == "running":
-            break
-        await asyncio.sleep(0.02)
-    assert await store.finish_run(run_id, "completed", output="x")
+    await settle(client, run_id)
     return run_id
 
 
-async def test_stream_waits_for_a_terminal_event_that_lands_after_the_status(service):
+async def test_stream_rereads_a_terminal_event_that_raced_its_state_read(service):
     client, provider, store = service
-    run_id = await _finished_without_terminal_event(client, provider, store)
-    executor = client._transport.app.state.keel.executor
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    provider.script = [["hang"]]
+    run_id = (await send(client)).json()["run_id"]
+    for _ in range(250):
+        events = await store.events_after(run_id, 0)
+        if events and events[-1].type == "run.started":
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError("the run never started")
+    cursor = events[-1].seq
+    real_events_after = store.events_after
+
+    async def racing(asked_run, after):
+        found = await real_events_after(asked_run, after)
+        if asked_run == run_id and after == cursor and not found:
+            # The termination commits after the stream's empty event read and before its state read.
+            transition = await store.finish_run(run_id, "completed", output="raced")
+            assert transition is not None and transition.event is not None
+        return found
+
+    store.events_after = racing
+    try:
+        response = await asyncio.wait_for(
+            client.get(f"/v1/profiles/p1/runs/{run_id}/events", params={"after": cursor}), 2)
+    finally:
+        store.events_after = real_events_after
+    assert [(f["type"], f["output"]) for f in _frames(response)] == [("run.completed", "raced")]
+
+
+async def test_stream_finds_a_terminal_event_whose_notification_was_lost(service, monkeypatch):
+    client, provider, store = service
+    monkeypatch.setattr("keel.api._KEEPALIVE_SECONDS", 0.1)
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    provider.script = [["hang"]]
+    run_id = (await send(client)).json()["run_id"]
+    for _ in range(250):
+        if any(e.type == "run.started" for e in await store.events_after(run_id, 0)):
+            break
+        await asyncio.sleep(0.02)
     stream = asyncio.create_task(client.get(f"/v1/profiles/p1/runs/{run_id}/events"))
-    await asyncio.sleep(0.2)
-    assert not stream.done()
-    await executor.emit(run_id, "run.completed", {"output": "x", "usage": {}})
-    response = await asyncio.wait_for(stream, 5)
-    types = [json.loads(l[6:])["type"] for l in response.text.splitlines() if l.startswith("data: ")]
-    assert types[-1] == "run.completed"
+    await asyncio.sleep(0.2)  # the stream has replayed run.started and is waiting for a notification
+    await store.finish_run(run_id, "completed", output="silent")  # no bus notification
+    response = await asyncio.wait_for(stream, 2)
+    assert [f["type"] for f in _frames(response)] == ["run.started", "run.completed"]
 
 
-async def test_a_run_finished_seconds_ago_still_waits_for_its_terminal_event(service):
-    client, provider, store = service
-    run_id = await _finished_without_terminal_event(client, provider, store)
-    store.clock.now += 30
-    executor = client._transport.app.state.keel.executor
-    stream = asyncio.create_task(client.get(f"/v1/profiles/p1/runs/{run_id}/events"))
-    await asyncio.sleep(0.2)
-    assert not stream.done()
-    await executor.emit(run_id, "run.completed", {"output": "x", "usage": {}})
-    response = await asyncio.wait_for(stream, 5)
-    types = [json.loads(l[6:])["type"] for l in response.text.splitlines() if l.startswith("data: ")]
-    assert types[-1] == "run.completed"
+async def test_stream_closes_when_the_cursor_is_at_the_terminal_event(service):
+    client, _, store = service
+    run_id = await _completed_run(client, store)
+    cursor = (await store.events_after(run_id, 0))[-1].seq
+    response = await asyncio.wait_for(
+        client.get(f"/v1/profiles/p1/runs/{run_id}/events", params={"after": cursor}), 2)
+    assert _frames(response) == []
+    assert (await store.events_after(run_id, 0))[-1].type == "run.completed"
 
 
-async def test_a_run_finished_over_a_minute_ago_without_a_terminal_event_closes_at_once(service):
-    client, provider, store = service
-    run_id = await _finished_without_terminal_event(client, provider, store)
-    store.clock.now += 61
+async def test_stream_closes_for_a_terminal_run_whose_events_were_pruned(service):
+    client, _, store = service
+    run_id = await _completed_run(client, store)
+    assert await store.prune_events(store.clock() + 1) == 3
     response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 2)
-    assert response.status_code == 200
+    assert _frames(response) == []
+    assert await store.events_after(run_id, 0) == []
 
 
-async def test_stream_gives_up_when_no_terminal_event_ever_comes(service, monkeypatch):
-    client, provider, store = service
-    monkeypatch.setattr("keel.api._TERMINAL_GRACE_SECONDS", 0.2)
-    run_id = await _finished_without_terminal_event(client, provider, store)
-    response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 1.5)
-    assert response.status_code == 200
-    assert all(json.loads(l[6:])["type"] not in ("run.completed", "run.failed", "run.cancelled")
-               for l in response.text.splitlines() if l.startswith("data: "))
+async def test_stream_closes_for_a_historical_terminal_run_without_an_event(service):
+    client, _, store = service
+    run_id = await _completed_run(client, store)
+    # Historical data: an upgrade-era terminal run can have no events left. The endpoint must not repair it.
+    await store.db.execute("DELETE FROM run_events WHERE run_id = ?", run_id)
+    response = await asyncio.wait_for(client.get(f"/v1/profiles/p1/runs/{run_id}/events"), 2)
+    assert _frames(response) == []
+    assert await store.events_after(run_id, 0) == []
 
 
 async def test_an_unexpected_error_is_a_json_500(service, monkeypatch):

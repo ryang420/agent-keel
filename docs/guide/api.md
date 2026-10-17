@@ -88,7 +88,8 @@ The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `u
 - `reasoning_effort` is passed to the provider as is (for example `low`, `medium`, `high`, or `none`).
 - `instructions` apply to this run only.
 
-The response (202): `{"run_id": "…", "status": "queued", "session_id": "…"}`.
+The response (202): `{"run_id": "…", "status": "queued", "session_id": "…"}`. A fast worker may already have
+claimed the run, in which case `status` is `running`.
 
 ## Run
 
@@ -97,8 +98,10 @@ The response (202): `{"run_id": "…", "status": "queued", "session_id": "…"}`
 (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`; null when unknown), `error_code`,
 `error`, `created_at`, `started_at`, `finished_at`.
 
-Stopping a queued run cancels it at once. Stopping a running run moves it to `stopping`; the worker ends it as
-`cancelled` and kills its running command. Stopping a finished run changes nothing.
+Stopping a queued run cancels it at once, and its `run.cancelled` event is committed with the cancellation.
+Stopping a running run moves it to `stopping`; the worker ends it as `cancelled` and kills its running command.
+Stopping a finished run changes nothing. Whichever terminal transition commits first wins; a later attempt returns
+the stored outcome and produces no event.
 
 ## Events
 
@@ -125,10 +128,15 @@ below. Events are stored: pass `after=<last seq>` to resume without losing or re
 | `run.failed` | `error_code`, `message` |
 | `run.cancelled` | none |
 
-`run.completed`, `run.failed` and `run.cancelled` are terminal.
+`run.completed`, `run.failed` and `run.cancelled` are terminal. The terminal event is committed together with the
+run's terminal state and is the last event the run accepts; anything a worker tries to record afterwards (a late
+`tool.completed`, for example) is dropped. A run that was forcibly terminated may therefore end without a matching
+`tool.completed`: reconcile its tool calls from the stored messages (`GET .../messages?after_id=`).
 
-The events of a run finished more than `KEEL_EVENT_RETENTION_DAYS` ago are deleted. Streaming such a run sends
-nothing and closes; read the run itself with `GET /v1/profiles/{p}/runs/{id}`.
+The events of a run finished more than `KEEL_EVENT_RETENTION_DAYS` ago are deleted, terminal event included.
+Streaming such a run sends nothing and closes, as does streaming a terminal run from before this guarantee that has
+no stored terminal event; read the run itself with `GET /v1/profiles/{p}/runs/{id}`. A replay is identified by its
+`(run_id, seq)` pair, so a client can resume with `after` without duplicating frames.
 
 `context.compacted` means a long session's earlier turns were summarized before a model call; the transcript itself
 is unchanged. A client should ignore event types it does not know.

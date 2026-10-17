@@ -16,6 +16,13 @@ All notable changes to this project are documented here. The format follows
   delay) and an error when the last attempt fails, so a stalled or failing provider shows up in the service log.
 
 ### Fixed
+- Run termination is atomic. The terminal state and its `run.completed`, `run.failed` or `run.cancelled` event commit
+  in one transaction, exactly one terminal transition can win, and the terminal event is the last event the run
+  accepts. Lifecycle changes and event sequence allocation serialise on the run row, so concurrent finishes, stops,
+  lease expiries and ordinary event writes cannot reorder or duplicate the terminal event. SSE rereads events once
+  the run is terminal instead of waiting out a grace window, so a terminal event that races the stream's first read
+  is still delivered; a pruned or historical terminal run closes immediately. No schema migration: all writers must
+  cut over together ([operations guide](docs/guide/operations.md)).
 - The SQLite store closes every cursor it opens (`BEGIN IMMEDIATE`, the connect-time PRAGMAs, `executescript`). One
   left to the garbage collector was freed on the event loop thread while the connection's worker thread ran another
   statement, which crashed the test suite with a segmentation fault in about 1 of 40 runs. PostgreSQL is not affected.
