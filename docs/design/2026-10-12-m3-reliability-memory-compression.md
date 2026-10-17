@@ -92,6 +92,9 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
   follows the cursor and the run finished more than 60 s ago by the store's clock (a margin well above the grace,
   for clock skew between instances). That covers a pruned run and a client reconnecting past the terminal event.
   The retention is a positive number of days; pruning cannot be switched off.
+  *Superseded by `2026-10-17-run-terminal-consistency.md`: the terminal state and its terminal event now commit in
+  one transaction, so the 5 s grace and the 60 s age check are gone. A terminal run with nothing after the cursor
+  closes at once.*
 
 ### Schema migrations
 

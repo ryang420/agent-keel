@@ -369,9 +369,11 @@ sequenceDiagram
   lost and no queue is detached by a disconnect.
 - **No race between reading and waiting.** The handler takes the waiter *before* reading the store, so a notify that
   lands in between is not lost.
-- **The terminal event is awaited.** The run row turns terminal slightly before its terminal event is appended; the
-  stream waits up to 5 s for it before it closes. A run that finished more than a minute ago with nothing after the
-  cursor closes the stream at once: its events were pruned, or the client is already past the terminal event.
+- **The terminal event commits with the terminal state.** A run's terminal state and its terminal event are one
+  transaction, and the terminal event is the last event the run accepts. When an empty read is followed by a
+  terminal state, the handler makes one final read for the event that raced the state read, then closes. A terminal
+  run with nothing after the cursor closes at once: its events were pruned, it predates the guarantee, or the
+  client is already past the terminal event.
 - **A wake-up is advisory.** A notify that fails is logged and never raised, and readers also re-read the store on a
   timeout, so the worst case of a lost notify is latency.
 
