@@ -47,3 +47,14 @@ Result line:
 A missing profile is created empty for `tenant_id`: no models, no skills, an empty sandbox and soul. The next profile
 update through the API (`PUT /v1/profiles/{id}`) fills it in before its first run. The command exits 1 when any line is
 `invalid`.
+
+## Upgrading to atomic run termination
+
+This release commits a run's terminal state and its terminal event in one transaction. It needs no schema migration,
+but the guarantee holds only while every process writing the database runs this version. An old writer can still
+leave a terminal run without its event; an old event writer can still append after a new-style terminal event.
+
+To cut over, stop admitting new runs, let in-flight runs drain, and stop the old instances before starting the new
+version. A run left in flight when its worker stops is failed as `worker_lost` by the new version's lease sweep. Total
+downtime can be as short as the drain window. Rolling back is safe — the new version writes ordinary rows — but the
+atomicity guarantee ends while old writers run.

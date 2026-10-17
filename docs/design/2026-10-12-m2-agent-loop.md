@@ -43,7 +43,9 @@ A run executes in `RunExecutor` (M1), now as a loop.
 3. **Commit the assistant message.** It holds the text, the reasoning items and the tool calls, in the
    order of arch §5's contract.
 4. **Answer in text?** If the response has no tool calls, the run completes. `run.output` is this final
-   message's text.
+   message's text. The executor asks the store to commit the completion; only the call that wins the
+   terminal transition (and therefore writes `run.completed`) runs post-completion work (title and
+   memory review). A completion that loses to a stop or a lease sweep changes nothing.
 5. **Run the tools.** Otherwise run each call in order:
    - emit `tool.started`;
    - execute the call (§3);
@@ -255,6 +257,13 @@ Arch §10 for M2:
   - cancels the model stream, if one is open;
   - calls `kill_tree` on the run's current `exec_id`, if a command is running;
   - lets the executor's cancel path finish the run `cancelled`.
+- **The terminal event commits with the finish.** The executor does not emit `run.cancelled` itself:
+  `finish_run` writes the state and the event in one transaction. A run finished by a lease sweep or a
+  shutdown is the same: the sweep or the closing worker commits `run.failed` with the state.
+- **Late events are dropped.** Cleanup after a forced termination still kills the command and answers
+  unanswered tool calls, but `tool.completed` and other events it would record are suppressed once the
+  run is terminal. Consumers therefore see the terminal event close the run even when a cleanup step
+  ran after it.
 - **Unanswered tool calls.** Every tool call of the last assistant message that has no result gets a
   synthetic tool message: content `"The command was cancelled."`, `tool_call_id` set. The next turn's
   request is then valid.
