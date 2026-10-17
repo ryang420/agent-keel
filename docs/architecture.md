@@ -179,8 +179,10 @@ Rules the schema enforces:
 - **Titles are unique per profile.** A partial unique index on `sessions(profile_id, title)` where the title is set.
 - **A session belongs to one profile.** `ensure_session` answers `404 session_not_found` when the id exists under a
   different profile.
-- **Events are numbered per run.** `(run_id, seq)` is the primary key; `append_event` takes `MAX(seq) + 1` inside a
-  transaction and retries up to three times on a unique violation.
+- **Events are numbered per run.** `(run_id, seq)` is the primary key. `append_event` locks the run row, takes
+  `MAX(seq) + 1` and inserts in the same transaction, so sequence allocation serialises without a retry loop. It
+  rejects a terminal event type (the run transition writes that one) and an unknown run, and returns `None` for a
+  terminal run so a late writer can stop quietly.
 
 The same SQL (`?` placeholders) runs on SQLite and Postgres. The schema is created and upgraded by numbered
 migrations (`store/migrations.py`) at start: each runs in its own transaction under a Postgres advisory lock, so
@@ -207,9 +209,10 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
-`finish_run` only updates a row that is still `queued`, `running` or `stopping`, and reports whether it did. So a run
-that completes at the same instant it is stopped, or swept, ends exactly once, and only the winner emits the terminal
-event.
+`finish_run` returns a `RunTransition`: `None` when the run does not exist, the run unchanged with no event when it is
+already terminal, and otherwise the updated run with the terminal event inserted in the same transaction. Only one
+transition can commit, so a run that completes at the same instant it is stopped, or swept, ends exactly once, and
+only the winner emits the terminal event.
 
 ### Starting a run
 
