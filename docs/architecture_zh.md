@@ -174,7 +174,9 @@ erDiagram
 - **标题在同一 profile 内唯一。** `sessions(profile_id, title)` 上有一个部分唯一索引，条件是标题已设置。
 - **一个会话只属于一个 profile。** 当会话 id 已存在于另一个 profile 名下时，`ensure_session` 返回
   `404 session_not_found`。
-- **事件按 run 编号。** `(run_id, seq)` 是主键；`append_event` 在事务内取 `MAX(seq) + 1`，遇到唯一约束冲突最多重试三次。
+- **事件按 run 编号。** `(run_id, seq)` 是主键。`append_event` 先锁 run 行，在同一事务里取 `MAX(seq) + 1` 并插入，
+  编号分配因此串行化，不需要重试循环；它会拒绝终止事件类型（这类事件由终止转换写入）和不存在的 run，并对终态 run
+  返回 `None`，让迟到的写入方安静地停下。
 
 同一套 SQL（`?` 占位符）同时跑在 SQLite 和 Postgres 上。schema 在启动时由编号迁移（`store/migrations.py`）
 创建和升级：每个迁移在自己的事务里、持有 Postgres advisory lock 执行，多个实例同时启动时只会迁移一次。0.2.0 的
@@ -200,8 +202,9 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
-`finish_run` 只会更新仍处于 `queued`、`running` 或 `stopping` 的行，并返回是否更新成功。因此，一个在被停止或被
-清扫的同一时刻恰好完成的 run，只会结束一次，也只有胜出的那一方会发出终止事件。
+`finish_run` 返回一个 `RunTransition`：run 不存在时为 `None`；run 已是终态时原样返回、不带事件；否则返回更新后的
+run，以及同一事务中插入的终止事件。只有一个转换能提交，所以一个在被停止或被清扫的同一时刻恰好完成的 run，只会
+结束一次，也只有胜出的那一方会发出终止事件。
 
 ### 发起一次 run
 
