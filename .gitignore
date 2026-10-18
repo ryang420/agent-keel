@@ -5,3 +5,5 @@ __pycache__/
 *.sqlite3
 .superpowers/
 .local/
+build/
+src/keel/sandbox/bin/

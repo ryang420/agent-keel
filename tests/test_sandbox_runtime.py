@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -8,8 +10,10 @@ import uuid
 
 import pytest
 
+from keel.sandbox.base import SandboxError
 from keel.sandbox.records import CleanupReceipt
-from keel.sandbox.runtime import decode_receipt, encode_control
+from keel.sandbox import runtime
+from keel.sandbox.runtime import HelperArtifact, decode_receipt, encode_control, helper_artifact
 
 
 def _receipt_json(**overrides) -> bytes:
@@ -76,3 +80,139 @@ def test_codec_import_does_not_require_the_store_package_first():
          "import keel.sandbox.runtime"],
         capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Helper artifact selection: local files and a deterministic manifest only.
+# ---------------------------------------------------------------------------
+
+_ARCHES = ("amd64", "arm64")
+
+
+def _write_assets(directory: Path, *, arches=_ARCHES, protocol: int = 1, manifest_version: int = 1,
+                  contents: dict[str, bytes] | None = None, mode: int = 0o755,
+                  digests: dict[str, str] | None = None) -> dict[str, bytes]:
+    """Synthetic byte fixtures; the default suite never builds a real helper."""
+    bodies = contents or {arch: b"\x7fELF" + arch.encode() + b"-fixture" for arch in arches}
+    artifacts = {}
+    for arch, body in bodies.items():
+        path = directory / f"keel-supervisor-{arch}"
+        path.write_bytes(body)
+        path.chmod(mode)
+        digest = (digests or {}).get(arch, hashlib.sha256(body).hexdigest())
+        artifacts[arch] = {"file": path.name, "sha256": digest}
+    (directory / "manifest.json").write_text(
+        json.dumps({"version": manifest_version, "protocol": protocol, "artifacts": artifacts}, sort_keys=True)
+        + "\n")
+    return bodies
+
+
+@pytest.fixture
+def asset_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "artifact_directory", lambda: tmp_path)
+    return tmp_path
+
+
+@pytest.mark.parametrize("architecture", ["amd64", "x86_64", "arm64", "aarch64", "ARM64"])
+def test_helper_artifact_normalizes_the_daemon_architecture(asset_directory, architecture):
+    bodies = _write_assets(asset_directory)
+
+    artifact = helper_artifact(architecture)
+
+    expected = "arm64" if architecture.lower() in ("arm64", "aarch64") else "amd64"
+    assert isinstance(artifact, HelperArtifact)
+    assert artifact.architecture == expected
+    assert artifact.protocol == 1
+    assert artifact.sha256 == hashlib.sha256(bodies[expected]).hexdigest()
+    assert artifact.path == asset_directory / f"keel-supervisor-{expected}"
+
+
+def test_helper_artifact_rejects_an_unsupported_architecture(asset_directory):
+    _write_assets(asset_directory)
+    with pytest.raises(SandboxError, match="architecture"):
+        helper_artifact("s390x")
+
+
+def test_helper_artifact_requires_the_manifest(asset_directory):
+    _write_assets(asset_directory)
+    (asset_directory / "manifest.json").unlink()
+    with pytest.raises(SandboxError, match="manifest"):
+        helper_artifact("amd64")
+
+
+@pytest.mark.parametrize("manifest", [
+    b"not json",
+    b"[]",
+    b'{"version":1}',
+    json.dumps({"version": 2, "protocol": 1, "artifacts": {}}).encode(),
+    json.dumps({"version": 1, "protocol": 2, "artifacts": {}}).encode(),
+    json.dumps({"version": True, "protocol": 1, "artifacts": {}}).encode(),
+    json.dumps({"version": 1, "protocol": 1, "artifacts": {"amd64": {"file": "../x", "sha256": "0" * 64}}}).encode(),
+    json.dumps({"version": 1, "protocol": 1, "artifacts": {"amd64": {"file": "x", "sha256": "0" * 63}}}).encode(),
+    json.dumps({"version": 1, "protocol": 1, "artifacts": {"amd64": {"file": "x"}}}).encode(),
+    json.dumps({"version": 1, "protocol": 1, "artifacts": {"s390x": {"file": "x", "sha256": "0" * 64}}}).encode(),
+])
+def test_helper_artifact_rejects_an_invalid_manifest(asset_directory, manifest):
+    _write_assets(asset_directory)
+    (asset_directory / "manifest.json").write_bytes(manifest)
+    with pytest.raises(SandboxError, match="manifest"):
+        helper_artifact("amd64")
+
+
+def test_helper_artifact_requires_the_requested_architecture(asset_directory):
+    _write_assets(asset_directory, arches=("amd64",))
+    with pytest.raises(SandboxError, match="arm64"):
+        helper_artifact("arm64")
+
+
+def test_helper_artifact_rejects_a_missing_file(asset_directory):
+    _write_assets(asset_directory)
+    (asset_directory / "keel-supervisor-arm64").unlink()
+    with pytest.raises(SandboxError, match="missing"):
+        helper_artifact("arm64")
+
+
+def test_helper_artifact_rejects_a_digest_mismatch(asset_directory):
+    _write_assets(asset_directory, digests={"amd64": "0" * 64})
+    with pytest.raises(SandboxError, match="digest"):
+        helper_artifact("amd64")
+
+
+def test_helper_artifact_rejects_a_protocol_mismatch(asset_directory):
+    _write_assets(asset_directory, protocol=2)
+    with pytest.raises(SandboxError, match="protocol"):
+        helper_artifact("amd64")
+
+
+def test_helper_artifact_rejects_a_non_regular_or_non_executable_file(asset_directory):
+    _write_assets(asset_directory, arches=("amd64",))
+    # A directory named like the artifact is not a regular file.
+    (asset_directory / "keel-supervisor-amd64").unlink()
+    (asset_directory / "keel-supervisor-amd64").mkdir()
+    with pytest.raises(SandboxError):
+        helper_artifact("amd64")
+    (asset_directory / "keel-supervisor-amd64").rmdir()
+    _write_assets(asset_directory, arches=("amd64",), mode=0o644)
+    with pytest.raises(SandboxError, match="executable"):
+        helper_artifact("amd64")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file")
+def test_helper_artifact_rejects_an_unreadable_file(asset_directory):
+    _write_assets(asset_directory, arches=("amd64",))
+    path = asset_directory / "keel-supervisor-amd64"
+    path.chmod(0o100)  # executable but not readable, so the digest cannot be taken
+    with pytest.raises(SandboxError, match="could not be read"):
+        helper_artifact("amd64")
+
+
+def test_helper_artifact_selection_never_shells_out(asset_directory, monkeypatch):
+    """Selection is a local file read; a build script is a separate, explicit step."""
+    _write_assets(asset_directory)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("artifact selection must not run a process")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    assert helper_artifact("amd64").architecture == "amd64"

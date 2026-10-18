@@ -11,7 +11,13 @@ import math
 import os
 import posixpath
 import re
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from keel.sandbox.records import (
+        CleanupReceipt, ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt,
+    )
+    from keel.sandbox.runtime import HelperArtifact
 
 RUNTIMES = ("runc", "runsc", "kata")
 TIMEOUT_EXIT_CODE = 124
@@ -203,6 +209,40 @@ class SandboxBackend(Protocol):
     async def kill_tree(self, sandbox: Sandbox, exec_id: str) -> None: ...
 
     async def destroy(self, sandbox: Sandbox) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+
+class CoordinatedSandboxBackend(Protocol):
+    """The exact-ID operations the lifecycle coordinator drives.
+
+    Wider than `SandboxBackend`, which the agent loop uses: every method addresses a recorded full container ID,
+    never a reusable name, and an implementation never calls `ensure` or retries a payload. A definite failure is
+    kept apart from uncertainty: a timeout, killed client, transport loss or malformed output is never read as
+    "the container does not exist".
+    """
+
+    async def daemon_identity(self) -> tuple[str, str]:
+        """The Docker daemon ID and normalized architecture, cached once read."""
+        ...
+
+    async def inspect_id(self, container_id: str) -> DockerOutcome: ...
+
+    async def inventory(self) -> list[ContainerObservation]: ...
+
+    async def create_generation(self, attempt: LifecycleAttempt, policy: SandboxPolicy) -> DockerOutcome: ...
+
+    async def install_helper(self, attempt: LifecycleAttempt, artifact: HelperArtifact) -> DockerOutcome: ...
+
+    async def start_id(self, attempt: LifecycleAttempt) -> DockerOutcome: ...
+
+    async def remove_id(self, attempt: LifecycleAttempt) -> DockerOutcome: ...
+
+    async def exec_bound(self, ticket: ExecTicket, argv: list[str], *, cwd: str, timeout_s: float,
+                         env: dict[str, str] | None = None, stdin: bytes | None = None
+                         ) -> tuple[ExecResult, CleanupReceipt]: ...
+
+    async def control_exec(self, ticket: ExecTicket, *, cancel: bool) -> CleanupReceipt: ...
 
     async def aclose(self) -> None: ...
 
