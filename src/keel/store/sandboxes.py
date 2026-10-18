@@ -12,14 +12,14 @@ import hashlib
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
 from keel.models import Usage
 from keel.sandbox.base import PolicyError, SandboxPolicy, parse_policy
 from keel.sandbox.records import (
-    MAX_DIAGNOSTIC_CHARS, BoundSandbox, CleanupReceipt, DockerOutcome, ExecTicket, LeaseStamp, LifecycleAttempt,
-    RecoveryAction, RunClaim, SandboxBinding, SandboxBusy, SandboxKey, SandboxLeaseLost, SandboxUsage, UsageBinding,
-    UseHandle,
+    MAX_DIAGNOSTIC_CHARS, BoundSandbox, CleanupReceipt, ContainerObservation, DockerOutcome, ExecTicket,
+    LeaseStamp, LifecycleAttempt, RecoveryAction, RunClaim, SandboxBinding, SandboxBusy, SandboxKey,
+    SandboxLeaseLost, SandboxUsage, UsageBinding, UseHandle,
 )
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION
 from keel.store.base import Run, UniqueViolation
@@ -28,6 +28,9 @@ _PREPARATION_KINDS = ("create", "install", "start")
 _RENEWABLE_USAGE_STATES = ("preparing", "active", "cleaning")
 _UNRELEASED_USAGE_STATES = ("preparing", "active", "cleaning")
 _UNRESOLVED_EXEC_STATES = ("pending", "running", "uncertain")
+# Stored error codes that withhold new admission for a profile until the recorded conflict is resolved.
+_INVENTORY_BLOCK_CODES = ("sandbox_inventory_conflict", "sandbox_retired_create_running",
+                          "sandbox_daemon_mismatch")
 _SANDBOX_IDENTITY = "deployment = ? AND profile_id = ?"
 _USAGE_IDENTITY = "id = ? AND token = ? AND owner = ? AND deployment = ? AND profile_id = ? AND daemon_id = ?"
 _BINDING_COLUMNS = ("generation", "generation_token", "container_id", "container_name")
@@ -49,6 +52,25 @@ def _usage_binding_is_null(row: dict) -> bool:
 def _usage_matches_binding(row: dict, binding: SandboxBinding) -> bool:
     return ((row["generation"], row["generation_token"], row["container_id"], row["container_name"])
             == (binding.generation, binding.generation_token, binding.container_id, binding.container_name))
+
+
+def _generation_draining(usages: list[dict], execs: list[dict], operations: list[dict], token: str,
+                         now: float) -> bool:
+    """True while a usage lease, execution or current operation still forbids restoring `ready`.
+
+    An active usage with an unexpired lease is the ordinary shared-generation case. An expired, preparing,
+    cleaning or orphaned usage, an unresolved execution or an unresolved current operation is a drain reason.
+    """
+    if any(use["state"] in ("preparing", "cleaning", "orphaned")
+           or (use["state"] != "released"
+               and (use["lease_expires_at"] is None or use["lease_expires_at"] <= now))
+           for use in usages):
+        return True
+    if any(ex["generation_token"] == token and ex["state"] in _UNRESOLVED_EXEC_STATES for ex in execs):
+        return True
+    return any(op["generation_token"] == token and op["authority"] == "current"
+               and op["outcome"] in ("planned", "dispatched", "uncertain")
+               and op["confirmed_absent_at"] is None for op in operations)
 
 
 def _linked_to_usage(row: dict, usage_id: str, create_id: str | None) -> bool:
@@ -75,7 +97,8 @@ def _unbound_retirement_blocker(usage: dict, create_op: dict | None, operations:
     for row in operations:
         if not _linked_to_usage(row, usage["id"], create_id):
             continue
-        if row["kind"] == "start" and row["authority"] == "current" and row["outcome"] != "definite_failure":
+        if (row["kind"] == "start" and row["outcome"] != "definite_failure"
+                and row["confirmed_absent_at"] is None):
             return "an authorized start remains"
         if (row["kind"] == "install" and row["outcome"] in ("dispatched", "succeeded", "uncertain")
                 and row["container_id"] is not None and row["confirmed_absent_at"] is None):
@@ -182,7 +205,7 @@ class SandboxStoreMixin:
         return " FOR UPDATE" if self.db.dialect == "postgres" else ""
 
     @asynccontextmanager
-    async def coordination_guard(self, profile_id: str) -> AsyncIterator[None]:
+    async def coordination_guard(self, profile_id: str, *, skip_locked: bool = False) -> AsyncIterator[bool]:
         """Serialize coordination work for a profile that may already have been deleted.
 
         Cleanup, release and recovery must finish after a terminal session/run/profile deletion, so unlike
@@ -191,8 +214,20 @@ class SandboxStoreMixin:
         """
         async with self.db.transaction():
             if self.db.dialect == "postgres":
-                await self.db.fetchrow("SELECT id FROM profiles WHERE id = ? FOR UPDATE", profile_id)
-            yield
+                suffix = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
+                row = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?" + suffix, profile_id)
+                if row is None and skip_locked:
+                    exists = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?", profile_id)
+                    if exists is not None:
+                        yield False
+                        return
+                    guard = await self.db.fetchrow(
+                        "SELECT profile_id FROM sandboxes WHERE profile_id = ? FOR UPDATE SKIP LOCKED", profile_id)
+                    if guard is None and await self.db.fetchrow(
+                            "SELECT profile_id FROM sandboxes WHERE profile_id = ?", profile_id) is not None:
+                        yield False
+                        return
+            yield True
 
     async def _lock_sandbox(self, key: SandboxKey, lock: str) -> dict | None:
         return await self.db.fetchrow(
@@ -251,6 +286,12 @@ class SandboxStoreMixin:
                             continue
                         if sandbox_row is not None and sandbox_row["state"] in ("draining", "removing", "blocked"):
                             continue
+                        if sandbox_row is not None and sandbox_row["state"] == "ready":
+                            if (sandbox_row["policy_digest"] != _effective_digest(sandbox)
+                                    or sandbox_row["helper_protocol"] not in (None, HELPER_PROTOCOL_VERSION)
+                                    or (helper_digest is not None
+                                        and sandbox_row["helper_digest"] not in (None, helper_digest))):
+                                continue
                         preparing = await self.db.fetchrow(
                             "SELECT id FROM sandbox_uses WHERE deployment = ? AND profile_id = ? "
                             "AND state = 'preparing' LIMIT 1", deployment, candidate["profile_id"])
@@ -574,6 +615,13 @@ class SandboxStoreMixin:
                 "AND state = ? RETURNING id",
                 now, reason, use.usage_id, use.token, use.owner, use.key.deployment, use.key.profile_id,
                 use.key.daemon_id, usage["state"])
+            if updated is not None:
+                await self.db.execute(
+                    "UPDATE sandboxes SET idle_since = ? WHERE deployment = ? AND profile_id = ? "
+                    "AND state = 'ready' AND container_id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM sandbox_uses WHERE deployment = ? AND profile_id = ? AND state != 'released')",
+                    now, use.key.deployment, use.key.profile_id, usage["container_id"],
+                    use.key.deployment, use.key.profile_id)
             return updated is not None
 
     def _orphaned_generation_gone(self, usage: dict, sandbox_row: dict | None) -> bool:
@@ -1064,7 +1112,8 @@ class SandboxStoreMixin:
         known_target = await self.db.fetchrow(
             "SELECT id FROM sandbox_operations WHERE deployment = ? AND profile_id = ? "
             "AND (container_id IS NOT NULL OR discovered_container_id IS NOT NULL) "
-            "AND confirmed_absent_at IS NULL LIMIT 1", key.deployment, key.profile_id)
+            "AND confirmed_absent_at IS NULL AND generation_token = ? LIMIT 1",
+            key.deployment, key.profile_id, our_token)
         if known_target is not None:
             return
         other_usage = await self.db.fetchrow(
@@ -1101,7 +1150,9 @@ class SandboxStoreMixin:
         are dispatched and committed externally through `commit_recovery`. The guard and locks work after the
         profile row was deleted.
         """
-        async with self.coordination_guard(key.profile_id):
+        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+            if not available:
+                return []
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox_row = await self._lock_sandbox(key, lock)
@@ -1177,7 +1228,7 @@ class SandboxStoreMixin:
         the exact target is retired (`remove_retry`) so a fresh current remove can be recorded; a succeeded one
         means the generation is already gone. Each pass re-arms a retry; pacing is the caller's.
         """
-        if sandbox_row["state"] == "absent":
+        if sandbox_row["state"] == "absent" or sandbox_row.get("error_code") in _INVENTORY_BLOCK_CODES:
             return None
         if any(row["state"] in _UNRELEASED_USAGE_STATES for row in usages):
             return None
@@ -1405,6 +1456,365 @@ class SandboxStoreMixin:
                 "release_reason = 'generation_removed' WHERE id = ? AND token = ? AND state = 'orphaned' "
                 "RETURNING id", now, action.usage_id, action.usage_token)
             return released is not None
+
+    async def recovery_candidates(self, *, limit: int = 100,
+                                  purpose: Literal["recovery", "idle"] = "recovery") -> list[SandboxKey]:
+        """Rotate independent bounded scan cursors so idle scans cannot consume recovery's next batch."""
+        if purpose not in ("recovery", "idle"):
+            raise ValueError("unknown sandbox scan purpose")
+        limit = max(0, min(limit, 100))
+        if not limit:
+            return []
+        cursors = getattr(self, "_sandbox_scan_cursors", {})
+        cursor = cursors.get(purpose, ("", "", ""))
+        query = (
+            "SELECT deployment, profile_id, daemon_id FROM sandboxes "
+            "UNION SELECT deployment, profile_id, daemon_id FROM sandbox_uses WHERE state != 'released' "
+            "OR (release_reason IN ('generation_removed', 'preparation_retired_without_execution') AND EXISTS "
+            "(SELECT 1 FROM runs r WHERE r.id = sandbox_uses.run_id AND r.status IN "
+            "('queued', 'running', 'stopping'))) "
+            "UNION SELECT deployment, profile_id, daemon_id FROM sandbox_operations WHERE resolved_at IS NULL")
+        rows = await self.db.fetch(
+            "SELECT * FROM (" + query + ") AS candidates WHERE (deployment, profile_id, daemon_id) > (?, ?, ?) "
+            "ORDER BY deployment, profile_id, daemon_id LIMIT ?", *cursor, limit)
+        if len(rows) < limit and cursor != ("", "", ""):
+            rows += await self.db.fetch(
+                "SELECT * FROM (" + query + ") AS candidates "
+                "WHERE (deployment, profile_id, daemon_id) <= (?, ?, ?) "
+                "ORDER BY deployment, profile_id, daemon_id LIMIT ?", *cursor, limit - len(rows))
+        if rows:
+            cursors[purpose] = (rows[-1]["deployment"], rows[-1]["profile_id"], rows[-1]["daemon_id"])
+            self._sandbox_scan_cursors = cursors
+        return [_key(row) for row in rows]
+
+    async def get_run_usage(self, run_id: str) -> SandboxUsage | None:
+        row = await self.db.fetchrow("SELECT * FROM sandbox_uses WHERE run_id = ?", run_id)
+        return _usage(row) if row is not None else None
+
+    async def recovery_snapshot(self, key: SandboxKey) -> tuple[dict | None, list[SandboxUsage]]:
+        """Observation only; all decisions re-read these identities under the guard."""
+        row = await self.db.fetchrow(
+            f"SELECT * FROM sandboxes WHERE {_SANDBOX_IDENTITY}", key.deployment, key.profile_id)
+        uses = await self.db.fetch(
+            "SELECT * FROM sandbox_uses WHERE deployment = ? AND profile_id = ? AND (state != 'released' "
+            "OR (release_reason IN ('generation_removed', 'preparation_retired_without_execution') AND EXISTS "
+            "(SELECT 1 FROM runs r WHERE r.id = sandbox_uses.run_id AND r.status IN "
+            "('queued', 'running', 'stopping'))))",
+            key.deployment, key.profile_id)
+        return row, [_usage(use) for use in uses]
+
+    async def recovery_diagnostics(self, deployment: str) -> tuple[int, float | None]:
+        row = await self.db.fetchrow(
+            "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM sandbox_operations "
+            "WHERE deployment = ? AND kind = 'create' AND authority = 'retired' AND resolved_at IS NULL",
+            deployment)
+        now = await self.coordination_now()
+        return row["n"], max(0.0, now - row["oldest"]) if row["oldest"] is not None else None
+
+    async def classify_inventory(self, observation: ContainerObservation, *, owner: str,
+                                 lease_seconds: float) -> RecoveryAction | None:
+        """Classify under the guard; only a fully matched retired attempt permits quarantine removal."""
+        labels = dict(observation.labels)
+        deployment, profile = labels.get("keel.deployment"), labels.get("keel.profile")
+        # Prefer recorded exact-ID ownership over mutable observation labels. A conflicting profile or
+        # deployment label must block the original owner, including when the managed label was removed.
+        recorded = await self.db.fetchrow(
+            "SELECT deployment, profile_id, daemon_id FROM sandboxes WHERE container_id = ? "
+            "UNION SELECT deployment, profile_id, daemon_id FROM sandbox_operations "
+            "WHERE container_id = ? OR discovered_container_id = ? LIMIT 1",
+            observation.container_id, observation.container_id, observation.container_id)
+        if recorded is not None:
+            key = _key(recorded)
+        elif labels.get("keel.managed") == "1" and deployment and profile:
+            key = SandboxKey(deployment, profile, observation.daemon_id)
+        else:
+            return None
+        profile = key.profile_id
+        async with self.coordination_guard(profile, skip_locked=True) as available:
+            if not available:
+                return None
+            lock = self._lock_suffix()
+            now = await self.coordination_now()
+            sandbox = await self._lock_sandbox(key, lock)
+            operations = await self._lock_operations(key, lock)
+            usages = await self._lock_usages(key, lock)
+            execs = await self._lock_execs(key, lock)
+            create = next((op for op in operations if op["id"] == labels.get("keel.create-operation")
+                           and op["kind"] == "create"), None)
+            matches = (labels.get("keel.managed") == "1" and deployment == key.deployment
+                       and labels.get("keel.profile") == key.profile_id
+                       and create is not None and create["daemon_id"] == observation.daemon_id
+                       and create["intended_name"] == observation.container_name
+                       and str(create["generation"]) == labels.get("keel.generation")
+                       and create["generation_token"] == labels.get("keel.generation-token")
+                       and create["container_id"] in (None, observation.container_id)
+                       and create["discovered_container_id"] in (None, observation.container_id)
+                       # Both values come from this container's own inspect: the comparison proves its policy
+                       # record is internally consistent, not that it equals the profile policy (publication
+                       # and reuse check the recorded digest separately).
+                       and observation.policy_digest == labels.get("keel.policy")
+                       and observation.policy_digest is not None and len(observation.policy_digest) == 16
+                       and all(char in "0123456789abcdef" for char in observation.policy_digest)
+                       and len(labels) == len(observation.labels))
+            if sandbox is not None and sandbox["daemon_id"] != observation.daemon_id:
+                return await self._block_inventory(key, observation, now, "sandbox_daemon_mismatch")
+            if not matches:
+                return await self._block_inventory(key, observation, now, "sandbox_inventory_conflict")
+            if (sandbox is not None and sandbox["container_id"] == observation.container_id
+                    and sandbox["generation_token"] == create["generation_token"]
+                    and sandbox["policy_digest"] != observation.policy_digest):
+                return await self._block_inventory(key, observation, now, "sandbox_inventory_conflict")
+            await self.db.execute(
+                "UPDATE sandbox_operations SET container_id = COALESCE(container_id, ?), "
+                "discovered_container_id = COALESCE(discovered_container_id, ?), updated_at = ? WHERE id = ?",
+                observation.container_id, observation.container_id, now, create["id"])
+            # A conflict recorded on this very container is reconciled by a fully matching observation of it:
+            # the operator restored the labels or the earlier inspect was wrong, and the published generation
+            # was verified end to end above. Conflicts recorded on another container clear only after that
+            # container is proven absent by exact ID (recovery does that after the scan). A generation still
+            # draining for another reason keeps its state and loses only the conflict evidence.
+            if (sandbox is not None and sandbox["error_code"] == "sandbox_inventory_conflict"
+                    and sandbox["error_message"] == observation.container_id
+                    and sandbox["container_id"] == observation.container_id
+                    and sandbox["generation_token"] == create["generation_token"]
+                    and create["authority"] == "current" and sandbox["state"] in ("draining", "blocked")):
+                if _generation_draining(usages, execs, operations, sandbox["generation_token"], now):
+                    await self.db.execute(
+                        "UPDATE sandboxes SET error_code = NULL, error_message = NULL, transitioned_at = ? "
+                        "WHERE deployment = ? AND profile_id = ? AND container_id = ? AND generation_token = ?",
+                        now, key.deployment, key.profile_id, observation.container_id,
+                        create["generation_token"])
+                    sandbox = dict(sandbox, error_code=None, error_message=None)
+                else:
+                    await self.db.execute(
+                        "UPDATE sandboxes SET state = 'ready', error_code = NULL, error_message = NULL, "
+                        "transitioned_at = ? WHERE deployment = ? AND profile_id = ? AND container_id = ? "
+                        "AND generation_token = ? AND state IN ('draining', 'blocked')",
+                        now, key.deployment, key.profile_id, observation.container_id,
+                        create["generation_token"])
+                    sandbox = dict(sandbox, state="ready", error_code=None, error_message=None)
+            if create["authority"] != "retired":
+                return RecoveryAction(key, "protected", container_id=observation.container_id,
+                                      operation_id=create["id"], reason="current_preparation")
+            linked = [op for op in operations if op["original_create_operation_id"] == create["id"]]
+            started = any(op["kind"] == "start" and op["confirmed_absent_at"] is None
+                          and op["outcome"] != "definite_failure" for op in linked)
+            executed = any(ex["generation_token"] == create["generation_token"]
+                           and ex["state"] in _UNRESOLVED_EXEC_STATES for ex in execs)
+            if observation.running and not (started or executed):
+                return await self._block_inventory(key, observation, now, "sandbox_retired_create_running")
+            if sandbox is not None and sandbox["error_code"] in _INVENTORY_BLOCK_CODES:
+                return RecoveryAction(key, "blocked", reason=sandbox["error_code"])
+            # A synthetic historical generation selects only that exact target. Conditional updates in
+            # _plan_remove/_commit_remove_success cannot overwrite a newer generation's pointer or usages.
+            historical = dict(sandbox or {})
+            historical.update(generation=create["generation"], generation_token=create["generation_token"],
+                              container_id=observation.container_id, container_name=observation.container_name,
+                              state="draining")
+            action = await self._plan_remove(key, owner, lease_seconds, historical, operations,
+                                             [use for use in usages if use["container_id"] == observation.container_id],
+                                             execs, now)
+            if action is not None:
+                await self.db.execute("UPDATE sandbox_operations SET cleanup_operation_id = ? WHERE id = ?",
+                                      action.operation_id, create["id"])
+            return action
+
+    async def _block_inventory(self, key: SandboxKey, observation: ContainerObservation, now: float,
+                               reason: str) -> RecoveryAction:
+        # An unknown extra target or a conflict on the published current container blocks new admission. The
+        # recorded exact-ID generation keeps its execution and control authority while it drains: exec dispatch
+        # targets that ID, so a label disagreement cannot redirect it, and an in-flight command must stay
+        # cancellable. A row without a verified current target is blocked outright.
+        current = await self._lock_sandbox(key, self._lock_suffix())
+        verified_current = (current is not None and current["container_id"] is not None
+                            and current["daemon_id"] == observation.daemon_id
+                            and current["state"] in ("ready", "draining"))
+        state = "draining" if verified_current else "blocked"
+        # Store only fixed reasons and exact identities, never raw Docker output or model-controlled labels.
+        await self.db.execute(
+            "INSERT INTO sandboxes (deployment, profile_id, daemon_id, generation, state, error_code, "
+            "error_message, transitioned_at) VALUES (?, ?, ?, 0, 'blocked', ?, ?, ?) "
+            "ON CONFLICT (deployment, profile_id) DO UPDATE SET state = ?, error_code = ?, "
+            "error_message = ?, transitioned_at = ?",
+            key.deployment, key.profile_id, key.daemon_id, reason, observation.container_id, now,
+            state, reason, observation.container_id, now)
+        return RecoveryAction(key, "blocked", container_id=observation.container_id, reason=reason)
+
+    async def blocked_inventory_targets(self, keys: list[SandboxKey], *,
+                                        daemon_id: str) -> list[tuple[SandboxKey, str]]:
+        """Recorded conflicting container IDs for verified profiles that still withhold admission.
+
+        Only blocks recorded on a container other than the published one are returned; a conflict recorded on
+        the published container itself clears only when that container is verified matching again.
+        """
+        targets = []
+        for key in keys:
+            if key.daemon_id != daemon_id:
+                continue
+            async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+                if not available:
+                    continue
+                sandbox = await self._lock_sandbox(key, self._lock_suffix())
+                if (sandbox is None or sandbox["daemon_id"] != daemon_id
+                        or sandbox["state"] not in ("draining", "blocked")
+                        or sandbox["error_code"] not in _INVENTORY_BLOCK_CODES
+                        or sandbox["container_id"] is None or sandbox["generation_token"] is None
+                        or sandbox["error_message"] is None
+                        or sandbox["error_message"] == sandbox["container_id"]):
+                    continue
+                targets.append((key, sandbox["error_message"]))
+        return targets
+
+    async def clear_resolved_inventory_block(self, key: SandboxKey, *, daemon_id: str) -> bool:
+        """Clear an admission block after the caller proves the recorded conflicting container absent.
+
+        The exact-ID absence evidence must come from this same daemon. A profile still draining for another
+        reason (expired, preparing, cleaning or orphaned usage, unresolved execution or current operation) keeps
+        its state and loses only the conflict evidence, so this never reopens admission on a draining generation.
+        """
+        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+            if not available:
+                return False
+            lock = self._lock_suffix()
+            sandbox = await self._lock_sandbox(key, lock)
+            if (sandbox is None or sandbox["daemon_id"] != daemon_id
+                    or sandbox["state"] not in ("draining", "blocked")
+                    or sandbox["error_code"] not in _INVENTORY_BLOCK_CODES
+                    or sandbox["container_id"] is None or sandbox["generation_token"] is None
+                    or sandbox["error_message"] is None
+                    or sandbox["error_message"] == sandbox["container_id"]):
+                return False
+            usages = await self._lock_usages(key, lock)
+            execs = await self._lock_execs(key, lock)
+            operations = await self._lock_operations(key, lock)
+            now = await self.coordination_now()
+            token = sandbox["generation_token"]
+            if _generation_draining(usages, execs, operations, token, now):
+                await self.db.execute(
+                    "UPDATE sandboxes SET error_code = NULL, error_message = NULL, transitioned_at = ? "
+                    "WHERE deployment = ? AND profile_id = ? AND container_id = ? AND generation_token = ?",
+                    now, key.deployment, key.profile_id, sandbox["container_id"], token)
+                return False
+            await self.db.execute(
+                "UPDATE sandboxes SET state = 'ready', error_code = NULL, error_message = NULL, "
+                "transitioned_at = ? WHERE deployment = ? AND profile_id = ? AND container_id = ? "
+                "AND generation_token = ? AND state IN ('draining', 'blocked')",
+                now, key.deployment, key.profile_id, sandbox["container_id"], token)
+            return True
+
+    async def confirm_generation_missing(self, key: SandboxKey, container_id: str) -> bool:
+        """Revoke users only after the caller has authoritative exact-ID absence evidence."""
+        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+            if not available:
+                return False
+            sandbox = await self._lock_sandbox(key, self._lock_suffix())
+            if sandbox is None or sandbox["daemon_id"] != key.daemon_id or sandbox["container_id"] != container_id:
+                return False
+            await self._lock_operations(key, self._lock_suffix())
+            await self._lock_usages(key, self._lock_suffix())
+            await self._lock_execs(key, self._lock_suffix())
+            now = await self.coordination_now()
+            await self.db.execute(
+                "UPDATE sandbox_uses SET state = 'orphaned' WHERE deployment = ? AND profile_id = ? "
+                "AND container_id = ? AND state IN ('active', 'cleaning')", key.deployment, key.profile_id,
+                container_id)
+            await self.db.execute(
+                "UPDATE sandboxes SET state = 'draining', transitioned_at = ? "
+                "WHERE deployment = ? AND profile_id = ?", now, key.deployment, key.profile_id)
+            return True
+
+    async def plan_idle_removal(self, key: SandboxKey, *, owner: str, lease_seconds: float,
+                                idle_seconds: float, helper_digest: str) -> list[RecoveryAction]:
+        """Remove expired idle or incompatible ready generations, after every valid user finishes."""
+        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+            if not available:
+                return []
+            lock = self._lock_suffix()
+            sandbox = await self._lock_sandbox(key, lock)
+            operations = await self._lock_operations(key, lock)
+            usages = await self._lock_usages(key, lock)
+            execs = await self._lock_execs(key, lock)
+            if sandbox is None or sandbox["daemon_id"] != key.daemon_id or sandbox["state"] != "ready":
+                return []
+            if any(use["state"] != "released" for use in usages):
+                return []
+            current = [op for op in operations if op["generation_token"] == sandbox["generation_token"]]
+            if any(op["outcome"] in ("planned", "dispatched", "uncertain")
+                   and op["confirmed_absent_at"] is None for op in current):
+                return []
+            profile = await self.db.fetchrow("SELECT sandbox FROM profiles WHERE id = ?", key.profile_id)
+            digest = _effective_digest(json.loads(profile["sandbox"])) if profile is not None else None
+            incompatible = (sandbox["policy_digest"] != digest
+                            or sandbox["helper_protocol"] not in (None, HELPER_PROTOCOL_VERSION)
+                            or sandbox["helper_digest"] not in (None, helper_digest))
+            now = await self.coordination_now()
+            if not incompatible and (sandbox["idle_since"] is None or sandbox["idle_since"] + idle_seconds > now):
+                return []
+            sandbox["state"] = "draining"
+            action = await self._plan_remove(key, owner, lease_seconds, sandbox, operations, usages, execs, now)
+            return [action] if action is not None else []
+
+    async def rearm_recovery_remove(self, action: RecoveryAction) -> RecoveryAction | None:
+        """After observing a still-present target, retire the old dispatch before a fresh remove intent."""
+        async with self.coordination_guard(action.key.profile_id, skip_locked=True) as available:
+            if not available:
+                return None
+            lock = self._lock_suffix()
+            sandbox = await self._lock_sandbox(action.key, lock)
+            operations = await self._lock_operations(action.key, lock)
+            operation = next((op for op in operations if op["id"] == action.operation_id), None)
+            if (operation is None or operation["owner_token"] != action.owner_token
+                    or operation["authority"] != "current" or operation["outcome"] not in ("dispatched", "uncertain")
+                    or operation["container_id"] != action.container_id):
+                return None
+            now = await self.coordination_now()
+            operation_id, token = "op_" + uuid.uuid4().hex, uuid.uuid4().hex
+            await self.db.execute(
+                "UPDATE sandbox_operations SET authority = 'retired', retired_at = ?, "
+                "retirement_reason = 'remove_retry', updated_at = ? WHERE id = ? AND owner_token = ?",
+                now, now, action.operation_id, action.owner_token)
+            await self.db.execute(
+                "INSERT INTO sandbox_operations (id, kind, deployment, profile_id, daemon_id, generation, "
+                "generation_token, intended_name, original_create_operation_id, container_id, owner, owner_token, "
+                "lease_expires_at, created_at, updated_at) VALUES (?, 'remove', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                operation_id, action.key.deployment, action.key.profile_id, action.key.daemon_id,
+                action.generation, action.generation_token, operation["intended_name"],
+                operation["original_create_operation_id"], action.container_id, operation["owner"], token,
+                operation["lease_expires_at"], now, now)
+            if sandbox is not None and sandbox["current_operation_id"] == action.operation_id:
+                await self.db.execute(
+                    "UPDATE sandboxes SET current_operation_id = ? WHERE deployment = ? AND profile_id = ? "
+                    "AND current_operation_id = ?", operation_id, action.key.deployment,
+                    action.key.profile_id, action.operation_id)
+            await self.db.execute(
+                "UPDATE sandbox_operations SET cleanup_operation_id = ? WHERE cleanup_operation_id = ?",
+                operation_id, action.operation_id)
+            return RecoveryAction(key=action.key, action="remove", operation_id=operation_id,
+                                  container_id=action.container_id, generation=action.generation,
+                                  generation_token=action.generation_token, owner_token=token, reason=action.reason)
+
+    async def authorize_recovery_remove(self, action: RecoveryAction) -> bool:
+        """Recheck exact-target bindings immediately before dispatch under the same admission guard."""
+        async with self.coordination_guard(action.key.profile_id, skip_locked=True) as available:
+            if not available:
+                return False
+            sandbox = await self._lock_sandbox(action.key, self._lock_suffix())
+            if sandbox is not None and (sandbox["daemon_id"] != action.key.daemon_id
+                                        or sandbox["error_code"] in _INVENTORY_BLOCK_CODES):
+                return False
+            operation = await self.get_operation(action.operation_id)
+            now = await self.coordination_now()
+            if (operation is None or operation.owner_token != action.owner_token or operation.authority != "current"
+                    or operation.container_id != action.container_id or operation.lease_expires_at is None
+                    or operation.lease_expires_at < now):
+                return False
+            users = await self._lock_usages(action.key, self._lock_suffix())
+            if any(use["container_id"] == action.container_id and use["state"] in _UNRELEASED_USAGE_STATES
+                   for use in users):
+                return False
+            if operation.outcome == "planned":
+                return await self.authorize_dispatch(operation)
+            return operation.outcome in ("dispatched", "uncertain")
 
     # evidence retention
 

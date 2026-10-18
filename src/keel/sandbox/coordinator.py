@@ -24,23 +24,25 @@ from keel.sandbox.records import (
     RunClaim, SandboxBinding,
     SandboxBusy, SandboxLeaseLost, SandboxUncertain, UseHandle,
 )
+from keel.sandbox.recovery import SandboxRecoveryMixin
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION, HelperArtifact, helper_artifact
 from keel.store.sql import SqlStore
 
 log = logging.getLogger(__name__)
 
 
-class SandboxCoordinator(ExecFileIO):
+class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
     """One instance's authority to admit, prepare and publish a profile's sandbox generation."""
 
     def __init__(self, store: SqlStore, backend: CoordinatedSandboxBackend, *, deployment: str, owner: str,
-                 lease_seconds: float, idle_seconds: float, reap_seconds: float) -> None:
+                 lease_seconds: float, idle_seconds: float, reap_seconds: float, bus=None) -> None:
         if not deployment:
             raise ValueError("a deployment identifier is required")
         if not owner:
             raise ValueError("a coordinator owner is required")
         if lease_seconds <= 0:
             raise ValueError("the coordination lease must be positive")
+        self.bus = bus
         self.store = store
         self.backend = backend
         self.deployment = deployment
@@ -346,8 +348,10 @@ class SandboxCoordinator(ExecFileIO):
                             *, container_id: str, expected_name: str, running: bool) -> None:
         """Verify the intended generation's identity before publishing any step of it.
 
-        Labels and policy are checked as an exact map and a required digest: an observation that omits them (for
-        example because an inspect could not read them) is never treated as matching.
+        Every generation label must be present with its exact value and the policy digest must match: an
+        observation that omits them (for example because an inspect could not read them) is never treated as
+        matching. Docker merges an image's own labels into the container, so labels keel did not write are ignored;
+        another keel label is still a conflict.
         """
         if observation.daemon_id != self._daemon_id:
             raise SandboxBusy("the Docker daemon identity changed during preparation")
@@ -367,5 +371,9 @@ class SandboxCoordinator(ExecFileIO):
             "keel.generation-token": attempt.generation_token,
             "keel.create-operation": attempt.original_create_operation_id or attempt.id,
         }
-        if dict(observation.labels) != expected:
+        labels = dict(observation.labels)
+        for name, value in expected.items():
+            if labels.get(name) != value:
+                raise SandboxUncertain(f"the {attempt.kind} observed another generation's labels")
+        if any(name.startswith("keel.") and name not in expected for name in labels):
             raise SandboxUncertain(f"the {attempt.kind} observed another generation's labels")

@@ -83,6 +83,26 @@ and the command it left running is killed: keel reaches the profile's container 
 process group. This works only when the instance that notices shares the lost worker's Docker daemon (or host, for
 the local sandbox); otherwise the command runs until its own timeout. The sweep never creates a container.
 
+## Coordinated recovery API
+
+`SandboxCoordinator.reconcile_once()` reconciles persisted usage and lifecycle attempts, including stopped
+containers and late results from retired creates. `recover_run(run_id)` performs the same guarded recovery for
+one run; `reap_idle_once()` removes safely released idle generations. These interfaces are available for service
+integration; the worker and API have not yet switched to them. Each scan takes bounded batches (at most 100
+profile candidates and 100 inventory observations), rotating through retained tombstones between passes.
+
+Expired usage drains its generation while other valid users can finish. Recovery removes only recorded exact
+container IDs and confirms absence before releasing bound orphan usage or replacing a generation. A never-bound
+preparation with no authorized start or execution may release without Docker, retaining its create tombstone
+indefinitely. Unknown or conflicting inventory blocks new admission for the affected profile while the recorded
+exact-ID generation keeps its execution and cancellation authority. A conflict recorded on the published
+container itself clears when that container is verified matching again; a conflict recorded on another container
+clears when that exact ID is proven absent on the same daemon. A generation still draining for another reason
+keeps draining when its conflict evidence clears. A daemon identity change is not resolved by inventory: it
+requires restoring the recorded daemon configuration, and a new daemon never proves that the previous daemon's
+containers are absent. Recovery reports count
+unresolved create tombstones and their oldest age, with bounded diagnostic codes.
+
 ## The Docker socket
 
 The service starts containers by running the docker CLI against the Docker daemon. Giving it the Docker socket is

@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Coordinator recovery APIs reconcile orphaned usage, stopped and delayed retired creates, and idle generations by
+  exact container ID. Recovery preserves valid users and their execution authority, retains unresolved create
+  evidence, blocks conflicting inventory until the recorded conflict is resolved, and safely replaces incompatible
+  policy/helper generations after their users finish.
 - The sandbox coordinator records commands, file/skill helpers and cleanup before dispatch, verifies supervisor
   receipts before finishing executions, and gates cancellation on the original execution and current usage lease.
 - `python -m keel.admin import-sessions` imports conversations copied from another system: JSON lines on stdin, one

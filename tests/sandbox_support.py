@@ -52,6 +52,8 @@ class FakeDocker:
         self.installations: list = []
         self.created_ids: list[str] = []
         self.inspections: list[str] = []
+        self.removed_ids: list[str] = []
+        self.running_ids: set[str] = set()
         self.observe = None
         self._containers = list(containers or [])
         self._created: dict[str, tuple[str, tuple[tuple[str, str], ...], str]] = {}
@@ -90,7 +92,8 @@ class FakeDocker:
         if created is None:
             return None
         name, labels, digest = created
-        return ContainerObservation(self.daemon_id, container_id, name, labels, True, digest)
+        return ContainerObservation(self.daemon_id, container_id, name, labels,
+                                    container_id in self.running_ids, digest)
 
     def _reported(self, kind: str, observation: ContainerObservation) -> ContainerObservation:
         return self.observe(kind, observation) if self.observe is not None else observation
@@ -136,6 +139,7 @@ class FakeDocker:
         forced = self._results.get("start")
         if forced is not None:
             return forced
+        self.running_ids.add(attempt.container_id)
         observation = self._running_observation(attempt.container_id)
         if observation is None:
             return DockerOutcome("definite_failure", diagnostic="the container does not exist")
@@ -149,12 +153,18 @@ class FakeDocker:
         return DockerOutcome("succeeded", observation=observation)
 
     async def inventory(self) -> list[ContainerObservation]:
-        return []
+        return [self._running_observation(exact) for exact in self._created]
 
     async def remove_id(self, attempt) -> DockerOutcome:
         self._enter("remove")
         self.attempts.setdefault("remove", []).append(attempt)
-        return self._results.get("remove", DockerOutcome("succeeded"))
+        await self._wait("remove")
+        result = self._results.get("remove", DockerOutcome("succeeded"))
+        if result.state == "succeeded":
+            self.removed_ids.append(attempt.container_id)
+            self._created.pop(attempt.container_id, None)
+            self.running_ids.discard(attempt.container_id)
+        return result
 
     async def aclose(self) -> None:
         return None
@@ -260,3 +270,10 @@ class TransactionProbe:
 
     async def close(self) -> None:
         await self.inner.close()
+
+
+async def current_container_id(store, key) -> str | None:
+    row = await store.db.fetchrow(
+        "SELECT container_id FROM sandboxes WHERE deployment = ? AND profile_id = ?",
+        key.deployment, key.profile_id)
+    return row["container_id"] if row else None

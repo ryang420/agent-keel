@@ -136,19 +136,18 @@ async def test_a_later_claim_shares_the_published_generation_without_new_docker_
     assert backend.calls == ["create", "install_helper", "start"]
 
 
-async def test_policy_mismatch_does_not_replace_an_existing_target(coordination):
+async def test_policy_mismatch_defers_claim_without_reserving_a_deadlocked_preparation(coordination):
     coordinator, backend, store, _ = coordination
     await seed_ready_sandbox(store)
-    claim = await make_claim(store, "s1", sandbox={"image": "other", "workdir": "/w"})
+    await seed_profile(store, sandbox={"image": "other", "workdir": "/w"})
+    run = await queue_run(store, "s1")
     before = await _sandbox_row(store)
 
-    with pytest.raises(SandboxBusy):
-        await coordinator.prepare(claim.use)
-
+    assert await coordinator.claim() is None
+    assert await store.get_run_usage(run.id) is None
+    assert (await store.get_run_by_id(run.id)).status == "queued"
     assert backend.calls == []
-    after = await _sandbox_row(store)
-    assert after == before
-    assert (await store.get_usage(claim.use.usage_id)).state == "preparing"
+    assert await _sandbox_row(store) == before
 
 
 async def test_an_expired_usage_never_dispatches_anything(coordination):
@@ -304,32 +303,23 @@ async def test_a_generation_published_with_another_helper_is_not_reused(coordina
     coordinator, backend, store, _ = coordination
     await seed_profile(store)
     await seed_ready_sandbox(store, helper_digest="0" * 64)
-    await queue_run(store, "s1")
+    run = await queue_run(store, "s1")
 
-    claim = await coordinator.claim()
-    assert claim is not None and claim.use is not None
-    usage = await store.get_usage(claim.use.usage_id)
-    assert usage.state == "preparing" and usage.binding is None
-    with pytest.raises(SandboxBusy):
-        await coordinator.prepare(claim.use)
-
+    assert await coordinator.claim() is None
+    assert await store.get_run_usage(run.id) is None
+    assert (await store.get_run_by_id(run.id)).status == "queued"
     assert backend.calls == []
-    assert (await store.get_usage(claim.use.usage_id)).state == "preparing"
 
 
 async def test_a_generation_published_for_another_helper_protocol_is_not_reused(coordination):
     coordinator, backend, store, _ = coordination
     await seed_profile(store)
     await seed_ready_sandbox(store, helper_protocol=2)
-    await queue_run(store, "s1")
+    run = await queue_run(store, "s1")
 
-    claim = await coordinator.claim()
-    assert claim is not None and claim.use is not None
-    usage = await store.get_usage(claim.use.usage_id)
-    assert usage.state == "preparing" and usage.binding is None
-    with pytest.raises(SandboxBusy):
-        await coordinator.prepare(claim.use)
-
+    assert await coordinator.claim() is None
+    assert await store.get_run_usage(run.id) is None
+    assert (await store.get_run_by_id(run.id)).status == "queued"
     assert backend.calls == []
 
 
@@ -339,6 +329,32 @@ async def test_a_create_observation_without_the_exact_labels_is_not_published(co
     backend.observe = lambda kind, observation: (
         replace(observation, labels=tuple(
             pair for pair in observation.labels if pair[0] != "keel.managed"))
+        if kind == "create" else observation)
+
+    with pytest.raises(SandboxUncertain):
+        await coordinator.prepare(claim.use)
+
+    assert backend.calls == ["create"]
+    assert (await _sandbox_row(store))["state"] == "creating"
+
+
+async def test_labels_inherited_from_the_image_do_not_block_publication(coordination):
+    coordinator, backend, store, _ = coordination
+    claim = await make_claim(store, "s1")
+    backend.observe = lambda kind, observation: replace(
+        observation, labels=observation.labels + (("com.example.image", "inherited"),))
+
+    bound = await coordinator.prepare(claim.use)
+
+    assert bound.binding.container_id == backend.created_ids[0]
+    assert (await _sandbox_row(store))["state"] == "ready"
+
+
+async def test_a_foreign_keel_label_on_the_observation_is_not_published(coordination):
+    coordinator, backend, store, _ = coordination
+    claim = await make_claim(store, "s1")
+    backend.observe = lambda kind, observation: (
+        replace(observation, labels=observation.labels + (("keel.foreign", "1"),))
         if kind == "create" else observation)
 
     with pytest.raises(SandboxUncertain):
