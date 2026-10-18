@@ -71,9 +71,11 @@ def _event(row: dict) -> Event:
 
 
 class SqlStore:
-    def __init__(self, db, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, db, clock: Callable[[], float] = time.time,
+                 coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
-        self.clock = clock
+        self.clock = clock  # legacy transcript time
+        self.coordination_clock = coordination_clock  # test-only override for database coordination time
 
     async def init(self) -> None:
         await migrate(self.db)
@@ -81,6 +83,12 @@ class SqlStore:
     async def ping(self) -> bool:
         row = await self.db.fetchrow("SELECT 1 AS ok")
         return row is not None and row["ok"] == 1
+
+    async def coordination_now(self) -> float:
+        """Database time for coordination deadlines, or the injected test clock when supplied."""
+        if self.coordination_clock is not None:
+            return self.coordination_clock()
+        return await self.db.database_now()
 
     async def close(self) -> None:
         await self.db.close()

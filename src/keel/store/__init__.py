@@ -11,6 +11,7 @@ from keel.store.sql import SqlStore
 
 
 async def open_store(url: str, clock: Callable[[], float] = time.time, *,
+                     coordination_clock: Callable[[], float] | None = None,
                      command_timeout: float | None = None, tenant_ids: tuple[int, ...] | None = None,
                      tenant_backfill: dict[str, int] | None = None) -> SqlStore:
     """Open the store; service startup migrates and enforces ownership atomically when tenant_ids are provided."""
@@ -23,7 +24,7 @@ async def open_store(url: str, clock: Callable[[], float] = time.time, *,
                     else PostgresDb.connect(url, command_timeout=command_timeout))
     else:
         raise ValueError(f"unsupported database URL: {url.split(':', 1)[0]}")
-    store = SqlStore(db, clock=clock)
+    store = SqlStore(db, clock=clock, coordination_clock=coordination_clock)
     try:
         if tenant_ids is None:
             await store.init()

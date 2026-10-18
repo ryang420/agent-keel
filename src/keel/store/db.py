@@ -21,6 +21,7 @@ class Db(Protocol):
     async def fetch(self, sql: str, *args) -> list[dict]: ...
     async def executescript(self, script: str) -> None: ...
     def transaction(self): ...
+    async def database_now(self) -> float: ...
     async def close(self) -> None: ...
 
 
@@ -85,6 +86,11 @@ class SqliteDb:
         async with self._lock:
             await (await self._conn.executescript(script)).close()
             await self._conn.commit()
+
+    async def database_now(self) -> float:
+        """Unix epoch seconds from SQLite's clock: a Julian day number adjusted to 1970-01-01 and scaled to days."""
+        row = await self.fetchrow("SELECT (julianday('now') - 2440587.5) * 86400.0 AS now")
+        return float(row["now"])
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:

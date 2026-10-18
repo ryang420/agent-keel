@@ -92,8 +92,82 @@ ALTER TABLE profiles ADD COLUMN tenant_id INTEGER;
 CREATE INDEX IF NOT EXISTS profiles_tenant ON profiles (tenant_id);
 """
 
+# Coordination identities are independent of transcript rows: run/profile/session columns are logical links, not
+# foreign keys, so evidence survives deletion of a terminal run or session. Authority and external outcome are
+# separate columns: retired + uncertain is an intentional, unresolved combination. There is no FK cycle between
+# sandboxes.current_operation_id and sandbox_operations; guarded transitions validate the pointer instead.
+_V5 = """
+CREATE TABLE sandboxes (
+    deployment TEXT NOT NULL, profile_id TEXT NOT NULL, daemon_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0), generation_token TEXT,
+    container_id TEXT, container_name TEXT, policy_digest TEXT,
+    helper_protocol INTEGER, helper_digest TEXT,
+    state TEXT NOT NULL DEFAULT 'absent'
+        CHECK (state IN ('absent', 'creating', 'ready', 'draining', 'removing', 'blocked')),
+    current_operation_id TEXT, idle_since {real}, transitioned_at {real} NOT NULL,
+    error_code TEXT, error_message TEXT,
+    PRIMARY KEY (deployment, profile_id));
+CREATE UNIQUE INDEX sandboxes_generation_token ON sandboxes (generation_token)
+    WHERE generation_token IS NOT NULL;
+CREATE UNIQUE INDEX sandboxes_container ON sandboxes (daemon_id, container_id)
+    WHERE container_id IS NOT NULL;
+CREATE INDEX sandboxes_idle ON sandboxes (state, idle_since);
+CREATE TABLE sandbox_uses (
+    id TEXT PRIMARY KEY, token TEXT NOT NULL,
+    deployment TEXT NOT NULL, profile_id TEXT NOT NULL, daemon_id TEXT NOT NULL,
+    run_id TEXT NOT NULL, session_id TEXT, owner TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('preparing', 'active', 'cleaning', 'orphaned', 'released')),
+    generation INTEGER, generation_token TEXT, container_id TEXT, container_name TEXT,
+    create_operation_id TEXT, heartbeat_at {real} NOT NULL, lease_expires_at {real} NOT NULL,
+    released_at {real}, release_reason TEXT,
+    CHECK (state <> 'released' OR released_at IS NOT NULL),
+    CHECK (state = 'released' OR released_at IS NULL));
+CREATE UNIQUE INDEX sandbox_uses_token ON sandbox_uses (token);
+CREATE UNIQUE INDEX sandbox_uses_run ON sandbox_uses (run_id);
+CREATE INDEX sandbox_uses_profile ON sandbox_uses (deployment, profile_id, state);
+CREATE INDEX sandbox_uses_lease ON sandbox_uses (lease_expires_at);
+CREATE INDEX sandbox_uses_create ON sandbox_uses (create_operation_id);
+CREATE TABLE sandbox_execs (
+    id TEXT PRIMARY KEY, control_token TEXT NOT NULL, usage_id TEXT NOT NULL, usage_token TEXT NOT NULL,
+    deployment TEXT NOT NULL, profile_id TEXT NOT NULL, daemon_id TEXT NOT NULL,
+    run_id TEXT, session_id TEXT, generation INTEGER NOT NULL, generation_token TEXT NOT NULL,
+    container_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'finished', 'uncertain', 'retired')),
+    protocol INTEGER, dispatched_at {real}, started_at {real}, finished_at {real},
+    cleanup_outcome TEXT, uncertainty_reason TEXT, diagnostic TEXT, created_at {real} NOT NULL);
+CREATE UNIQUE INDEX sandbox_execs_control_token ON sandbox_execs (control_token);
+CREATE INDEX sandbox_execs_usage ON sandbox_execs (usage_id, state);
+CREATE INDEX sandbox_execs_state ON sandbox_execs (state, created_at);
+CREATE TABLE sandbox_operations (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('create', 'install', 'start', 'remove')),
+    deployment TEXT NOT NULL, profile_id TEXT NOT NULL, daemon_id TEXT NOT NULL,
+    run_id TEXT, session_id TEXT, generation INTEGER NOT NULL CHECK (generation >= 0),
+    generation_token TEXT NOT NULL, intended_name TEXT, original_create_operation_id TEXT,
+    usage_id TEXT, usage_token TEXT, container_id TEXT, owner TEXT NOT NULL, owner_token TEXT NOT NULL,
+    lease_expires_at {real},
+    authority TEXT NOT NULL DEFAULT 'current' CHECK (authority IN ('current', 'retired')),
+    retired_at {real}, retirement_reason TEXT,
+    outcome TEXT NOT NULL DEFAULT 'planned'
+        CHECK (outcome IN ('planned', 'dispatched', 'succeeded', 'definite_failure', 'uncertain')),
+    result_code TEXT, result_message TEXT, discovered_container_id TEXT, cleanup_operation_id TEXT,
+    confirmed_absent_at {real}, resolved_at {real}, created_at {real} NOT NULL, updated_at {real} NOT NULL,
+    CHECK (kind <> 'create' OR intended_name IS NOT NULL),
+    CHECK (authority <> 'retired' OR retired_at IS NOT NULL));
+CREATE UNIQUE INDEX sandbox_operations_owner_token ON sandbox_operations (owner_token);
+CREATE UNIQUE INDEX sandbox_operations_create_name ON sandbox_operations (daemon_id, intended_name)
+    WHERE kind = 'create' AND intended_name IS NOT NULL;
+CREATE UNIQUE INDEX sandbox_operations_remove_target ON sandbox_operations (daemon_id, container_id)
+    WHERE kind = 'remove' AND authority = 'current' AND container_id IS NOT NULL;
+CREATE INDEX sandbox_operations_profile ON sandbox_operations (deployment, profile_id, authority, outcome);
+CREATE INDEX sandbox_operations_lease ON sandbox_operations (lease_expires_at);
+CREATE INDEX sandbox_operations_retired ON sandbox_operations (authority, outcome, retired_at);
+CREATE INDEX sandbox_operations_create ON sandbox_operations (original_create_operation_id);
+CREATE INDEX sandbox_operations_target ON sandbox_operations (daemon_id, container_id);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
-    Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4))
+    Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 
