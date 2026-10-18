@@ -6,8 +6,6 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.3.0-rc.2] - 2026-10-18
-
 ### Added
 - Coordinator recovery APIs reconcile orphaned usage, stopped and delayed retired creates, and idle generations by
   exact container ID. Recovery preserves valid users and their execution authority, retains unresolved create
@@ -15,6 +13,10 @@ All notable changes to this project are documented here. The format follows
   policy/helper generations after their users finish.
 - The sandbox coordinator records commands, file/skill helpers and cleanup before dispatch, verifies supervisor
   receipts before finishing executions, and gates cancellation on the original execution and current usage lease.
+
+## [0.3.0-rc.2] - 2026-10-18
+
+### Added
 - `POST /v1/models/verify` checks a model id with two tiny calls (text, then a 1×1 image) and reports whether
   the model reads images. Any tenant key may call it; it stores nothing ([API guide](docs/guide/api.md)).
 - `python -m keel.admin import-sessions` imports conversations copied from another system: JSON lines on stdin, one
