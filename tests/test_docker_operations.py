@@ -1277,3 +1277,49 @@ async def test_internal_control_rechecks_current_authority(backend, cause, valid
             await task
     assert authorized == [True]
     assert any('cancel' in args for args in fake.commands()) == valid
+
+
+# ---------------------------------------------------------------------------
+# stderr warnings never corrupt a parsed result
+# ---------------------------------------------------------------------------
+
+WARNING_CLI = """#!/bin/sh
+echo "WARNING: the requested image's platform does not match the detected host platform" >&2
+case "$1" in
+  info) echo daemon-warned ;;
+  version) echo arm64 ;;
+  image) echo null ;;
+  create) echo "$KEEL_FAKE_ID" ;;
+  inspect) printf '%s|/keel-sbx-warned|false|{}\\n' "$KEEL_FAKE_ID" ;;
+  ps) printf '{"ID":"%s","Names":"keel-sbx-warned","State":"created","Labels":"keel.managed=1"}\\n' "$KEEL_FAKE_ID" ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+async def test_a_stderr_warning_on_a_successful_command_does_not_make_its_result_uncertain(tmp_path, monkeypatch):
+    # Docker prints daemon warnings (platform mismatch, missing swap accounting) on stderr while the result is on
+    # stdout: identity, inventory and the create's container ID are parsed from stdout only.
+    cli = tmp_path / "docker"
+    cli.write_text(WARNING_CLI)
+    cli.chmod(0o755)
+    container = exact_id()
+    monkeypatch.setenv("KEEL_FAKE_ID", container)
+    backend = DockerSandbox(docker=str(cli), deployment=DEPLOYMENT, mount_root=str(tmp_path))
+    assert await backend.daemon_identity() == ("daemon-warned", "arm64")
+    attempt = make_attempt("create", intended_name="keel-sbx-warned", key=make_key(daemon_id="daemon-warned"))
+    created = await backend.create_generation(attempt, policy())
+    assert created.state == "succeeded" and created.observation.container_id == container
+    inspected = await backend.inspect_id(container)
+    assert inspected.state == "succeeded" and inspected.observation.container_name == "keel-sbx-warned"
+    assert [item.container_id for item in await backend.inventory()] == [container]
+
+
+async def test_a_failed_create_keeps_its_stderr_as_a_bounded_diagnostic(tmp_path, monkeypatch):
+    cli = tmp_path / "docker"
+    cli.write_text("#!/bin/sh\ncase \"$1\" in image) echo null ;; info) echo daemon-1 ;; version) echo amd64 ;;\n"
+                   "create) echo 'Error response from daemon: conflict' >&2; exit 1 ;; esac\n")
+    cli.chmod(0o755)
+    backend = DockerSandbox(docker=str(cli), deployment=DEPLOYMENT, mount_root=str(tmp_path))
+    created = await backend.create_generation(make_attempt("create", intended_name="keel-sbx-x"), policy())
+    assert created.state == "definite_failure" and "conflict" in created.diagnostic

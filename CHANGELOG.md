@@ -29,6 +29,15 @@ All notable changes to this project are documented here. The format follows
   the Docker daemon ID is read afresh for every ownership or absence decision: a changed daemon closes admission
   instead of making recorded containers look absent.
 
+### Fixed
+- An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
+  including on a profile that never had a coordinated sandbox. The block clears only once the recorded container
+  is proven absent on the same daemon and a complete fresh listing shows no other unrecorded container of that
+  profile.
+- A Docker warning printed on stderr (for example a platform mismatch or missing swap accounting) no longer makes a
+  successful container creation, inspection, inventory or daemon identity read uncertain: results are parsed from
+  stdout only, and stderr is kept as a bounded diagnostic.
+
 ## [0.3.0-rc.2] - 2026-10-18
 
 ### Added

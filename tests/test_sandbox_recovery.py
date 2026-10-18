@@ -662,3 +662,74 @@ async def test_an_unpublished_block_stays_when_the_absence_is_not_authoritative(
     assert (row["state"], row["error_message"]) == ("blocked", unknown)
     await queue_run(store, "waits")
     assert await coordinator.claim() is None
+
+
+def _unknown(backend, container: str, profile_id: str = "p1") -> None:
+    labels = (("keel.deployment", "dep"), ("keel.managed", "1"), ("keel.policy", "0" * 16),
+              ("keel.profile", profile_id))
+    backend._created[container] = ("keel-sbx-legacy-" + container[:6], labels, "0" * 16)
+    backend.running_ids.add(container)
+
+
+@pytest.mark.parametrize("path", ["recover_key", "batched_inventory"])
+async def test_an_unpublished_block_stays_while_another_unknown_container_of_the_profile_remains(recovery, path):
+    # The block records one offending ID; removing only that container must not reopen admission while another
+    # unclassified container of the same profile still exists, whatever path or batch performs the check.
+    coordinator, backend, store, _ = recovery
+    await seed_profile(store, "p1")
+    first, second = "a" * 64, "b" * 64
+    _unknown(backend, first)
+    _unknown(backend, second)
+    if path == "batched_inventory":
+        for index in range(120):  # more containers than one bounded inventory pass classifies
+            _unknown(backend, f"{index:064x}", profile_id=f"other-{index}")
+    for _ in range(3):
+        await coordinator.reconcile_once()
+    recorded = (await store.db.fetchrow("SELECT error_message FROM sandboxes WHERE profile_id = 'p1'"))[
+        "error_message"]
+    remaining = first if recorded == second else second
+    backend._created.pop(recorded)  # the operator removed only the recorded offender
+    key = next(key for key in await store.recovery_candidates(limit=100) if key.profile_id == "p1")
+    if path == "recover_key":  # the lease sweep's recover_run path: no inventory scan at all
+        await coordinator._recover_key(key)
+    else:
+        # A bounded pass whose 100-container batch does not reach the remaining container (it sorts last).
+        coordinator._inventory_cursor = ""
+        await coordinator.reconcile_once()
+    await queue_run(store, "waits")
+    assert await coordinator.claim() is None, "admission reopened beside an unclassified container"
+    assert (await store.db.fetchrow("SELECT state FROM sandboxes WHERE profile_id = 'p1'"))["state"] == "blocked"
+
+    backend._created.pop(remaining)  # once every unknown container of the profile is gone, the block clears
+    for _ in range(3):
+        await coordinator.reconcile_once()
+    claim = await coordinator.claim()
+    assert claim is not None and claim.run.profile_id == "p1"
+
+
+async def test_a_published_profile_block_stays_while_another_unknown_container_remains(recovery):
+    coordinator, backend, store, _ = recovery
+    backend._containers = ["0" * 64]  # the published container sorts first, inside every first batch
+    claim = await make_claim(store, "current")
+    bound = await coordinator.prepare(claim.use)
+    assert await coordinator.release(claim.use)
+    first, second = "a" * 64, "b" * 64
+    _unknown(backend, first)
+    _unknown(backend, second)
+    for index in range(1, 121):
+        _unknown(backend, f"{index:064x}", profile_id=f"other-{index}")
+    for _ in range(3):
+        await coordinator.reconcile_once()
+    row = await store.db.fetchrow("SELECT error_message FROM sandboxes WHERE profile_id = 'p1'")
+    remaining = first if row["error_message"] == second else second
+    backend._created.pop(row["error_message"])
+    coordinator._inventory_cursor = ""  # this pass's batch does not reach the remaining container
+    await coordinator.reconcile_once()
+    await queue_run(store, "waits")
+    assert await coordinator.claim() is None, "admission reopened beside an unclassified container"
+    backend._created.pop(remaining)
+    for _ in range(3):
+        await coordinator.reconcile_once()
+    reopened = await coordinator.claim()
+    assert reopened is not None and reopened.run.profile_id == "p1"
+    assert (await store.get_usage(reopened.use.usage_id)).binding.container_id == bound.name

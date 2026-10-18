@@ -83,6 +83,9 @@ class SandboxRecoveryMixin:
                 if verified:
                     for key, offending in await self.store.blocked_inventory_targets(
                             verified, daemon_id=daemon_id):
+                        if await self._unrecorded_profile_container(key, inventory):
+                            blocked += 1  # another unclassified container of this profile is still listed
+                            continue
                         try:
                             outcome = await self.backend.inspect_id(offending)
                             if not confirmed_absent(outcome):
@@ -236,15 +239,35 @@ class SandboxRecoveryMixin:
             outcome = await self.backend.inspect_id(offending)
             if not confirmed_absent(outcome):
                 return 1
+            # The block names one offender; others of this profile may sit outside any bounded scan batch (or
+            # this may be the sweep's path, which scans nothing). A complete fresh listing must show none.
+            listing = await self.backend.inventory()
+            if await self._unrecorded_profile_container(key, listing):
+                return 1
             daemon, _ = await self.backend.daemon_identity()
         except asyncio.CancelledError:
             raise
         except Exception:
             return 1
-        if daemon != key.daemon_id:
+        if daemon != key.daemon_id or any(item.daemon_id != daemon for item in listing):
             return 1
         return 0 if await self.store.clear_resolved_inventory_block(
             key, daemon_id=daemon, offending=offending) else 1
+
+    async def _unrecorded_profile_container(self, key: SandboxKey, observations) -> bool:
+        """True when a complete listing still holds a container naming this profile that the ledger never recorded.
+
+        Such a container is unclassified evidence: an admission block must stay until it is gone, whichever single
+        offender the block happens to record. Containers the ledger attributes to the profile are classified by
+        their own recovery (a quarantined retired create, the published generation) and do not keep it blocked.
+        """
+        named = [item for item in observations
+                 if dict(item.labels).get("keel.profile") == key.profile_id
+                 and dict(item.labels).get("keel.deployment") in (None, key.deployment)]
+        if not named:
+            return False
+        recorded = await self.store.recorded_container_ids(key)
+        return any(item.container_id not in recorded for item in named)
 
     async def _finish_unavailable(self, run_id: str) -> None:
         transition = await self.store.finish_run(

@@ -1669,6 +1669,15 @@ class SandboxStoreMixin:
                 targets.append((key, sandbox["error_message"]))
         return targets
 
+    async def recorded_container_ids(self, key: SandboxKey) -> set[str]:
+        """Every exact container ID the ledger attributes to this profile: its current one and every attempt's."""
+        rows = await self.db.fetch(
+            "SELECT container_id AS id FROM sandboxes WHERE deployment = ? AND profile_id = ? "
+            "UNION SELECT container_id FROM sandbox_operations WHERE deployment = ? AND profile_id = ? "
+            "UNION SELECT discovered_container_id FROM sandbox_operations WHERE deployment = ? AND profile_id = ?",
+            key.deployment, key.profile_id, key.deployment, key.profile_id, key.deployment, key.profile_id)
+        return {row["id"] for row in rows if row["id"]}
+
     async def unpublished_inventory_block(self, key: SandboxKey) -> str | None:
         """The conflicting container ID recorded on a `blocked` profile that has no published generation.
 

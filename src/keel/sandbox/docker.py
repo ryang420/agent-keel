@@ -72,11 +72,22 @@ _MAX_TAR_BYTES = _MAX_HELPER_BYTES + 1024 * 1024  # the helper plus tar headers 
 
 @dataclass(frozen=True)
 class _DockerResult:
-    """A docker CLI result, including why no exit status is available (timeout, missing CLI, signal)."""
+    """A docker CLI result, including why no exit status is available (timeout, missing CLI, signal).
+
+    `output` is stdout only: identities and structured results are parsed from it. Docker prints daemon warnings
+    (platform mismatch, missing swap accounting) on stderr even when a command succeeds, so stderr is kept apart in
+    `diagnostic` and only matched for daemon error messages or reported, bounded, as a diagnostic.
+    """
 
     code: int | None
     output: str
     timed_out: bool = False
+    diagnostic: str = ""
+
+    @property
+    def text(self) -> str:
+        """stdout and stderr together, for daemon-message matching and diagnostics; never parsed as a result."""
+        return "\n".join(part for part in (self.output.strip(), self.diagnostic.strip()) if part)
 
 
 @dataclass(frozen=True)
@@ -308,11 +319,11 @@ class DockerSandbox:
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.docker, *args, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         except FileNotFoundError:
             return _DockerResult(None, "The docker CLI is not available.")
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(stdin), timeout)
+            out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
         except TimeoutError:
             proc.kill()
             try:
@@ -320,13 +331,14 @@ class DockerSandbox:
             except (TimeoutError, ProcessLookupError):
                 pass
             return _DockerResult(None, f"docker {args[0]} did not answer within {timeout:.0f}s.", timed_out=True)
-        return _DockerResult(proc.returncode, out.decode("utf-8", errors="replace"))
+        return _DockerResult(proc.returncode, out.decode("utf-8", errors="replace"),
+                             diagnostic=err.decode("utf-8", errors="replace")[-4096:])
 
     async def _docker(self, *args: str, stdin: bytes | None = None, timeout: float = 60.0) -> tuple[int, str]:
         result = await self._docker_raw(*args, stdin=stdin, timeout=timeout)
         if result.timed_out or result.code is None:
-            raise SandboxError(result.output or f"docker {args[0]} failed.")
-        return result.code, result.output
+            raise SandboxError(result.text or f"docker {args[0]} failed.")
+        return result.code, result.text
 
     async def _docker_bytes(self, *args: str, stdin: bytes | None = None,
                             timeout: float = 60.0) -> _DockerBinaryResult:
@@ -436,14 +448,14 @@ class DockerSandbox:
         daemon_id = info.output.strip()
         if (info.timed_out or info.code != 0 or not daemon_id or len(daemon_id) > 128
                 or any(character.isspace() for character in daemon_id)):
-            raise SandboxError("could not read the Docker daemon identity: " + info.output.strip()[:200])
+            raise SandboxError("could not read the Docker daemon identity: " + info.text[:200])
         if self._architecture is None:
             async with self._identity_lock:
                 if self._architecture is None:
                     version = await self._docker_raw("version", "--format", "{{.Server.Arch}}")
                     if version.timed_out or version.code != 0:
                         raise SandboxError(
-                            "could not read the Docker daemon architecture: " + version.output.strip()[:200])
+                            "could not read the Docker daemon architecture: " + version.text[:200])
                     self._architecture = normalize_architecture(version.output.strip())
         return daemon_id, self._architecture
 
@@ -490,10 +502,10 @@ class DockerSandbox:
             "{{.Id}}|{{.Name}}|{{.State.Running}}|{{json .Config.Labels}}", exact)
         if result.timed_out or result.code is None or result.code < 0:
             return DockerOutcome("uncertain", diagnostic="the inspect did not produce a definite result")
-        if result.code == 1 and _not_found(result.output):
+        if result.code == 1 and _not_found(result.text):
             return DockerOutcome("definite_failure", diagnostic="the container does not exist")
         if result.code != 0:
-            return DockerOutcome("uncertain", diagnostic=result.output.strip())
+            return DockerOutcome("uncertain", diagnostic=result.text[:2000])
         observation = _parse_observation(result.output, daemon_id, exact)
         if observation is None:
             return DockerOutcome("uncertain", diagnostic="the daemon returned malformed inspect output")
@@ -506,7 +518,7 @@ class DockerSandbox:
             "ps", "-a", "--no-trunc", "--filter", "label=keel.managed=1",
             "--filter", f"label=keel.deployment={self.deployment}", "--format", "{{json .}}")
         if result.timed_out or result.code != 0:
-            raise SandboxError("could not inventory managed sandbox containers: " + result.output.strip()[:300])
+            raise SandboxError("could not inventory managed sandbox containers: " + result.text[:300])
         observations = []
         for line in result.output.splitlines():
             line = line.strip()
@@ -557,9 +569,9 @@ class DockerSandbox:
             return None, DockerOutcome("uncertain",
                                        diagnostic="the image inspection did not produce a definite result")
         if result.code != 0:
-            definite = _no_such_image(result.output) or _definite_daemon_error(result.output)
+            definite = _no_such_image(result.text) or _definite_daemon_error(result.text)
             return None, DockerOutcome("definite_failure" if definite else "uncertain",
-                                       diagnostic=result.output.strip())
+                                       diagnostic=result.text)
         try:
             value = json.loads(result.output.strip() or "null")
         except ValueError:
@@ -606,8 +618,8 @@ class DockerSandbox:
         if created.timed_out or created.code is None or created.code < 0:
             return DockerOutcome("uncertain", diagnostic="the create dispatch has an unknown outcome")
         if created.code != 0:
-            state = "definite_failure" if _definite_daemon_error(created.output) else "uncertain"
-            return DockerOutcome(state, diagnostic=created.output.strip())
+            state = "definite_failure" if _definite_daemon_error(created.text) else "uncertain"
+            return DockerOutcome(state, diagnostic=created.text[:2000])
         container_id = created.output.strip()
         if not _EXACT_ID.fullmatch(container_id):
             return DockerOutcome("uncertain",
@@ -669,8 +681,8 @@ class DockerSandbox:
         if installed.timed_out or installed.code is None or installed.code < 0:
             return DockerOutcome("uncertain", diagnostic="the helper install has an unknown outcome")
         if installed.code != 0:
-            state = "definite_failure" if _definite_daemon_error(installed.output) else "uncertain"
-            return DockerOutcome(state, diagnostic=installed.output.strip())
+            state = "definite_failure" if _definite_daemon_error(installed.text) else "uncertain"
+            return DockerOutcome(state, diagnostic=installed.text[:2000])
         readback = await self._docker_bytes("cp", f"{container_id}:{_RESERVED_RUNTIME}", "-", timeout=120)
         if readback.timed_out or readback.code is None or readback.code < 0:
             return DockerOutcome("uncertain", diagnostic="the helper readback has an unknown outcome")
@@ -695,10 +707,10 @@ class DockerSandbox:
         started = await self._docker_raw("start", container_id, timeout=120)
         if started.timed_out or started.code is None or started.code < 0:
             return DockerOutcome("uncertain", diagnostic="the start dispatch has an unknown outcome")
-        if started.code != 0 and _not_found(started.output):
+        if started.code != 0 and _not_found(started.text):
             return DockerOutcome("definite_failure", diagnostic="the container does not exist")
-        if started.code != 0 and not _definite_daemon_error(started.output):
-            return DockerOutcome("uncertain", diagnostic=started.output.strip())
+        if started.code != 0 and not _definite_daemon_error(started.text):
+            return DockerOutcome("uncertain", diagnostic=started.text[:2000])
         inspected = await self.inspect_id(container_id)
         if inspected.uncertain:
             return inspected
@@ -720,8 +732,8 @@ class DockerSandbox:
         removed = await self._docker_raw("rm", "-f", container_id, timeout=120)
         if removed.timed_out or removed.code is None or removed.code < 0:
             return DockerOutcome("uncertain", diagnostic="the remove dispatch has an unknown outcome")
-        if removed.code != 0 and not _not_found(removed.output) and not _definite_daemon_error(removed.output):
-            return DockerOutcome("uncertain", diagnostic=removed.output.strip())
+        if removed.code != 0 and not _not_found(removed.text) and not _definite_daemon_error(removed.text):
+            return DockerOutcome("uncertain", diagnostic=removed.text[:2000])
         inspected = await self.inspect_id(container_id)
         if inspected.uncertain:
             return inspected
@@ -757,7 +769,7 @@ class DockerSandbox:
         """Ask the supervisor to cancel; never signal a numeric PID or process group."""
         result = await self._docker_raw(*self._control_args(ticket, "cancel", include_usage=True), timeout=15)
         if result.timed_out or result.code not in (0, 4, 5):
-            log.warning("sandbox cancellation was not acknowledged: %s", result.output.strip()[:200])
+            log.warning("sandbox cancellation was not acknowledged: %s", result.text[:200])
 
     async def _await_receipt(self, ticket: ExecTicket, *, require_success: bool) -> CleanupReceipt:
         if self.receipt_timeout_s is None:
@@ -774,7 +786,7 @@ class DockerSandbox:
                 raise SandboxUncertain("the sandbox supervisor rejected the control binding")
             if result.code != 5:
                 raise SandboxUncertain("the sandbox terminal receipt is unavailable: "
-                                       + (result.output.strip()[:200] or "the helper did not answer"))
+                                       + (result.text[:200] or "the helper did not answer"))
             if time.monotonic() >= deadline:
                 raise SandboxUncertain("the sandbox terminal receipt is unavailable")
             await asyncio.sleep(0.2)
