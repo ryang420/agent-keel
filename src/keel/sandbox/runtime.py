@@ -20,6 +20,17 @@ _PROTOCOL_VERSION = 1
 _RECEIPT_FIELDS = frozenset(
     {"version", "exec_id", "control_token", "leader_status", "control_closed", "descendants_complete",
      "uncertain_reason"})
+_BYTE_ORDER_MARK = b"\xef\xbb\xbf"
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict:
+    """Reject duplicate JSON members; `json.loads` would silently keep the last value."""
+    value: dict = {}
+    for key, member in pairs:
+        if key in value:
+            raise ValueError("receipt has duplicate fields")
+        value[key] = member
+    return value
 
 
 def encode_control(control_token: str, usage_token: str, *, cancel: bool) -> bytes:
@@ -37,8 +48,10 @@ def decode_receipt(data: bytes) -> CleanupReceipt:
     """Decode a bounded, identity-only JSON receipt emitted separately from payload stdout."""
     if not isinstance(data, bytes) or not data or len(data) > _MAX_RECEIPT_BYTES:
         raise ValueError("receipt must be a non-empty bounded byte string")
+    if data.startswith(_BYTE_ORDER_MARK):
+        raise ValueError("receipt must not start with a byte-order mark")
     try:
-        value = json.loads(data)
+        value = json.loads(data, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("receipt is not valid JSON") from exc
     if not isinstance(value, dict) or set(value) != _RECEIPT_FIELDS:

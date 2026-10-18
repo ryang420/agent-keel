@@ -8,9 +8,12 @@ carry argv, source code, environment values or credentials.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from keel.sandbox.base import Sandbox, SandboxError, SandboxPolicy
-from keel.store.base import Run
+
+if TYPE_CHECKING:  # avoid importing the store package (which imports this module) at runtime
+    from keel.store.base import Run
 
 SANDBOX_STATES = ("absent", "creating", "ready", "draining", "removing", "blocked")
 USAGE_STATES = ("preparing", "active", "cleaning", "orphaned", "released")
