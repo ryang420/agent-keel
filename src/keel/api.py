@@ -22,6 +22,7 @@ from keel.store.base import (
     ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse,
 )
 from keel.titles import sanitize_title
+from keel.verify import VerifyError, verify_model
 
 log = logging.getLogger(__name__)
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -208,6 +209,27 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             log.warning("health check: the store did not answer", exc_info=True)
             return _error(503, "unavailable", "The store is not answering.")
         return {"status": "ok"}
+
+    @app.post("/v1/models/verify")
+    async def verify(request: Request):
+        """Probe a model with two tiny calls (text, then a 1x1 image) and report whether it reads images.
+
+        Any tenant's key may ask: the call reads no profile and writes nothing. A refused model is 422 with code
+        access_denied, not_found or unsupported; a provider that did not answer is 503 unavailable.
+        """
+        body = await _json_body(request)
+        provider_name, model = body.get("provider"), body.get("model")
+        if not isinstance(model, str) or not 0 < len(model) <= 128:
+            raise ApiError(400, "invalid_input", "model must be a model id of 1-128 characters.")
+        if not isinstance(provider_name, str) or provider_name not in k(request).providers.names():
+            raise ApiError(400, "invalid_input", "provider must be one of the configured providers.")
+        try:
+            vision = await verify_model(k(request).providers.get(provider_name), model)
+        except VerifyError as exc:
+            log.warning("model verify failed provider=%s model=%s code=%s cause=%r",
+                        provider_name, model, exc.code, exc.__cause__)
+            raise ApiError(503 if exc.code == "unavailable" else 422, exc.code, exc.message)
+        return {"supports_vision": vision}
 
     async def profile_or_404(request: Request, profile_id: str):
         """Validate profile_id and load the caller's profile, or raise 404 profile_not_found.

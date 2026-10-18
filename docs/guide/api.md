@@ -34,6 +34,7 @@ Errors have one shape, with a machine-readable code:
 | `GET /v1/profiles/{profile_id}/sessions/{session_id}/boundary` | `{"last_message_id": …}`. |
 | `PATCH /v1/profiles/{profile_id}/sessions/{session_id}` | Rename: `{"title": "…"}`. Returns the session. |
 | `DELETE /v1/profiles/{profile_id}/sessions/{session_id}` | Delete a session: `{"deleted": true}`. |
+| `POST /v1/models/verify` | Check a model id: `{"provider", "model"}` → `{"supports_vision": bool}`. |
 
 ## Profile
 
@@ -159,6 +160,22 @@ returned. If a stored image is gone later, the model sees "[image no longer avai
 A turn cut short (cancelled, crashed or swept) can leave tool calls without results. They are answered with
 "The command was cancelled." when the run ends or at the start of the next turn.
 
+## Verifying a model
+
+`POST /v1/models/verify` checks that a provider and model id work, and whether the model reads images:
+
+```json
+{"provider": "bedrock", "model": "openai.gpt-6-luna"}
+```
+
+It makes two tiny calls through the provider: a short text prompt, then the same prompt with a 1×1 PNG. A model that
+answers both reads images (`{"supports_vision": true}`); one that refuses the image with a bad-request answer reads
+text only (`false`). Any tenant's service key may call it: it reads no profile and writes nothing.
+
+A refused model is 422, with code `access_denied` (the account may not call it), `not_found` (the provider does not
+recognize the id) or `unsupported` (the provider rejected the test request for another reason). A provider that did
+not answer (rate limit, server error, timeout) is 503 `unavailable`.
+
 ## Error codes
 
 | HTTP | Code | When |
@@ -172,9 +189,10 @@ A turn cut short (cancelled, crashed or swept) can leave tool calls without resu
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |
 | 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |
 | 409 | `title_in_use` | Another session already has that title. |
+| 422 | `access_denied`, `not_found`, `unsupported` | `/v1/models/verify`: the model is unusable (no access, unknown id, or the provider refused the test request). |
 | 429 | `at_capacity` | `KEEL_MAX_RUNNING` runs are in flight. Has a `Retry-After: 1` header. |
 | 500 | `internal_error` | An unexpected error. |
-| 503 | `unavailable` | The service is not ready, or the store does not answer. |
+| 503 | `unavailable` | The service is not ready, the store does not answer, or `/v1/models/verify` could not reach the provider. |
 
 A failed run reports its cause in `error_code` (on the run and in `run.failed`):
 
