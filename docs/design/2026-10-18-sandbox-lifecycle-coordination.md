@@ -503,6 +503,26 @@ Docker's CLI permits exec/removal targeting by container ID; exec requires a run
 [docker exec](https://docs.docker.com/reference/cli/docker/container/exec/) and
 [docker rm](https://docs.docker.com/reference/cli/docker/container/rm/).
 
+### Receipt trust
+
+The supervisor and the payload share the configured sandbox user. That user can read the supervisor's
+`/proc/<pid>/cmdline` (including the control and usage tokens) and can write the retained receipt file, so a
+deliberately hostile payload can forge a success receipt for its own exec. The exec exit-status mapping is no
+substitute: the same user can signal the supervisor. The receipt is therefore cleanup evidence for a
+cooperative payload, not a security boundary against the payload itself.
+
+The impact is bounded to the forging profile. One container serves one profile, so a forged receipt can at most
+keep that profile's generation draining, delay its removal, or let the forging command's descendants outlive
+their exec. Receipt fields never carry removal authority: exact-container removal, ownership checks and every
+Docker operation remain host-side and keyed to recorded IDs, so no receipt can name, retain or remove another
+profile's or tenant's container. Keel records `finished` only for a receipt whose exec identity and control
+token match the dispatch, with `control_closed` and `descendants_complete` true and no uncertainty reason.
+
+An authenticated receipt would need a host-issued key the payload cannot read, delivered outside argv and the
+environment (for example stdin consumed before the payload fork), a keyed MAC in the statically linked helper,
+and key retention for recovery after a restart. That work is deferred until a consumer needs protection from
+hostile commands inside their own profile; until then this trust assumption is explicit.
+
 ## 11. Normal release and recovery
 
 Normal release moves usage through `cleaning`, finishes managed cleanup, and commits `released` only when no

@@ -30,6 +30,7 @@ service key are required; an invalid value stops the service at start with a mes
 |---|---|---|
 | `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). |
 | `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (checked about once a minute). |
+| `KEEL_SANDBOX_REAP_SECONDS` | `5` | Maximum time to prove sandbox process descendants have exited after the termination grace period; an unproven cleanup leaves the generation blocked for recovery. Must be above 0 and at most 86400 (the supervisor's one-day bound). |
 | `KEEL_SANDBOX_MOUNT_ROOT` | unset | Deployment-owned host directory for profile bind mounts. A profile may mount only paths under `<root>/<sha256(profile_id)>`; the operator must create and protect that directory. Without this setting, bind mounts are refused. |
 | `KEEL_DOCKER` | `docker` | The docker CLI to run. |
 | `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. At start, containers carrying this label are removed (except those of profiles with a run in flight), so it must be unique per deployment that shares a Docker daemon. |

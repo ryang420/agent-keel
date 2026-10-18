@@ -11,8 +11,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#define KEEL_MAX_SECONDS 86400.0
-
 static int usage(void)
 {
     fprintf(stderr,

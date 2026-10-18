@@ -111,6 +111,7 @@ int keel_exec_dir(const char *root, const char *control_token, char *dir, size_t
 static int ensure_private_dir(const char *path)
 {
     struct stat status;
+    int fd;
 
     if (mkdir(path, 0700) == 0) {
         return 0;
@@ -118,16 +119,20 @@ static int ensure_private_dir(const char *path)
     if (errno != EEXIST) {
         return -1;
     }
-    if (lstat(path, &status) != 0) {
+    /*
+     * Open the directory itself rather than trusting the path twice: between an lstat() and chmod() a same-uid
+     * process could replace it with a symlink and make the supervisor chmod an arbitrary path.
+     */
+    fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
         return -1;
     }
-    if (!S_ISDIR(status.st_mode) || status.st_uid != geteuid()) {
+    if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != geteuid() ||
+        fchmod(fd, 0700) != 0) {
+        close(fd);
         return -1;
     }
-    if (chmod(path, 0700) != 0) {
-        return -1;
-    }
-    return 0;
+    return close(fd);
 }
 
 int keel_ensure_exec_dir(const char *root, const char *control_token, char *dir, size_t dir_size,
@@ -333,16 +338,14 @@ int keel_decode_control(const unsigned char *frame, size_t length, const char *c
     return 0;
 }
 
-int keel_send_response(int fd, unsigned char response, const char *receipt, size_t receipt_length)
+int keel_send_response(int fd, unsigned char response)
 {
-    if (send(fd, &response, 1, MSG_NOSIGNAL) != 1) {
-        return -1;
-    }
-    if (receipt != NULL && receipt_length > 0 &&
-        send(fd, receipt, receipt_length, MSG_NOSIGNAL) != (ssize_t)receipt_length) {
-        return -1;
-    }
-    return 0;
+    ssize_t sent;
+
+    do {
+        sent = send(fd, &response, 1, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    return sent == 1 ? 0 : -1;
 }
 
 static int send_frame(int fd, const unsigned char frame[KEEL_CONTROL_FRAME_LEN])
@@ -411,8 +414,10 @@ static int print_retained_receipt(const char *dir)
     int attempt;
 
     /*
-     * The endpoint closes just before the leader is reaped and the receipt is renamed into place. A control that
-     * loses that race waits briefly for the retained terminal receipt instead of reporting an unknown outcome.
+     * The endpoint closes just before the leader is reaped and the receipt appears only after the descendant proof
+     * or the reap deadline (grace + reap, potentially many seconds). This client waits 2s for the common case; if
+     * the supervisor is still draining descendants, it reports that no receipt is available yet. The host must
+     * treat a missing receipt as an uncertain outcome, never as cleanup success.
      */
     for (attempt = 0; attempt < 100; attempt++) {
         length = keel_read_receipt(dir, receipt, sizeof(receipt));
@@ -422,7 +427,7 @@ static int print_retained_receipt(const char *dir)
         }
         usleep(20000);
     }
-    fprintf(stderr, "keel-supervisor: terminal receipt is not available\n");
+    fprintf(stderr, "keel-supervisor: no terminal receipt within 2s; treat the exec as uncertain\n");
     return KEEL_EXIT_NO_RECEIPT;
 }
 
@@ -486,23 +491,8 @@ int keel_control(const struct keel_control_request *request)
         fprintf(stderr, "keel-supervisor: control binding rejected\n");
         return KEEL_EXIT_CONTROL_REJECTED;
     }
-    if (length != 1 || (response != KEEL_CONTROL_ACCEPTED && response != KEEL_CONTROL_TERMINAL)) {
+    if (length != 1 || response != KEEL_CONTROL_ACCEPTED) {
         close(fd);
-        return print_retained_receipt(dir);
-    }
-    if (response == KEEL_CONTROL_TERMINAL) {
-        if (wait_readable(fd, KEEL_CLIENT_TIMEOUT_MS) == 0) {
-            do {
-                length = recv(fd, receipt, KEEL_RECEIPT_MAX, 0);
-            } while (length < 0 && errno == EINTR);
-            close(fd);
-            if (length > 0) {
-                print_receipt(receipt, (size_t)length);
-                return 0;
-            }
-        } else {
-            close(fd);
-        }
         return print_retained_receipt(dir);
     }
     close(fd);

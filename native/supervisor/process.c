@@ -2,10 +2,16 @@
  * The serialized supervisor state machine.
  *
  * One thread owns SIGCHLD/SIGTERM/SIGINT (blocked and read through signalfd), the TERM grace and cleanup deadlines,
- * KILL, control admission and reaping. The leader is recorded at fork and observed with
+ * KILL, control admission and reaping. PR_SET_CHILD_SUBREAPER is enabled and read back before the payload fork, so
+ * orphaned descendants are adopted by this supervisor. The leader is recorded at fork and observed with
  * waitid(P_PID, ..., WEXITED | WNOWAIT) so it stays unreaped while signaling is possible; killpg is only issued
- * while this supervisor still owns the original leader. Before the leader is reaped, control authority closes, the
- * endpoint is invalidated and every timer that could issue a signal is cancelled.
+ * while this supervisor still owns the original leader.
+ *
+ * No child is reaped while signal authority remains open: adopted children may stay zombies during cleanup. After
+ * the final TERM/grace/KILL attempt and a confirmed leader exit, control authority closes, the endpoint is
+ * invalidated and every timer that could issue a signal is cancelled; only then is the leader reaped. A
+ * nonblocking waitpid(-1) then drains adopted children. Zero means children remain and is not success; only ECHILD
+ * proves descendant completion. The fixed cleanup deadline is never extended by duplicate controls.
  */
 #include "supervisor.h"
 
@@ -18,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -26,6 +33,11 @@
 #include <unistd.h>
 
 #define KEEL_POLL_INTERVAL_MS 500
+/*
+ * A connected control client must send its fixed frame promptly. Without this idle deadline a silent same-uid
+ * peer could occupy the single client slot indefinitely and block a legitimate cancellation.
+ */
+#define KEEL_CLIENT_IDLE_SECONDS 0.25
 
 struct keel_supervisor {
     const struct keel_request *request;
@@ -37,8 +49,8 @@ struct keel_supervisor {
     int handshake_pipe[2];
     int handshake_fd;
     pid_t leader;
+    int subreaper_failed;
     int handshake_ok;
-    int exec_confirmed;
     int setup_failed;
     int group_unverified;
     int signal_failed;
@@ -52,7 +64,7 @@ struct keel_supervisor {
     int cancel_requested;
     int timers_cancelled;
     int control_closed;
-    int receipt_written;
+    int awaiting_descendants;
     int receipt_failed;
     int terminal;
     mode_t payload_umask;
@@ -60,6 +72,7 @@ struct keel_supervisor {
     double reap_seconds;
     struct timespec grace_deadline;
     struct timespec reap_deadline;
+    struct timespec client_deadline;
     enum keel_state state;
     int exit_code;
 };
@@ -71,8 +84,6 @@ const char *keel_state_name(enum keel_state state)
         return "reserved";
     case KEEL_STATE_CHILD_SPAWNED:
         return "child_spawned";
-    case KEEL_STATE_HANDSHAKED:
-        return "handshaked";
     case KEEL_STATE_PAYLOAD_RUNNING:
         return "payload_running";
     case KEEL_STATE_CLEANUP:
@@ -83,6 +94,8 @@ const char *keel_state_name(enum keel_state state)
         return "control_closed";
     case KEEL_STATE_LEADER_REAPED:
         return "leader_reaped";
+    case KEEL_STATE_AWAITING_DESCENDANTS:
+        return "awaiting_descendants";
     case KEEL_STATE_TERMINAL:
         return "terminal";
     }
@@ -119,6 +132,14 @@ static int deadline_reached(struct timespec now, struct timespec deadline)
         return now.tv_sec > deadline.tv_sec;
     }
     return now.tv_nsec >= deadline.tv_nsec;
+}
+
+static int deadline_before(struct timespec left, struct timespec right)
+{
+    if (left.tv_sec != right.tv_sec) {
+        return left.tv_sec < right.tv_sec;
+    }
+    return left.tv_nsec < right.tv_nsec;
 }
 
 static void close_fd(int *fd)
@@ -190,6 +211,28 @@ static int reset_sigchld(void)
     return sigaction(SIGCHLD, &action, NULL);
 }
 
+/*
+ * Subreaper ownership is what lets this supervisor adopt and reap orphaned descendants, including double-forked
+ * processes. Setting it is not enough: the value is read back, and any failure refuses to launch the payload.
+ */
+static int enable_subreaper(void)
+{
+    int value = 0;
+
+    if (keel_test_subreaper_failed()) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+        return -1;
+    }
+    if (prctl(PR_GET_CHILD_SUBREAPER, &value, 0, 0, 0) != 0 || value != 1) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    return 0;
+}
+
 static int install_signal_fd(struct keel_supervisor *supervisor)
 {
     sigset_t mask;
@@ -226,7 +269,8 @@ static void close_control_authority(struct keel_supervisor *supervisor)
     keel_test_trace("control_closed", NULL, 0, supervisor->leader > 0 && !supervisor->leader_reaped);
 }
 
-static void write_terminal_receipt(struct keel_supervisor *supervisor, const char *reason)
+static void write_terminal_receipt(struct keel_supervisor *supervisor, const char *reason,
+                                   int descendants_complete)
 {
     struct keel_receipt receipt;
 
@@ -236,17 +280,19 @@ static void write_terminal_receipt(struct keel_supervisor *supervisor, const cha
     receipt.has_status = supervisor->leader_has_status;
     receipt.leader_status = supervisor->leader_status;
     receipt.control_closed = 1;
-    receipt.descendants_complete = 0;
+    receipt.descendants_complete = descendants_complete ? 1 : 0;
     receipt.uncertain_reason = reason;
 
     if (keel_write_receipt(supervisor->dir, &receipt) != 0) {
         fprintf(stderr, "keel-supervisor: cannot write terminal receipt\n");
         supervisor->receipt_failed = 1;
     }
-    supervisor->receipt_written = 1;
     supervisor->state = KEEL_STATE_TERMINAL;
     supervisor->terminal = 1;
-    keel_test_trace("receipt", reason, receipt.has_status ? receipt.leader_status : -1, 0);
+    keel_test_trace("receipt", reason, receipt.has_status ? receipt.leader_status : -1,
+                    descendants_complete);
+    keel_test_trace(supervisor->receipt_failed ? "receipt_failed" : "receipt_written", reason,
+                    descendants_complete ? 1 : 0, 0);
 }
 
 /* Reap the pinned leader only after control authority and all timers are closed. */
@@ -279,9 +325,21 @@ static void reap_leader(struct keel_supervisor *supervisor)
                     supervisor->leader_has_status ? supervisor->leader_status : -1, 0);
 }
 
-static void finish_normal(struct keel_supervisor *supervisor)
+/*
+ * Close authority and persist an uncertain receipt. Uncertainty is never success, even when the leader status is
+ * known; callers must inspect the receipt. A setup failure keeps its own exit code.
+ */
+static void finish_uncertain(struct keel_supervisor *supervisor, const char *reason)
 {
-    const char *reason;
+    close_control_authority(supervisor);
+    write_terminal_receipt(supervisor, reason, 0);
+    supervisor->exit_code =
+        supervisor->setup_failed ? KEEL_EXIT_SETUP_FAILURE : KEEL_EXIT_UNKNOWN_LEADER;
+}
+
+static void finish_after_echild(struct keel_supervisor *supervisor)
+{
+    const char *reason = NULL;
 
     if (supervisor->setup_failed) {
         reason = "setup_failed";
@@ -289,18 +347,16 @@ static void finish_normal(struct keel_supervisor *supervisor)
         reason = "group_unverified";
     } else if (supervisor->signal_failed) {
         reason = "signal_failed";
-    } else {
-        reason = "descendants_unverified";
     }
-    close_control_authority(supervisor);
-    reap_leader(supervisor);
-    if (supervisor->reap_failed) {
-        reason = "leader_reap_failed";
+    keel_test_trace("echild", reason, 0, 0);
+    if (reason != NULL) {
+        write_terminal_receipt(supervisor, reason, 0);
+        supervisor->exit_code =
+            supervisor->setup_failed ? KEEL_EXIT_SETUP_FAILURE : KEEL_EXIT_UNKNOWN_LEADER;
+        return;
     }
-    write_terminal_receipt(supervisor, reason);
-    if (supervisor->setup_failed) {
-        supervisor->exit_code = KEEL_EXIT_SETUP_FAILURE;
-    } else if (!supervisor->leader_has_status || supervisor->reap_failed || supervisor->receipt_failed) {
+    write_terminal_receipt(supervisor, NULL, 1);
+    if (supervisor->receipt_failed || !supervisor->leader_has_status) {
         supervisor->exit_code = KEEL_EXIT_UNKNOWN_LEADER;
     } else {
         supervisor->exit_code = supervisor->leader_status;
@@ -308,14 +364,63 @@ static void finish_normal(struct keel_supervisor *supervisor)
 }
 
 /*
- * The cleanup deadline expired while the leader was still unreaped. Signal authority and all timers close now;
- * the leader is deliberately not reaped and is abandoned to the container's init as uncertain work.
+ * Descendant draining starts only after the leader has been reaped, so this wait can never consume the pinned
+ * leader. A zero return means children remain: it is not success, and the state machine waits again until the
+ * fixed cleanup deadline. Only ECHILD proves that this supervisor has no remaining payload descendants.
  */
-static void finish_timeout(struct keel_supervisor *supervisor, const char *reason)
+static void drain_descendants(struct keel_supervisor *supervisor)
+{
+    int status = 0;
+    pid_t reaped;
+
+    for (;;) {
+        if (keel_test_wait_error()) {
+            keel_test_trace("wait_failed", "injected", 0, 0);
+            finish_uncertain(supervisor, "wait_failed");
+            return;
+        }
+        do {
+            reaped = waitpid(-1, &status, WNOHANG);
+        } while (reaped < 0 && errno == EINTR);
+        if (reaped > 0) {
+            keel_test_trace("descendant_reaped", NULL, (long)reaped, 0);
+            continue;
+        }
+        if (reaped == 0) {
+            return; /* children remain; handle_timers waits again within the fixed deadline */
+        }
+        if (errno == ECHILD) {
+            finish_after_echild(supervisor);
+            return;
+        }
+        keel_test_trace("wait_failed", "error", (long)errno, 0);
+        finish_uncertain(supervisor, "wait_failed");
+        return;
+    }
+}
+
+/*
+ * The leader exited and the final TERM/grace/KILL attempt has run. Close signal authority first, then reap the
+ * leader and prove descendant completion. No signal may be sent after this point.
+ */
+static void finish_normal(struct keel_supervisor *supervisor)
 {
     close_control_authority(supervisor);
-    write_terminal_receipt(supervisor, reason);
-    supervisor->exit_code = KEEL_EXIT_UNKNOWN_LEADER;
+    reap_leader(supervisor);
+    if (supervisor->reap_failed) {
+        finish_uncertain(supervisor, "leader_reap_failed");
+        return;
+    }
+    supervisor->awaiting_descendants = 1;
+    supervisor->state = KEEL_STATE_AWAITING_DESCENDANTS;
+    keel_test_barrier("after_leader_reaped");
+    drain_descendants(supervisor);
+}
+
+/* The cleanup deadline expired; do not reopen signal authority or reap an unconfirmed leader. */
+static void finish_timeout(struct keel_supervisor *supervisor, const char *reason)
+{
+    finish_uncertain(supervisor, reason);
 }
 
 static void observe_leader(struct keel_supervisor *supervisor)
@@ -429,8 +534,6 @@ static void handle_handshake(struct keel_supervisor *supervisor)
         close_fd(&supervisor->handshake_fd);
         if (!supervisor->handshake_ok) {
             begin_setup_failure(supervisor);
-        } else {
-            supervisor->exec_confirmed = 1;
         }
         return;
     }
@@ -455,6 +558,11 @@ static void read_client(struct keel_supervisor *supervisor)
         length = recv(supervisor->client_fd, frame, sizeof(frame), 0);
     } while (length < 0 && errno == EINTR);
     if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (deadline_reached(monotonic_now(), supervisor->client_deadline)) {
+            keel_test_trace("client_idle", "closed", 0,
+                            supervisor->leader > 0 && !supervisor->leader_reaped);
+            close_fd(&supervisor->client_fd);
+        }
         return;
     }
     if (length <= 0) {
@@ -463,21 +571,21 @@ static void read_client(struct keel_supervisor *supervisor)
     }
     if (keel_decode_control(frame, (size_t)length, supervisor->request->control_token,
                             supervisor->request->usage_token, &cancel) != 0) {
-        (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_REJECTED, NULL, 0);
+        (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_REJECTED);
         keel_test_trace("control_rejected", "binding", 0,
                         supervisor->leader > 0 && !supervisor->leader_reaped);
         close_fd(&supervisor->client_fd);
         return;
     }
     if (cancel == 0) {
-        (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_ACCEPTED, NULL, 0);
+        (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_ACCEPTED);
         keel_test_trace("control", "status", 0, supervisor->leader > 0 && !supervisor->leader_reaped);
         close_fd(&supervisor->client_fd);
         return;
     }
     if (supervisor->cleanup_started) {
         /* Retries join the original cleanup deadline; they never restart it. */
-        (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_ACCEPTED, NULL, 0);
+        (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_ACCEPTED);
         keel_test_trace("control", "duplicate", 0, supervisor->leader > 0 && !supervisor->leader_reaped);
         close_fd(&supervisor->client_fd);
         return;
@@ -487,7 +595,7 @@ static void read_client(struct keel_supervisor *supervisor)
     if (!supervisor->handshake_ok) {
         supervisor->cancel_requested = 1;
     }
-    (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_ACCEPTED, NULL, 0);
+    (void)keel_send_response(supervisor->client_fd, KEEL_CONTROL_ACCEPTED);
     close_fd(&supervisor->client_fd);
     begin_cleanup(supervisor, "cancel");
 }
@@ -504,6 +612,7 @@ static void accept_client(struct keel_supervisor *supervisor)
     } while (fd < 0 && errno == EINTR);
     if (fd >= 0) {
         supervisor->client_fd = fd;
+        supervisor->client_deadline = deadline_after(monotonic_now(), KEEL_CLIENT_IDLE_SECONDS);
     }
 }
 
@@ -540,10 +649,36 @@ static void handle_timers(struct keel_supervisor *supervisor)
 {
     struct timespec now;
 
-    if (supervisor->terminal || supervisor->timers_cancelled) {
+    if (supervisor->terminal) {
         return;
     }
     now = monotonic_now();
+    if (supervisor->awaiting_descendants) {
+        const char *reason;
+
+        drain_descendants(supervisor);
+        if (supervisor->terminal) {
+            return;
+        }
+        if (!deadline_reached(now, supervisor->reap_deadline)) {
+            return;
+        }
+        if (supervisor->setup_failed) {
+            reason = "setup_failed";
+        } else if (supervisor->group_unverified) {
+            reason = "group_unverified";
+        } else if (supervisor->signal_failed) {
+            reason = "signal_failed";
+        } else {
+            reason = "descendants_unreaped";
+        }
+        keel_test_trace("deadline", reason, 0, 0);
+        finish_uncertain(supervisor, reason);
+        return;
+    }
+    if (supervisor->timers_cancelled) {
+        return;
+    }
     if (supervisor->setup_failed) {
         if (supervisor->leader_exit_observed) {
             finish_normal(supervisor);
@@ -584,16 +719,31 @@ static int poll_timeout_ms(const struct keel_supervisor *supervisor)
     struct timespec now;
     struct timespec deadline;
     long long milliseconds;
+    int have_deadline = 0;
 
-    if (supervisor->timers_cancelled) {
+    if (supervisor->terminal) {
         return -1;
     }
-    if (supervisor->setup_failed) {
+    if (supervisor->awaiting_descendants) {
         deadline = supervisor->reap_deadline;
-    } else if (supervisor->cleanup_started) {
-        deadline = (!supervisor->kill_sent && signals_allowed(supervisor)) ? supervisor->grace_deadline
-                                                                           : supervisor->reap_deadline;
-    } else {
+        have_deadline = 1;
+    } else if (!supervisor->timers_cancelled) {
+        if (supervisor->setup_failed) {
+            deadline = supervisor->reap_deadline;
+            have_deadline = 1;
+        } else if (supervisor->cleanup_started) {
+            deadline = (!supervisor->kill_sent && signals_allowed(supervisor))
+                           ? supervisor->grace_deadline
+                           : supervisor->reap_deadline;
+            have_deadline = 1;
+        }
+    }
+    if (supervisor->client_fd >= 0 &&
+        (!have_deadline || deadline_before(supervisor->client_deadline, deadline))) {
+        deadline = supervisor->client_deadline;
+        have_deadline = 1;
+    }
+    if (!have_deadline) {
         return -1;
     }
     now = monotonic_now();
@@ -618,7 +768,8 @@ static void wait_for_events(struct keel_supervisor *supervisor)
     descriptors[count].events = POLLIN;
     descriptors[count].revents = 0;
     count++;
-    if (supervisor->listen_fd >= 0) {
+    if (supervisor->listen_fd >= 0 && supervisor->client_fd < 0) {
+        /* Do not poll a queued connection while the single client slot is busy: it would spin the loop. */
         descriptors[count].fd = supervisor->listen_fd;
         descriptors[count].events = POLLIN;
         descriptors[count].revents = 0;
@@ -666,8 +817,9 @@ static int valid_request(const struct keel_request *request)
            keel_valid_exec_id(request->exec_id) && keel_valid_token(request->control_token) &&
            keel_valid_token(request->usage_token) && isfinite(request->grace_seconds) &&
            isfinite(request->reap_seconds) && request->grace_seconds >= 0.0 &&
-           request->reap_seconds >= 0.0 && request->argv != NULL && request->argv[0] != NULL &&
-           request->argv[0][0] != '\0';
+           request->grace_seconds <= KEEL_MAX_SECONDS && request->reap_seconds >= 0.0 &&
+           request->reap_seconds <= KEEL_MAX_SECONDS && request->argv != NULL &&
+           request->argv[0] != NULL && request->argv[0][0] != '\0';
 }
 
 int keel_supervise(const struct keel_request *request)
@@ -721,6 +873,13 @@ int keel_supervise(const struct keel_request *request)
         fprintf(stderr, "keel-supervisor: cannot install the signal state\n");
         goto setup_failure;
     }
+    if (enable_subreaper() != 0) {
+        supervisor.subreaper_failed = 1;
+        keel_test_trace("subreaper_failed", NULL, 0, 0);
+        fprintf(stderr, "keel-supervisor: cannot enable child subreaper tracking\n");
+        goto setup_failure;
+    }
+    keel_test_trace("subreaper", "verified", 1, 0);
     if (pipe2(supervisor.handshake_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
         fprintf(stderr, "keel-supervisor: cannot create the handshake pipe\n");
         goto setup_failure;
@@ -746,6 +905,7 @@ int keel_supervise(const struct keel_request *request)
 setup_failure:
     close_control_authority(&supervisor);
     supervisor.leader_has_status = 0;
-    write_terminal_receipt(&supervisor, "setup_failed");
+    write_terminal_receipt(&supervisor,
+                           supervisor.subreaper_failed ? "subreaper_unavailable" : "setup_failed", 0);
     return KEEL_EXIT_SETUP_FAILURE;
 }

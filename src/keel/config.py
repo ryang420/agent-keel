@@ -19,6 +19,8 @@ _DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TENANT_INT_MIN = -2_147_483_648
 _TENANT_INT_MAX = 2_147_483_647
+# The sandbox supervisor rejects grace/reap values above one day (KEEL_MAX_SECONDS in supervisor.h).
+_MAX_SANDBOX_REAP_SECONDS = 86_400.0
 # A canonical decimal: no sign on zero, no plus sign, no leading zeros.
 _TENANT = re.compile(r"^(?:0|-?[1-9][0-9]{0,9})$")
 _SECRET = re.compile(r"^[^\s,]+$")
@@ -33,7 +35,7 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return int(raw)
 
 
-def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
+def _positive_float(env: Mapping[str, str], name: str, default: float, maximum: float | None = None) -> float:
     raw = (env.get(name) or "").strip()
     if not raw:
         return default
@@ -43,6 +45,8 @@ def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
         value = math.nan
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive number, not {raw!r}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum:g}, not {raw!r}")
     return value
 
 
@@ -155,6 +159,7 @@ class Settings:
     user_chars: int = 1375
     sandbox: str = "docker"
     sandbox_idle_seconds: float = 1800.0
+    sandbox_reap_seconds: float = 5.0
     sandbox_mount_root: str | None = None
     docker: str = "docker"
     deployment: str = "keel"
@@ -221,6 +226,8 @@ class Settings:
             user_chars=_positive_int(env, "KEEL_USER_CHARS", 1375),
             sandbox=sandbox,
             sandbox_idle_seconds=_positive_float(env, "KEEL_SANDBOX_IDLE_SECONDS", 1800.0),
+            sandbox_reap_seconds=_positive_float(env, "KEEL_SANDBOX_REAP_SECONDS", 5.0,
+                                                 maximum=_MAX_SANDBOX_REAP_SECONDS),
             sandbox_mount_root=mount_root,
             docker=(env.get("KEEL_DOCKER") or "").strip() or "docker",
             deployment=deployment,

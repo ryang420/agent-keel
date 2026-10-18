@@ -5,11 +5,14 @@
  * KEEL_TEST_TRACE_FD     append JSONL events to this file descriptor
  * KEEL_TEST_BARRIER      comma-separated barrier names to stop at
  * KEEL_TEST_BARRIER_DIR  directory where ready-<name>/release-<name> files are exchanged
+ * KEEL_TEST_FAIL_SUBREAPER  simulate unavailable PR_SET_CHILD_SUBREAPER support
+ * KEEL_TEST_WAIT_ERROR   simulate an unexpected child-wait error during descendant draining
  *
  * Events (one JSON object per line):
- *   reservation, duplicate, fork, handshake, payload_start, cleanup, supervisor_signal, control,
- *   control_rejected, leader_exit, term, kill, control_closed, leader_reaped, reap_failed, setup_failed,
- *   receipt, barrier, and signal events term/kill carry leader_pinned.
+ *   reservation, duplicate, subreaper, fork, handshake, payload_start, cleanup, supervisor_signal, control,
+ *   control_rejected, leader_exit, term, kill, control_closed, leader_reaped, descendant_reaped, echild,
+ *   wait_failed, reap_failed, setup_failed, receipt, receipt_written, receipt_failed, barrier. Signal events
+ *   term/kill carry leader_pinned.
  */
 #include "supervisor.h"
 
@@ -27,6 +30,35 @@
 
 static int trace_fd = -1;
 static int trace_initialized = 0;
+static int environment_initialized = 0;
+static int fail_subreaper = 0;
+static int wait_error = 0;
+
+static void environment_init(void)
+{
+    const char *configured;
+
+    if (environment_initialized) {
+        return;
+    }
+    environment_initialized = 1;
+    configured = getenv("KEEL_TEST_FAIL_SUBREAPER");
+    fail_subreaper = configured != NULL && *configured != '\0';
+    configured = getenv("KEEL_TEST_WAIT_ERROR");
+    wait_error = configured != NULL && *configured != '\0';
+}
+
+int keel_test_subreaper_failed(void)
+{
+    environment_init();
+    return fail_subreaper;
+}
+
+int keel_test_wait_error(void)
+{
+    environment_init();
+    return wait_error;
+}
 
 static long long monotonic_milliseconds(void)
 {
