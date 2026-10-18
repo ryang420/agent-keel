@@ -60,7 +60,7 @@ async def make_rig(store, tmp_path, monkeypatch, *, lease=LEASE, skills_path=Non
         policy["skills_path"] = str(skills_path)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox=policy, soul="",
                                skills=["helper"] if skills_path is not None else [])
-    executor = executor_class(store, bus, registry, coordinator=coordinator, sleep=no_sleep, kill_grace_s=0.5)
+    executor = executor_class(store, bus, registry, coordinator=coordinator, sleep=no_sleep)
     return Rig(store, coordinator, backend, provider, bus, executor, work)
 
 
@@ -415,34 +415,9 @@ async def test_a_preparation_failure_reports_a_bounded_redacted_diagnostic(store
     assert (await rig.store.get_run_usage(run.id)).state == "released"
 
 
-async def test_the_cancellation_budget_is_one_bounded_control_without_a_hard_kill_retry(store, tmp_path,
-                                                                                       monkeypatch):
-    rig = await make_rig(store, tmp_path, monkeypatch, lease=30.0, executor_class=ClaimedExecutor)
-    assert rig.executor.cancel_budget_s == pytest.approx(0.5 + rig.coordinator.reap_seconds + 15.0 + 1.0)
-    rig.executor.cancel_budget_s = 0.3
-    rig.provider.script = [[call("c1", command="sleep 30"), Completed(Usage(1, 1, 0, 0))]]
-    calls = 0
-
-    async def second_hangs(ticket):
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            await asyncio.Event().wait()
-
-    rig.backend.control_hook = second_hangs
-    await queue_run(rig.store, "s1")
-    run = await rig.executor.claim_next()
-    task = asyncio.create_task(rig.executor.execute(run))
-    await eventually(lambda: _current_exec(rig.store, run.id))
-    await asyncio.sleep(0.2)
-    started = asyncio.get_running_loop().time()
-    task.cancel()
-    await asyncio.wait_for(task, 5)
-    assert asyncio.get_running_loop().time() - started < 3
-    assert len(rig.backend.control_calls) == 2  # the facade's own cancel and one runner control, no retry
-    assert await terminal_types(rig.store, run.id) == ["run.cancelled"]
-    assert (await rig.store.get_run_by_id(run.id)).current_exec_id is not None
-    await kill_leftovers(rig.backend)
+async def test_the_cancellation_budget_is_grace_plus_reap_plus_transport_and_one_second_for_the_runner(rig):
+    assert rig.coordinator.control_budget_s == pytest.approx(0.5 + rig.coordinator.reap_seconds + 15.0)
+    assert rig.executor.cancel_budget_s == pytest.approx(rig.coordinator.control_budget_s + 1.0)
 
 
 async def test_the_sweeper_commits_and_notifies_termination_before_recovery(rig):
@@ -492,3 +467,133 @@ async def test_lease_expiry_uses_database_time_despite_host_clock_skew(store, cl
     clock.now = 1_000.0  # and far in the past
     [expired] = await store.expire_leases()
     assert expired.run.id == run.id and expired.event.type == "run.failed"
+
+
+async def test_a_lost_usage_lease_does_not_spin_run_lease_renewal_during_cleanup(rig):
+    rig.provider.script = [[call("c1", command="sleep 30"), Completed(Usage(1, 1, 0, 0))]]
+    close_tool = rig.executor._close_tool
+
+    async def slow_close(run, state):
+        await asyncio.sleep(1.5)  # a slow but bounded cancellation cleanup
+        await close_tool(run, state)
+
+    rig.executor._close_tool = slow_close
+    renewals = []
+    renew_claim = rig.store.renew_claim
+
+    async def counting(claim, seconds):
+        renewals.append(claim.run.id)
+        return await renew_claim(claim, seconds)
+
+    rig.store.renew_claim = counting
+    pool = rig.pool()
+    await pool.start()
+    try:
+        run = await queue_run(rig.store, "s1")
+        await eventually(lambda: _current_exec(rig.store, run.id))
+        await rig.store.db.execute("UPDATE sandbox_uses SET state = 'orphaned' WHERE run_id = ?", run.id)
+        before = len(renewals)
+        await eventually(lambda: terminal_types(rig.store, run.id), seconds=10)
+        # About 1.5 s of cleanup at one renewal per lease/3 (0.3 s): a handful, never a busy loop.
+        assert len(renewals) - before <= 10
+    finally:
+        await pool.close()
+        await kill_leftovers(rig.backend)
+
+
+async def test_one_bounded_control_ends_a_stop_even_when_the_first_control_never_answers(store, tmp_path,
+                                                                                       monkeypatch):
+    rig = await make_rig(store, tmp_path, monkeypatch, lease=30.0, executor_class=ClaimedExecutor)
+    rig.coordinator.control_budget_s = 0.3
+    rig.provider.script = [[call("c1", command="sleep 30"), Completed(Usage(1, 1, 0, 0))]]
+
+    async def never(ticket):
+        await asyncio.Event().wait()
+
+    rig.backend.control_hook = never
+    await queue_run(rig.store, "s1")
+    run = await rig.executor.claim_next()
+    task = asyncio.create_task(rig.executor.execute(run))
+    try:
+        exec_id = await eventually(lambda: _current_exec(rig.store, run.id))
+        await asyncio.sleep(0.2)
+        started = asyncio.get_running_loop().time()
+        task.cancel()
+        await asyncio.wait_for(asyncio.shield(task), 3)
+        assert asyncio.get_running_loop().time() - started < 0.3 + 1.0 + 0.5
+        assert rig.backend.control_calls == [exec_id]  # one control request for the whole stop
+        row = await rig.store.db.fetchrow("SELECT state FROM sandbox_execs WHERE id = ?", exec_id)
+        assert row["state"] == "uncertain"
+        assert await terminal_types(rig.store, run.id) == ["run.cancelled"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await kill_leftovers(rig.backend)
+
+
+async def test_a_second_cancel_joins_the_same_control(store, tmp_path, monkeypatch):
+    rig = await make_rig(store, tmp_path, monkeypatch, lease=30.0, executor_class=ClaimedExecutor)
+    rig.provider.script = [[call("c1", command="sleep 30"), Completed(Usage(1, 1, 0, 0))]]
+    entered, answer_now = asyncio.Event(), asyncio.Event()
+
+    async def slow(ticket):
+        entered.set()
+        await answer_now.wait()
+
+    rig.backend.control_hook = slow
+    await queue_run(rig.store, "s1")
+    run = await rig.executor.claim_next()
+    task = asyncio.create_task(rig.executor.execute(run))
+    exec_id = await eventually(lambda: _current_exec(rig.store, run.id))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    await asyncio.wait_for(entered.wait(), 3)
+    task.cancel()  # a repeated stop while the first control is in flight
+    await asyncio.sleep(0.1)
+    answer_now.set()
+    await asyncio.wait_for(task, 5)
+    assert rig.backend.control_calls == [exec_id]
+    row = await rig.store.db.fetchrow("SELECT state FROM sandbox_execs WHERE id = ?", exec_id)
+    assert row["state"] == "finished"
+    assert await terminal_types(rig.store, run.id) == ["run.cancelled"]
+    assert (await rig.store.get_run_by_id(run.id)).current_exec_id is None
+    assert (await rig.store.get_run_usage(run.id)).state == "released"
+
+
+async def test_concurrent_kill_requests_for_one_exec_send_one_control(rig):
+    await queue_run(rig.store, "s1")
+    claim = await rig.coordinator.claim()
+    bound = await rig.coordinator.prepare(claim.use)
+    await rig.store.begin_exec(bound, "original")
+    gate = asyncio.Event()
+
+    async def slow(ticket):
+        await gate.wait()
+
+    rig.backend.control_hook = slow
+    first = asyncio.create_task(rig.coordinator.kill_tree(bound, "original"))
+    second = asyncio.create_task(rig.coordinator.kill_tree(bound, "original"))
+    await asyncio.sleep(0.1)
+    gate.set()
+    await asyncio.gather(first, second)
+    await rig.coordinator.kill_tree(bound, "original")  # a later retry reads the same outcome
+    assert rig.backend.control_calls == ["original"]
+
+
+async def test_usage_renewal_follows_the_lease_the_coordinator_grants(store, tmp_path, monkeypatch):
+    rig = await make_rig(store, tmp_path, monkeypatch)  # the coordinator grants LEASE
+    rig.provider.script = [[call("c1", command="echo one"), Completed(Usage(1, 1, 0, 0))],
+                           [2 * LEASE, *answer("done")]]
+    pool = rig.pool(lease_seconds=30.0)  # a pool configured with a much longer lease of its own
+    await pool.start()
+    try:
+        run = await queue_run(rig.store, "s1")
+        await eventually(lambda: has_event(rig.store, run.id, "tool.completed"))
+        await asyncio.sleep(LEASE + 0.2)
+        usage = await rig.store.get_run_usage(run.id)
+        assert usage.state == "active" and usage.lease_expires_at > await rig.store.coordination_now()
+        await eventually(lambda: terminal_types(rig.store, run.id), seconds=10)
+        assert await terminal_types(rig.store, run.id) == ["run.completed"]
+        assert (await eventually(lambda: _released(rig.store, run.id))).release_reason == "normal_release"
+    finally:
+        await pool.close()

@@ -30,8 +30,7 @@ def answer(text="done"):
 async def coordinated(store, tmp_path, monkeypatch, registry, **options):
     """A sandbox-enabled executor whose runs are claimed through a coordinator over host processes."""
     coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch)
-    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, kill_grace_s=0.5,
-                               **options)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, **options)
     return executor, backend
 
 

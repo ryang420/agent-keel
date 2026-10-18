@@ -86,7 +86,7 @@ async def test_an_imported_conversation_is_replayed_to_the_model_on_the_next_run
         pass
 
     coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
-    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, kill_grace_s=0.5,
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator,
                                sleep=no_sleep, max_iterations=3, now=lambda: datetime(2026, 10, 16, tzinfo=UTC))
     run = await executor.claim_next()
     await executor.execute(run)

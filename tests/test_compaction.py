@@ -87,7 +87,7 @@ async def start(store, text="next", session="s1", executor=None):
 
 async def sandboxed(store, tmp_path, monkeypatch, registry, **options):
     coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
-    return ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, kill_grace_s=0.5, **options)
+    return ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, **options)
 
 
 def answer(text="done", usage=Usage(None, 5, None, None)):

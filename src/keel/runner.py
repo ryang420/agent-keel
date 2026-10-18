@@ -36,9 +36,8 @@ log = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 60
 CANCELLED_TOOL_RESULT = "The command was cancelled."
 LEASE_LOST_MESSAGE = "The run lost its sandbox lease."
-# A helper control request may take the TERM grace plus the descendant reap timeout plus this much Docker transport;
-# the runner waits one second more for the coordinator to record the receipt, then leaves the outcome uncertain.
-CONTROL_TRANSPORT_S = 15.0
+# The coordinator bounds an exec's one cancellation control (TERM grace + reap timeout + Docker transport); the
+# runner waits one second more for the outcome to be recorded, then leaves it to recovery.
 CONTROL_MARGIN_S = 1.0
 __all__ = ["CANCELLED_TOOL_RESULT", "DEFAULT_IDENTITY", "DEFAULT_MAX_ITERATIONS", "RunExecutor", "RunFailure"]
 
@@ -73,9 +72,6 @@ class _RunState:
     use: UseHandle | None = None  # the claim's usage; released in the executor's final cleanup
     sandbox: object = None  # the bound sandbox once preparation published or shared a generation
     exec_id: str | None = None
-    control: asyncio.Future | None = None  # the one cancellation control of `control_exec`, joined by retries
-    control_exec: str | None = None
-    control_deadline: float = 0.0
     open_tool: tuple | None = None  # (call, preview, started at) of a tool that has started and not completed
     streamed: bool = False  # the current model call has produced output, so it must not be retried
 
@@ -108,7 +104,7 @@ class RunExecutor:
 
     def __init__(self, store, bus, providers: ProviderRegistry, *, coordinator=None, sleep=asyncio.sleep,
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None,
-                 kill_grace_s: float = 3.0, skills_ttl_s: float = 60.0, clock=time.monotonic,
+                 skills_ttl_s: float = 60.0, clock=time.monotonic,
                  now=lambda: datetime.now(UTC), compression_threshold: float = 0.75, background=None,
                  memory_chars: int = 2200, user_chars: int = 1375, memory_review_turns: int = 10) -> None:
         self.store = store
@@ -121,9 +117,6 @@ class RunExecutor:
         self.memory_review_turns = memory_review_turns
         self.max_iterations = max_iterations
         self.mount_root = mount_root
-        reap = coordinator.reap_seconds if coordinator is not None else 0.0
-        # One control request's receipt-aware budget; a timeout leaves the exec uncertain, never retried by PID.
-        self.cancel_budget_s = kill_grace_s + reap + CONTROL_TRANSPORT_S + CONTROL_MARGIN_S
         self.skills_ttl_s = skills_ttl_s
         self._sleep = sleep
         self._now = now
@@ -132,6 +125,11 @@ class RunExecutor:
         self._skills_cache: dict[tuple, tuple[float, list]] = {}
         self._lease_lost: set[str] = set()  # runs the worker cancelled because their usage lease was lost
         self.compactor = Compactor(store, threshold=compression_threshold, sleep=sleep, now=now, emit=self.emit)
+
+    @property
+    def cancel_budget_s(self) -> float:
+        """How long a stop waits for its exec's one control: the coordinator's control budget plus a margin."""
+        return (self.coordinator.control_budget_s if self.coordinator is not None else 0.0) + CONTROL_MARGIN_S
 
     def note_lease_lost(self, run_id: str) -> None:
         """Called by the worker before it cancels a run whose usage it could not renew: the run fails as
@@ -181,9 +179,9 @@ class RunExecutor:
         except Exception:
             log.exception("run %s failed with an internal error", run.id)
             await self._shielded(run, self._fail_internal(run, state), "record the failure")
-        self._lease_lost.discard(run.id)
         if usage is not None:
             await self._shielded(run, self._release(run, state), "release its sandbox usage")
+        self._lease_lost.discard(run.id)  # after release: the worker may still note a loss during cleanup
 
     async def _shielded(self, run: Run, work, what: str) -> None:
         """Run cleanup to completion even if the task is cancelled again meanwhile; those late cancellations
@@ -222,26 +220,14 @@ class RunExecutor:
     async def _kill_command(self, run: Run, state: _RunState) -> None:
         """Cancel the command the run is executing through its supervisor; closing the client alone proves nothing.
 
-        One control request per exec, bounded by the receipt-aware budget; a second call joins it with the same
-        deadline. Without a verified receipt the exec stays uncertain and its pointer stays set: no hard-kill
-        retry and no numeric process signal.
+        The coordinator sends one control request per exec under one deadline; this joins it (the facade usually
+        started it when the tool was cancelled). Without a verified receipt the exec stays uncertain and its
+        pointer stays set: no hard-kill retry and no numeric process signal.
         """
         if not (state.exec_id and state.sandbox is not None and self.coordinator is not None):
             return
-        loop = asyncio.get_running_loop()
-        if state.control is None or state.control_exec != state.exec_id:
-            state.control = asyncio.ensure_future(self.coordinator.kill_tree(state.sandbox, state.exec_id))
-            state.control_exec = state.exec_id
-            state.control_deadline = loop.time() + self.cancel_budget_s
-        control = state.control
         try:
-            await asyncio.wait_for(asyncio.shield(control), max(0.0, state.control_deadline - loop.time()))
-        except TimeoutError:
-            control.cancel()  # its own handler records the uncertainty
-            await asyncio.gather(control, return_exceptions=True)
-            log.warning("run %s: its command's cleanup was not confirmed in time; recovery keeps the evidence",
-                        run.id)
-            return
+            await asyncio.wait_for(self.coordinator.kill_tree(state.sandbox, state.exec_id), self.cancel_budget_s)
         except Exception:
             log.warning("run %s: could not confirm its command's cleanup; recovery keeps the evidence", run.id,
                         exc_info=True)

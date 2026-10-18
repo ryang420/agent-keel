@@ -29,6 +29,13 @@ from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION, HelperArtifact, helper
 from keel.store.sql import SqlStore
 
 log = logging.getLogger(__name__)
+# Docker transport allowed for one helper control request on top of the TERM grace and the descendant reap timeout.
+CONTROL_TRANSPORT_S = 15.0
+
+
+def _observe(control: asyncio.Future) -> None:
+    if not control.cancelled():
+        control.exception()
 
 
 class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
@@ -53,6 +60,10 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         self._daemon_id: str | None = None
         self._artifact: HelperArtifact | None = None
         self._initialize_lock = asyncio.Lock()
+        # One cancellation control per (usage, exec), fixed at its first request and bounded by this budget.
+        # Later requests join it (or read its outcome); entries go when the usage is released.
+        self.control_budget_s = getattr(backend, "kill_grace_s", 3.0) + reap_seconds + CONTROL_TRANSPORT_S
+        self._controls: dict[tuple[str, str], asyncio.Task] = {}
 
     async def initialize(self) -> None:
         """Cache the checked daemon identity and helper artifact; fail closed when the deployment cannot be served.
@@ -171,9 +182,25 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
                 raise SandboxUncertain("the sandbox execution receipt could not be recorded")
 
     async def kill_tree(self, sandbox: BoundSandbox, exec_id: str) -> None:
-        """Resolve current authority from durable identities; successful signal delivery alone proves nothing."""
+        """Cancel one exec through its supervisor, sending at most one control request for it.
+
+        The first request starts a control bounded by `control_budget_s`; concurrent and later requests for the
+        same exec join it and see its outcome, so a repeated stop never restarts the deadline or sends a second
+        request. Cancelling a waiter does not cancel the control; on budget expiry it records the exec uncertain.
+        """
         await self._ready()
         self._require_bound(sandbox)
+        key = (sandbox.use.usage_id, exec_id)
+        control = self._controls.get(key)
+        if control is None:
+            deadline = asyncio.get_running_loop().time() + self.control_budget_s
+            control = asyncio.ensure_future(self._control(sandbox, exec_id, deadline))
+            control.add_done_callback(_observe)  # waiters may have left; the outcome is recorded either way
+            self._controls[key] = control
+        await asyncio.shield(control)
+
+    async def _control(self, sandbox: BoundSandbox, exec_id: str, deadline: float) -> None:
+        """Resolve current authority from durable identities; successful signal delivery alone proves nothing."""
         try:
             ticket = await self.store.resolve_exec(sandbox, exec_id)
         except SandboxError:
@@ -181,7 +208,8 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         except Exception as exc:
             raise SandboxUncertain("the sandbox execution authority could not be verified") from exc
         try:
-            receipt = await self.backend.control_exec(ticket, cancel=True)
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            receipt = await asyncio.wait_for(self.backend.control_exec(ticket, cancel=True), remaining)
             await self._finish_exec(sandbox, ticket, receipt)
         except asyncio.CancelledError:
             await self._try_mark_exec_uncertain(ticket, "control_cancelled")
@@ -194,6 +222,8 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         """Release only guarded, proven cleanup; terminal run status never supplies execution evidence."""
         await self._ready()
         self._require_handle(use)
+        for key in [key for key, control in self._controls.items() if key[0] == use.usage_id and control.done()]:
+            del self._controls[key]
         if abandon_preparation:
             if await self.store.retire_unbound_preparation(use, abandon=True):
                 return True

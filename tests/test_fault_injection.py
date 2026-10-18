@@ -55,8 +55,7 @@ async def parts(store, tmp_path, monkeypatch, clock):
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(work)})
     coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch, owner="worker-b")
-    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep,
-                               kill_grace_s=0.5)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep)
     return store, provider, registry, backend, executor, work
 
 
@@ -272,8 +271,7 @@ async def test_a_container_removed_between_two_tool_calls_fails_the_run_and_reco
     registry.register(provider)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": IMAGE, "workdir": "/work"})
-    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep,
-                               kill_grace_s=1.0)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep)
     try:
         run = await start(executor)
         await executor.execute(run)

@@ -23,10 +23,16 @@ _BACKGROUND = ("keel-sweeper", "keel-maintenance")
 
 @dataclass
 class _Deadlines:
-    """Local monotonic deadlines derived from the last confirmed lease of each kind."""
+    """Local monotonic deadlines derived from the last confirmed lease of each kind, and the lease length granted.
+
+    Renewal cadence follows what the database granted (the coordinator's lease for a coordinated claim), never a
+    separately configured copy, so a lease cannot lapse between renewals.
+    """
 
     run: float
     usage: float | None
+    granted: float
+    usage_granted: float
 
 
 def _confirmed(sent: float, stamp: LeaseStamp) -> float:
@@ -194,8 +200,10 @@ class WorkerPool:
             # No positive lease interval: dispatch nothing. The sweeper and recovery own the claim.
             log.warning("run %s was claimed without a positive lease; leaving it to the sweeper", run.id)
             return
+        granted = claim.lease.expires_at - claim.lease.observed_at
         deadlines = _Deadlines(run=_confirmed(sent, claim.lease),
-                               usage=_confirmed(sent, claim.lease) if use is not None else None)
+                               usage=_confirmed(sent, claim.lease) if use is not None else None,
+                               granted=granted, usage_granted=granted)
         work = self.executor.execute(run, usage=use) if use is not None else self.executor.execute(run)
         execution = asyncio.create_task(work, name=f"keel-run-{run.id}")
         lost = asyncio.Event()
@@ -230,9 +238,11 @@ class WorkerPool:
             try:
                 await asyncio.shield(execution)
             except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    received += 1  # counted even when the execution finished in the same step
                 if execution.done():
                     break
-                received += 1
                 execution.cancel()
             except Exception:
                 break
@@ -248,7 +258,6 @@ class WorkerPool:
         """Renew the run lease while the run is active; cancel the execution on a stop, a terminal or lost run, or
         a lost usage. Returns once the execution is done or cancelled and the run lease no longer needs renewal."""
         run = claim.run
-        interval = self.lease_seconds / 3
         cancelled = False
         while not execution.done():
             if lost.is_set() and not cancelled:
@@ -269,11 +278,13 @@ class WorkerPool:
                     if current is None or current.status != "running":
                         execution.cancel()
                         cancelled = True
-            waits = {execution, asyncio.ensure_future(lost.wait())}
+            waits = {execution}
+            if not lost.is_set():  # an event already set would end every wait at once and spin the renewals
+                waits.add(asyncio.ensure_future(lost.wait()))
             if waiter is not None and not cancelled:
                 waits.add(asyncio.ensure_future(waiter.wait()))
             try:
-                done, _ = await asyncio.wait(waits, timeout=min(interval, self._left(deadlines.run)),
+                done, _ = await asyncio.wait(waits, timeout=min(deadlines.granted / 3, self._left(deadlines.run)),
                                              return_when=asyncio.FIRST_COMPLETED)
             finally:
                 for waiting in waits:
@@ -283,7 +294,7 @@ class WorkerPool:
                 return
             sent = self.monotonic()
             try:
-                stamp = await asyncio.wait_for(self.store.renew_claim(claim, self.lease_seconds),
+                stamp = await asyncio.wait_for(self.store.renew_claim(claim, deadlines.granted),
                                                self._left(deadlines.run))
             except Exception:
                 log.warning("renewing the lease of %s failed", run.id, exc_info=True)
@@ -297,6 +308,7 @@ class WorkerPool:
                 execution.cancel()
                 return
             deadlines.run = _confirmed(sent, stamp)
+            deadlines.granted = stamp.expires_at - stamp.observed_at
 
     def _left(self, deadline: float) -> float:
         return max(0.0, deadline - self.monotonic())
@@ -306,9 +318,8 @@ class WorkerPool:
         """Renew the usage every third of the lease until cancelled after executor cleanup. A definite loss, or
         reaching the last confirmed deadline without a renewal, cancels the execution: no new exec can be admitted
         anyway, since every admission rechecks the lease in the database."""
-        interval = self.lease_seconds / 3
         while True:
-            await asyncio.sleep(min(interval, self._left(deadlines.usage)))
+            await asyncio.sleep(min(deadlines.usage_granted / 3, self._left(deadlines.usage)))
             if self.monotonic() >= deadlines.usage:
                 log.warning("run %s: its sandbox usage lease could not be confirmed in time", run.id)
                 break
@@ -324,6 +335,7 @@ class WorkerPool:
                 log.warning("run %s: its sandbox usage lease was lost", run.id)
                 break
             deadlines.usage = _confirmed(sent, stamp)
+            deadlines.usage_granted = stamp.expires_at - stamp.observed_at
         if not execution.done():
             note = getattr(self.executor, "note_lease_lost", None)
             if note is not None:

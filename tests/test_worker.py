@@ -270,7 +270,7 @@ async def test_a_stop_during_a_command_ends_the_run_quickly(store, tmp_path, mon
     registry.register(provider)
     bus = InMemoryEventBus()
     coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch, lease_seconds=3)
-    executor = RunExecutor(store, bus, registry, coordinator=coordinator, kill_grace_s=0.5)
+    executor = RunExecutor(store, bus, registry, coordinator=coordinator)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "w")})
     pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01, lease_seconds=3,

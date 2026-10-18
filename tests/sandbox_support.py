@@ -211,6 +211,7 @@ class LocalDocker(FakeDocker):
 
     def __init__(self, *, kill_grace_s: float = 0.5, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.kill_grace_s = kill_grace_s
         self.local = LocalSandbox(kill_grace_s=kill_grace_s)
         self.exec_calls: list[tuple[str, list[str]]] = []
         self.control_calls: list[str] = []

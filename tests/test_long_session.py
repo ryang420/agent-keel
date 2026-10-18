@@ -101,7 +101,7 @@ async def service(store, tmp_path, monkeypatch):
     registry.register(model)
     bus = InMemoryEventBus()
     coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch, bus=bus)
-    executor = RunExecutor(store, bus, registry, coordinator=coordinator, kill_grace_s=0.5)
+    executor = RunExecutor(store, bus, registry, coordinator=coordinator)
     pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01, coordinator=coordinator)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
                 credentials=(ServiceCredential(1, "test-key"),), max_running=2)
