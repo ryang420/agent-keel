@@ -403,6 +403,34 @@ class SandboxStoreMixin:
                 raise SandboxBusy(f"exec {exec_id!r} already exists") from exc
             return ExecTicket(exec_id, use, binding, control_token)
 
+    async def resolve_exec(self, sandbox: BoundSandbox, exec_id: str) -> ExecTicket:
+        """Resolve the original durable control ticket under current usage and generation authority.
+
+        Cleaning owners may finish their executions; expired, revoked, uncertain and retired identities cannot
+        acquire signal authority. No cached ticket or reusable container name substitutes for these checks.
+        """
+        use, binding = sandbox.use, sandbox.binding
+        async with self.coordination_guard(use.key.profile_id):
+            lock = self._lock_suffix()
+            current = await self._lock_sandbox(use.key, lock)
+            usage = await self.db.fetchrow(
+                f"SELECT * FROM sandbox_uses WHERE {_USAGE_IDENTITY}{lock}", use.usage_id, use.token, use.owner,
+                use.key.deployment, use.key.profile_id, use.key.daemon_id)
+            now = await self.coordination_now()
+            if (usage is None or usage["state"] not in ("active", "cleaning")
+                    or usage["lease_expires_at"] < now or not _usage_matches_binding(usage, binding)
+                    or current is None or current["daemon_id"] != use.key.daemon_id
+                    or current["state"] not in ("ready", "draining")
+                    or not _usage_matches_binding(current, binding)):
+                raise SandboxLeaseLost("the execution no longer has valid usage authority")
+            row = await self.db.fetchrow(f"SELECT * FROM sandbox_execs WHERE id = ?{lock}", exec_id)
+            if row is None or row["state"] not in ("pending", "running", "finished"):
+                raise SandboxLeaseLost("the execution control identity is unavailable")
+            ticket = ExecTicket(exec_id, use, binding, row["control_token"])
+            if not self._exec_matches_ticket(row, ticket):
+                raise SandboxLeaseLost("the execution control binding does not match its usage")
+            return ticket
+
     async def finish_exec(self, ticket: ExecTicket, receipt: CleanupReceipt) -> bool:
         """Record one verified cleanup receipt, returning True only for the finished transition.
 
@@ -463,6 +491,10 @@ class SandboxStoreMixin:
     def _exec_matches_ticket(self, row: dict, ticket: ExecTicket) -> bool:
         binding = ticket.binding
         return (row["usage_id"] == ticket.use.usage_id
+                and row["usage_token"] == ticket.use.token
+                and row["deployment"] == ticket.use.key.deployment
+                and row["profile_id"] == ticket.use.key.profile_id
+                and row["daemon_id"] == ticket.use.key.daemon_id
                 and row["generation"] == binding.generation
                 and row["generation_token"] == binding.generation_token
                 and row["container_id"] == binding.container_id)

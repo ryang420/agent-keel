@@ -11,7 +11,7 @@ import re
 from typing import Awaitable, Callable
 import uuid
 
-from keel.sandbox.base import ExecResult, Sandbox, SandboxBackend
+from keel.sandbox.base import ExecResult, Sandbox, SandboxError, SandboxExecutor
 
 MAX_TOOL_RESULT_CHARS = 100_000
 PREVIEW_CHARS = 500
@@ -49,11 +49,12 @@ class ToolArgumentError(Exception):
 class ToolOutcome:
     content: str
     error: bool = False
+    sandbox_error: SandboxError | None = None  # internal run-ending signal, never part of the tool JSON
 
 
 @dataclass
 class ToolContext:
-    backend: SandboxBackend | None = None
+    backend: SandboxExecutor | None = None
     sandbox: Sandbox | None = None
     cwd: str = ""
     tool_call_id: str = ""
@@ -70,9 +71,11 @@ class ToolContext:
 
     async def exec(self, argv: list[str], *, timeout_s: float, cwd: str | None = None,
                    env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:
-        """Run a command, recording its exec id first so a stop can kill it. The id is cleared only after a
-        normal finish: a cancelled command must stay findable for the stop path. Without `cwd` the command starts in
-        "/", which always exists (the session directory may not): tools pass absolute paths or cd themselves."""
+        """Run through the I/O facade; on_exec is a convenience pointer, never coordinated cleanup authority.
+
+        The pointer survives cancellation for legacy stop callers. Without `cwd` the command starts in "/", which
+        always exists (the session directory may not): tools pass absolute paths or cd themselves.
+        """
         exec_id = "x" + uuid.uuid4().hex[:16]
         if self.on_exec is not None:
             await self.on_exec(exec_id)

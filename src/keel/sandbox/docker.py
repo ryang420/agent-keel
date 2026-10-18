@@ -28,7 +28,7 @@ import stat
 import tarfile
 import tempfile
 import time
-from typing import Collection
+from typing import Awaitable, Callable, Collection
 import uuid
 
 from keel.sandbox.base import (
@@ -36,7 +36,7 @@ from keel.sandbox.base import (
     profile_mount_root, validate_mount_sources,
 )
 from keel.sandbox.records import (
-    ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt, SandboxKey, SandboxUncertain,
+    BoundSandbox, ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt, SandboxKey, SandboxUncertain,
 )
 from keel.sandbox.runtime import (
     HELPER_PROTOCOL_VERSION, HelperArtifact, artifact_directory, decode_receipt, normalize_architecture,
@@ -786,7 +786,8 @@ class DockerSandbox:
             raise SandboxError("The docker CLI is not available.") from exc
 
     async def exec_bound(self, ticket: ExecTicket, argv: list[str], *, cwd: str, timeout_s: float,
-                         env: dict[str, str] | None = None, stdin: bytes | None = None
+                         env: dict[str, str] | None = None, stdin: bytes | None = None,
+                         authorize_control: Callable[[], Awaitable[None]] | None = None
                          ) -> tuple[ExecResult, CleanupReceipt]:
         """Dispatch one payload through the installed helper, by exact ID, and require its terminal receipt."""
         container_id = self._exact_id(ticket.binding.container_id)
@@ -807,14 +808,28 @@ class DockerSandbox:
                      "--reap", str(float(self.reap_seconds)), "--", *argv]
             proc = await self._spawn(args, stdin is not None)
 
+            control_error = None
+
             async def cancel() -> None:
+                nonlocal control_error
+                if authorize_control is not None:
+                    try:
+                        await authorize_control()
+                    except Exception as exc:
+                        control_error = exc
+                        # End only this transport. Without current authority the supervisor cannot be signalled.
+                        if proc.returncode is None:
+                            proc.kill()
+                        return
                 await self._send_cancel(ticket)
 
             try:
                 output, timed_out = await collect(proc, stdin, timeout_s, cancel)
             except asyncio.CancelledError:
-                await self._send_cancel(ticket)
+                await cancel()
                 raise
+            if control_error is not None:
+                raise SandboxUncertain("sandbox cleanup authority is no longer valid") from control_error
         code = TIMEOUT_EXIT_CODE if timed_out else (proc.returncode if proc.returncode is not None else -1)
         result = ExecResult(code, output.decode("utf-8", errors="replace"), timed_out,
                             round(time.monotonic() - started, 3))
@@ -846,6 +861,8 @@ class DockerSandbox:
 
     async def exec(self, sandbox: Sandbox, argv: list[str], *, cwd: str, timeout_s: float, exec_id: str,
                    env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:
+        if isinstance(sandbox, BoundSandbox):
+            raise SandboxError("bound sandbox execution requires the coordinator facade")
         result = await self._exec_once(sandbox, argv, cwd, timeout_s, exec_id, env, stdin)
         if (result.exit_code != 0 and result.output.startswith("Error response from daemon")
                 and any(marker in result.output for marker in _GONE)
@@ -915,6 +932,8 @@ class DockerSandbox:
             raise PermissionError(result.output.strip()[:300] or path)
 
     async def kill_tree(self, sandbox: Sandbox, exec_id: str) -> None:
+        if isinstance(sandbox, BoundSandbox):
+            raise SandboxError("bound sandbox cancellation requires the coordinator facade")
         await self._docker("exec", sandbox.name, "sh", "-c", _SIGNAL, "keel-kill", exec_id, "TERM", timeout=15)
         deadline = time.monotonic() + self.kill_grace_s
         while time.monotonic() < deadline:

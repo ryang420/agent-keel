@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The sandbox coordinator records commands, file/skill helpers and cleanup before dispatch, verifies supervisor
+  receipts before finishing executions, and gates cancellation on the original execution and current usage lease.
 - `python -m keel.admin import-sessions` imports conversations copied from another system: JSON lines on stdin, one
   result line per conversation on stdout ([operations guide](docs/guide/operations.md)). A conversation keeps its
   title (numbered if the profile already uses it), times and messages, and never any reasoning. An existing session

@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import asyncio
 
-from keel.sandbox.base import CoordinatedSandboxBackend, PolicyError, SandboxError, parse_policy
+from keel.sandbox.base import (
+    CoordinatedSandboxBackend, ExecFileIO, ExecResult, PolicyError, SandboxError, parse_policy,
+)
 from keel.sandbox.records import (
-    BoundSandbox, ContainerObservation, DockerOutcome, LeaseStamp, LifecycleAttempt, RunClaim, SandboxBinding,
+    BoundSandbox, CleanupReceipt, ContainerObservation, DockerOutcome, ExecTicket, LeaseStamp, LifecycleAttempt,
+    RunClaim, SandboxBinding,
     SandboxBusy, SandboxLeaseLost, SandboxUncertain, UseHandle,
 )
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION, HelperArtifact, helper_artifact
 from keel.store.sql import SqlStore
 
 
-class SandboxCoordinator:
+class SandboxCoordinator(ExecFileIO):
     """One instance's authority to admit, prepare and publish a profile's sandbox generation."""
 
     def __init__(self, store: SqlStore, backend: CoordinatedSandboxBackend, *, deployment: str, owner: str,
@@ -106,6 +109,81 @@ class SandboxCoordinator:
             raise SandboxUncertain(f"usage {use.usage_id!r} already has recorded preparation")
         policy = await self._profile_policy(use)
         return await self._prepare_generation(use, policy, artifact)
+
+    async def exec(self, sandbox: BoundSandbox, argv: list[str], *, cwd: str, timeout_s: float,
+                   exec_id: str, env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:
+        """Commit one pending ticket, dispatch it once, and finish only with matching cleanup evidence."""
+        await self._ready()
+        self._require_bound(sandbox)
+        ticket = await self.store.begin_exec(sandbox, exec_id)
+
+        async def authorize_control() -> None:
+            current = await self.store.resolve_exec(sandbox, exec_id)
+            if current != ticket:
+                raise SandboxLeaseLost("the execution control identity changed")
+
+        try:
+            result, receipt = await self.backend.exec_bound(
+                ticket, argv, cwd=cwd, timeout_s=timeout_s, env=env, stdin=stdin,
+                authorize_control=authorize_control)
+            await self._finish_exec(sandbox, ticket, receipt)
+            return result
+        except asyncio.CancelledError:
+            try:
+                await self.kill_tree(sandbox, exec_id)
+            except Exception:
+                await self.store.mark_exec_uncertain(ticket, "cancel_cleanup_unverified")
+            raise
+        except Exception as exc:
+            await self.store.mark_exec_uncertain(ticket, "dispatch_or_cleanup_unverified")
+            raise SandboxUncertain("the sandbox execution outcome is uncertain") from exc
+
+    def _require_bound(self, sandbox: BoundSandbox) -> None:
+        if not isinstance(sandbox, BoundSandbox):
+            raise SandboxLeaseLost("coordinated execution requires a bound sandbox")
+        self._require_handle(sandbox.use)
+        if sandbox.profile_id != sandbox.use.key.profile_id:
+            raise SandboxLeaseLost("the sandbox belongs to another usage profile")
+
+    async def _finish_exec(self, sandbox: BoundSandbox, ticket: ExecTicket,
+                           receipt: CleanupReceipt) -> None:
+        if (not isinstance(receipt, CleanupReceipt) or receipt.exec_id != ticket.exec_id
+                or receipt.control_token != ticket.control_token or not receipt.control_closed
+                or not receipt.descendants_complete or receipt.uncertain_reason is not None):
+            raise SandboxUncertain("the sandbox cleanup receipt is missing or unverified")
+        if not await self.store.finish_exec(ticket, receipt):
+            # Another completion/control client may already have finished the same original ticket. Resolution
+            # rejects uncertain/retired rows and mismatched authority, so only that idempotent finish is accepted.
+            if await self.store.resolve_exec(sandbox, ticket.exec_id) != ticket:
+                raise SandboxUncertain("the sandbox execution receipt could not be recorded")
+
+    async def kill_tree(self, sandbox: BoundSandbox, exec_id: str) -> None:
+        """Resolve current authority from durable identities; successful signal delivery alone proves nothing."""
+        await self._ready()
+        self._require_bound(sandbox)
+        ticket = await self.store.resolve_exec(sandbox, exec_id)
+        try:
+            receipt = await self.backend.control_exec(ticket, cancel=True)
+            await self._finish_exec(sandbox, ticket, receipt)
+        except asyncio.CancelledError:
+            await self.store.mark_exec_uncertain(ticket, "control_cancelled")
+            raise
+        except Exception as exc:
+            await self.store.mark_exec_uncertain(ticket, "control_or_cleanup_unverified")
+            raise SandboxUncertain("the sandbox cancellation outcome is uncertain") from exc
+
+    async def release(self, use: UseHandle, *, abandon_preparation: bool = False) -> bool:
+        """Release only guarded, proven cleanup; terminal run status never supplies execution evidence."""
+        await self._ready()
+        self._require_handle(use)
+        if abandon_preparation:
+            if await self.store.retire_unbound_preparation(use, abandon=True):
+                return True
+        if not await self.store.begin_usage_cleanup(use):
+            usage = await self.store.get_usage(use.usage_id)
+            if usage is None or usage.state != "cleaning":
+                return False  # orphan release belongs to recovery, even when its generation is already gone
+        return await self.store.release_usage(use)
 
     async def _ready(self) -> tuple[str, HelperArtifact]:
         await self.initialize()

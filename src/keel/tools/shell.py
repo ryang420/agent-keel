@@ -3,10 +3,12 @@ tool (tools/terminal_tool_result.py). There are no background processes, PTYs or
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
 import re
 import uuid
 
+from keel.sandbox.base import SandboxError
 from keel.tools.base import (
     ToolArgumentError, ToolOutcome, error_result, optional_int, require, tool, tool_json, truncate_middle,
 )
@@ -66,6 +68,8 @@ async def _shown(ctx, text: str) -> str:
         try:
             await ctx.backend.write_file(ctx.sandbox, path, text.encode("utf-8"))
             return shown + f"\n\n[Full output saved to {path}]"
+        except SandboxError:
+            raise
         except Exception as exc:
             reason = reason or f"{type(exc).__name__}: {exc}"
     return shown + f"\n\n[Full output could not be saved: {reason}]"
@@ -107,10 +111,12 @@ async def terminal(args: dict, ctx) -> ToolOutcome:
 
 
 async def _remove(ctx, path: str) -> None:
-    """Best effort; a cancellation is not caught here and simply leaves the script behind."""
+    """Best effort, through the same registered execution path as every other helper."""
     try:
         await ctx.backend.exec(ctx.sandbox, ["rm", "-f", path], cwd="/", timeout_s=30,
                                exec_id="r" + uuid.uuid4().hex[:16])
+    except SandboxError:
+        raise
     except Exception:
         pass
 
@@ -127,8 +133,11 @@ async def execute_code(args: dict, ctx) -> ToolOutcome:
         token = f"__KEEL_CWD_{uuid.uuid4().hex}__"
         result = await ctx.exec(_argv(f"python3 {path}", token, ctx.cwd, ctx.sandbox.policy.workdir),
                                 timeout_s=CODE_TIMEOUT)
-    except Exception:
-        await _remove(ctx, path)
+    except (Exception, asyncio.CancelledError):
+        try:
+            await _remove(ctx, path)
+        except Exception:
+            pass  # retain the original failure/cancellation; the facade has recorded cleanup uncertainty
         raise
     await _remove(ctx, path)
     output, new_cwd = _split_cwd(result.output, token)

@@ -493,3 +493,46 @@ async def test_start_owner_token_change_after_recording_blocks_publication(coord
     with pytest.raises(SandboxLeaseLost):
         await coordinator.prepare(claim.use)
     assert (await _sandbox_row(store))["state"] == "creating"
+
+
+async def test_release_does_not_revive_an_expired_bound_usage(coordination):
+    coordinator, _, store, clock = coordination
+    claim = await make_claim(store, 's1')
+    await coordinator.prepare(claim.use)
+    clock.now += 61
+    assert await coordinator.release(claim.use) is False
+    usage = await store.get_usage(claim.use.usage_id)
+    assert usage.state == 'active' and usage.released_at is None
+    assert await coordinator.renew_usage(claim.use) is None
+
+
+async def test_release_rejects_a_foreign_usage_token(coordination):
+    coordinator, _, store, _ = coordination
+    claim = await make_claim(store, 's1')
+    await coordinator.prepare(claim.use)
+    assert await coordinator.release(replace(claim.use, token='foreign')) is False
+    assert (await store.get_usage(claim.use.usage_id)).state == 'active'
+
+
+async def test_release_requires_every_registered_execution_to_finish(coordination):
+    from keel.sandbox.records import CleanupReceipt
+
+    coordinator, _, store, _ = coordination
+    claim = await make_claim(store, 's1')
+    bound = await coordinator.prepare(claim.use)
+    ticket = await store.begin_exec(bound, 'pending-helper')
+    assert await coordinator.release(claim.use) is False
+    assert (await store.get_usage(claim.use.usage_id)).state == 'cleaning'
+    assert await store.finish_exec(ticket, CleanupReceipt(ticket.exec_id, ticket.control_token, 0, True, True, None))
+    assert await coordinator.release(claim.use) is True
+
+
+async def test_normal_release_leaves_removed_orphan_to_recovery(coordination):
+    coordinator, _, store, clock = coordination
+    claim = await make_claim(store, 's1')
+    await coordinator.prepare(claim.use)
+    clock.now += 61
+    await store.db.execute('UPDATE sandbox_uses SET state = ? WHERE id = ?', 'orphaned', claim.use.usage_id)
+    await store.db.execute('UPDATE sandboxes SET state = ?, container_id = NULL WHERE profile_id = ?', 'absent', 'p1')
+    assert await coordinator.release(claim.use) is False
+    assert (await store.get_usage(claim.use.usage_id)).state == 'orphaned'

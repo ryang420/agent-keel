@@ -10,6 +10,8 @@ import posixpath
 import re
 import uuid
 
+from keel.sandbox.base import Sandbox, SandboxExecutor
+
 log = logging.getLogger(__name__)
 _FRONT = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.S)
 _DESCRIPTION_CHARS = 60
@@ -69,7 +71,7 @@ def parse_front_matter(text: str) -> dict[str, str]:
     return fields
 
 
-async def read_text(backend, sandbox, path: str, limit: int) -> tuple[str, bool]:
+async def read_text(backend: SandboxExecutor, sandbox: Sandbox, path: str, limit: int) -> tuple[str, bool]:
     """The file's text and whether it was cut at `limit` bytes. Raises OSError (or ValueError for a bad path)."""
     data = await backend.read_file(sandbox, path, limit + 1)
     return data[:limit].decode("utf-8", errors="replace"), len(data) > limit
@@ -109,7 +111,8 @@ def _sections(output: str, token: str) -> list[tuple[str, str | None]]:
     return found
 
 
-async def discover_skills(backend, sandbox, skills_path: str, enabled: list[str]) -> list[SkillInfo]:
+async def discover_skills(backend: SandboxExecutor, sandbox: Sandbox, skills_path: str,
+                          enabled: list[str]) -> list[SkillInfo]:
     """The enabled skills under `skills_path`, found with a single exec that reads the first 8 KiB of every SKILL.md
     (the full file is read on demand by skill_view)."""
     if not enabled:

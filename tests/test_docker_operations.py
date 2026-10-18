@@ -1188,3 +1188,45 @@ async def test_real_docker_install_and_exec_bound(tmp_path, image, user, monkeyp
             assert removed.state == "succeeded", removed
         assert await backend.inventory() == []
         await backend.aclose()
+
+
+@pytest.mark.parametrize('cause', ['timeout', 'cancel'])
+@pytest.mark.parametrize('valid', [True, False])
+async def test_internal_control_rechecks_current_authority(backend, cause, valid):
+    from keel.sandbox.records import SandboxLeaseLost
+
+    ticket = make_ticket()
+    process = FakeProcess([], None)
+    attach_spawn(backend, process)
+    authorized = []
+
+    async def authorize():
+        authorized.append(True)
+        if not valid:
+            raise SandboxLeaseLost('expired usage')
+
+    def handler(args, stdin):
+        if 'cancel' in args:
+            process.returncode = -15
+            return 0, ''
+        return 0, receipt_json(ticket)
+
+    fake = attach(backend, handler)
+    if cause == 'timeout':
+        if valid:
+            result, receipt = await backend.exec_bound(ticket, ['sleep', '30'], cwd='/w', timeout_s=0.01,
+                                                       authorize_control=authorize)
+            assert result.timed_out and receipt.descendants_complete
+        else:
+            with pytest.raises(SandboxUncertain):
+                await backend.exec_bound(ticket, ['sleep', '30'], cwd='/w', timeout_s=0.01,
+                                         authorize_control=authorize)
+    else:
+        task = asyncio.create_task(backend.exec_bound(ticket, ['sleep', '30'], cwd='/w', timeout_s=30,
+                                                      authorize_control=authorize))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert authorized == [True]
+    assert any('cancel' in args for args in fake.commands()) == valid
