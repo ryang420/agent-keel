@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `POST /v1/models/verify` checks a model id with two tiny calls (text, then a 1×1 image) and reports whether
+  the model reads images. Any tenant key may call it; it stores nothing ([API guide](docs/guide/api.md)).
 - `python -m keel.admin import-sessions` imports conversations copied from another system: JSON lines on stdin, one
   result line per conversation on stdout ([operations guide](docs/guide/operations.md)). A conversation keeps its
   title (numbered if the profile already uses it), times and messages, and never any reasoning. An existing session
