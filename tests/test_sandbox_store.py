@@ -153,6 +153,25 @@ async def test_an_active_preparation_operation_blocks_a_new_preparation_owner(st
     assert (await store.get_run_by_id(second.id)).status == "queued"
 
 
+@pytest.mark.parametrize("state", ["active", "cleaning"])
+async def test_an_expired_unreleased_usage_blocks_admission_between_scans(store, clock, state):
+    """Recovery owns orphaning; admission must not slip through after a lease expired but before a scan."""
+    await seed_profile(store)
+    await seed_ready_sandbox(store)
+    await queue_run(store, "s1")
+    claim = await store.claim_run_with_usage("w1", 30, deployment=DEPLOYMENT, daemon_id=DAEMON)
+    assert claim is not None and claim.use is not None
+    await store.db.execute(
+        "UPDATE sandbox_uses SET state = ?, lease_expires_at = ? WHERE id = ?",
+        state, await store.db.database_now() - 1, claim.use.usage_id)
+    clock.now += 1
+    second = await queue_run(store, "s2")
+
+    assert await store.claim_run_with_usage("w2", 30, deployment=DEPLOYMENT, daemon_id=DAEMON) is None
+    assert (await store.get_run_by_id(second.id)).status == "queued"
+    assert (await store.get_usage(claim.use.usage_id)).state == state  # admission never mutates
+
+
 async def test_usage_renewal_rejects_expired_revoked_and_released_rows(store):
     claim = await make_claim(store, "s1")
     use = claim.use
