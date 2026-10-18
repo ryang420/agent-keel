@@ -417,3 +417,79 @@ async def test_cancellation_between_a_recorded_start_and_publication_publishes_n
     assert sandbox["state"] == "creating" and sandbox["container_id"] is None
     usage = await store.get_usage(claim.use.usage_id)
     assert usage.state == "preparing" and usage.binding is None
+
+
+@pytest.mark.parametrize("phase", ["create", "install_helper", "start"])
+async def test_operation_expiry_before_heartbeat_retains_evidence_without_progress(coordination, phase):
+    coordinator, backend, store, clock = coordination
+    claim = await make_claim(store, "s1")
+    assert await store.renew_usage(claim.use, 120) is not None
+    barrier = backend.hold_next(phase)
+    task = asyncio.create_task(coordinator.prepare(claim.use))
+    await asyncio.wait_for(barrier.entered.wait(), 5)
+    clock.now += 31
+    barrier.release.set()
+    with pytest.raises(SandboxLeaseLost):
+        await asyncio.wait_for(task, 5)
+    calls = ["create", "install_helper", "start"]
+    assert backend.calls == calls[:calls.index(phase) + 1]
+    attempt = backend.attempts[phase][0]
+    saved = await store.get_operation(attempt.id)
+    assert saved.outcome == "dispatched"
+    assert saved.container_id == backend.created_ids[0]
+    assert saved.lease_expires_at < clock.now
+    usage = await store.get_usage(claim.use.usage_id)
+    assert usage.lease_expires_at > clock.now
+    assert usage.state == "preparing" and usage.binding is None
+    assert (await _sandbox_row(store))["state"] == "creating"
+
+
+async def test_start_expiry_after_result_recording_blocks_publication(coordination, monkeypatch):
+    coordinator, backend, store, clock = coordination
+    claim = await make_claim(store, "s1")
+    assert await store.renew_usage(claim.use, 120) is not None
+    publish = store.publish_generation
+    async def expire_before_publish(*args, **kwargs):
+        clock.now += 31
+        return await publish(*args, **kwargs)
+    monkeypatch.setattr(store, "publish_generation", expire_before_publish)
+    with pytest.raises(SandboxLeaseLost):
+        await coordinator.prepare(claim.use)
+    assert backend.calls == ["create", "install_helper", "start"]
+    assert (await _sandbox_row(store))["state"] == "creating"
+    assert (await store.get_usage(claim.use.usage_id)).state == "preparing"
+
+
+@pytest.mark.parametrize("phase", ["create", "install"])
+async def test_operation_expiry_after_recording_blocks_next_phase(coordination, monkeypatch, phase):
+    coordinator, backend, store, clock = coordination
+    claim = await make_claim(store, "s1")
+    assert await store.renew_usage(claim.use, 120) is not None
+    begin = store.begin_lifecycle
+
+    async def expire_before_next(use, kind, **kwargs):
+        if kind == {"create": "install", "install": "start"}[phase]:
+            clock.now += 31
+        return await begin(use, kind, **kwargs)
+
+    monkeypatch.setattr(store, "begin_lifecycle", expire_before_next)
+    with pytest.raises(SandboxLeaseLost):
+        await coordinator.prepare(claim.use)
+    assert backend.calls == (["create"] if phase == "create" else ["create", "install_helper"])
+    assert (await _sandbox_row(store))["state"] == "creating"
+
+
+async def test_start_owner_token_change_after_recording_blocks_publication(coordination, monkeypatch):
+    coordinator, backend, store, _ = coordination
+    claim = await make_claim(store, "s1")
+    publish = store.publish_generation
+
+    async def change_token_before_publish(use, binding, operation_id, **kwargs):
+        await store.db.execute(
+            "UPDATE sandbox_operations SET owner_token = ? WHERE id = ?", "replacement-token", operation_id)
+        return await publish(use, binding, operation_id, **kwargs)
+
+    monkeypatch.setattr(store, "publish_generation", change_token_before_publish)
+    with pytest.raises(SandboxLeaseLost):
+        await coordinator.prepare(claim.use)
+    assert (await _sandbox_row(store))["state"] == "creating"

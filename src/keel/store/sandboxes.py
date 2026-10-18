@@ -653,6 +653,13 @@ class SandboxStoreMixin:
         if (sandbox_row["generation"] != target.generation
                 or sandbox_row["generation_token"] != target.generation_token):
             raise SandboxBusy("the target is not the sandbox's current generation")
+        # Only the owner of the immediately preceding step may continue preparation. Earlier completed
+        # steps need not stay leased while a later, independently heartbeating operation is in flight.
+        previous = next((row for row in operations if row["id"] == sandbox_row["current_operation_id"]), None)
+        if (previous is not None and previous["kind"] in _PREPARATION_KINDS
+                and (previous["owner"] != use.owner or previous["usage_token"] != use.token
+                     or previous["lease_expires_at"] is None or previous["lease_expires_at"] < now)):
+            raise SandboxLeaseLost("the previous preparation owner lost its lease")
         create_id = create_operation_id or usage["create_operation_id"]
         create = next((operation for operation in operations if operation["id"] == create_id), None)
         if create is None:
@@ -806,12 +813,15 @@ class SandboxStoreMixin:
                                       outcome: DockerOutcome) -> LifecycleAttempt:
         """Record an external result conditionally.
 
-        A current dispatched attempt advances its outcome and may attach a newly discovered exact ID. A stale or
+        An unexpired current dispatched attempt advances its outcome and may attach a newly discovered exact ID.
+        Expired owners retain matching evidence without advancing their outcome. A stale or
         retired attempt only ever attaches matching evidence that is still null: it never changes authority or
         outcome, publishes, or touches another generation's pointer.
         """
         discovered = outcome.observation.container_id if outcome.observation is not None else None
         async with self.db.transaction():
+            await self.db.fetchrow(
+                f"SELECT id FROM sandbox_operations WHERE id = ?{self._lock_suffix()}", attempt.id)
             now = await self.coordination_now()
             # A created container stays unresolved until its cleanup/absence is reconciled; only a definite
             # failure or a completed install/start/remove is resolved by its own result.
@@ -824,11 +834,12 @@ class SandboxStoreMixin:
                 "discovered_container_id = CASE WHEN discovered_container_id IS NULL THEN ? "
                 "ELSE discovered_container_id END, updated_at = ? "
                 "WHERE id = ? AND owner_token = ? AND authority = 'current' AND outcome = 'dispatched' "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at >= ? "
                 "AND (CAST(? AS TEXT) IS NULL OR container_id IS NULL OR container_id = ?) "
                 "AND (CAST(? AS TEXT) IS NULL OR discovered_container_id IS NULL "
                 "OR discovered_container_id = ?) RETURNING *",
                 outcome.state, outcome.diagnostic, resolved_at, discovered, discovered, now, attempt.id,
-                attempt.owner_token, discovered, discovered, discovered, discovered)
+                attempt.owner_token, now, discovered, discovered, discovered, discovered)
             if row is not None:
                 return _attempt(row)
             current = await self.db.fetchrow(
@@ -854,7 +865,7 @@ class SandboxStoreMixin:
             return _attempt(evidence if evidence is not None else current)
 
     async def publish_generation(self, use: UseHandle, binding: SandboxBinding,
-                                 start_operation_id: str) -> BoundSandbox:
+                                 start_operation_id: str, *, start_owner_token: str | None = None) -> BoundSandbox:
         """Publish one verified preparation as the profile's current usable generation.
 
         Everything is rechecked under the profile guard: the preparing usage still holds its lease and is unbound,
@@ -866,12 +877,12 @@ class SandboxStoreMixin:
             if not available:
                 raise SandboxBusy(f"profile {use.key.profile_id!r} is unavailable")
             lock = self._lock_suffix()
-            now = await self.coordination_now()
             sandbox_row = await self._lock_sandbox(use.key, lock)
             operations = await self._lock_operations(use.key, lock)
             usage = await self.db.fetchrow(
                 f"SELECT * FROM sandbox_uses WHERE {_USAGE_IDENTITY}{lock}", use.usage_id, use.token, use.owner,
                 use.key.deployment, use.key.profile_id, use.key.daemon_id)
+            now = await self.coordination_now()
             if (usage is None or usage["state"] != "preparing" or usage["lease_expires_at"] < now
                     or not _usage_binding_is_null(usage)):
                 raise SandboxLeaseLost(f"usage {use.usage_id!r} is not a valid preparation owner")
@@ -899,6 +910,10 @@ class SandboxStoreMixin:
                     or start["generation_token"] != binding.generation_token
                     or start["container_id"] != binding.container_id):
                 raise SandboxBusy("the recorded start does not authorize publication")
+            if ((start_owner_token is not None and start["owner_token"] != start_owner_token)
+                    or start["owner"] != use.owner or start["usage_token"] != use.token
+                    or start["lease_expires_at"] is None or start["lease_expires_at"] < now):
+                raise SandboxLeaseLost("the start owner lost its lease before publication")
             if start["intended_name"] not in (None, binding.container_name):
                 raise SandboxBusy("the recorded start names another container")
             if sandbox_row["current_operation_id"] != start["id"]:

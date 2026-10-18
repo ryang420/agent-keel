@@ -181,7 +181,8 @@ class SandboxCoordinator:
         self._verify_observation(
             self._observed(started_outcome), started, policy, container_id=container_id,
             expected_name=target.container_name, running=True)
-        return await self.store.publish_generation(use, target, started.id)
+        return await self.store.publish_generation(
+            use, target, started.id, start_owner_token=started.owner_token)
 
     async def _dispatch(self, attempt: LifecycleAttempt,
                         action) -> tuple[LifecycleAttempt, DockerOutcome]:
@@ -218,7 +219,13 @@ class SandboxCoordinator:
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)
         saved = await self.store.record_lifecycle_result(attempt, outcome)
-        if saved.authority != "current" or saved.outcome != outcome.state:
+        if (saved.owner_token == attempt.owner_token and saved.authority == "current"
+                and saved.outcome == "dispatched"
+                and (saved.lease_expires_at is None
+                     or saved.lease_expires_at < await self.store.coordination_now())):
+            raise SandboxLeaseLost(
+                f"operation {attempt.id!r} lost its lease while the {attempt.kind} was in flight")
+        if saved.owner_token != attempt.owner_token or saved.authority != "current" or saved.outcome != outcome.state:
             raise SandboxUncertain(
                 f"the {attempt.kind} result arrived after its attempt was retired")
         if lost:
