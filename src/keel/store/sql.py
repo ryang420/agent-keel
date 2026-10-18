@@ -18,6 +18,7 @@ from keel.store.base import (
     UniqueViolation, UnknownRun,
 )
 from keel.store.migrations import migrate
+from keel.store.sandboxes import SandboxStoreMixin
 
 _IN_FLIGHT = "('queued', 'running', 'stopping')"
 
@@ -70,7 +71,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore:
+class SqlStore(SandboxStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
