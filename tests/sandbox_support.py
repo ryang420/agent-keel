@@ -330,6 +330,39 @@ async def make_claim(store, session_id: str, *, profile_id: str = "p1", sandbox:
     return claim
 
 
+# Every keel table, dependents first, so a disposable PostgreSQL database starts each test from a clean schema.
+KEEL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memories, run_events, "
+               "runs, messages, sessions, profiles, tenants, blobs")
+
+
+async def reset_postgres_schema(dsn: str) -> None:
+    """Drop keel's tables in the disposable test database named by `dsn` (never a real deployment's)."""
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(f"DROP TABLE IF EXISTS {KEEL_TABLES}")
+    finally:
+        await conn.close()
+
+
+async def wait_until(probe, task: asyncio.Task | None = None, *, seconds: float = 30.0,
+                     what: str = "the payload to become ready") -> None:
+    """Poll the async `probe` until it is true, failing at the deadline or as soon as `task` ends first.
+
+    This waits for readiness only (a file a payload wrote, a process that exists); it is never the ordering oracle.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while not await probe():
+        if task is not None and task.done():
+            await task  # surfaces the payload's own failure
+            raise AssertionError(f"the task finished before {what}")
+        if loop.time() >= deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.02)
+
+
 def absence_verified_before_create(journal: list[tuple[str, ...]], old_id: str, new_id: str) -> bool:
     """True when an exact-ID inspection reported `old_id` absent after its removal and before `new_id` was created."""
     try:

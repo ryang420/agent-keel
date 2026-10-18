@@ -28,7 +28,9 @@ from keel.sandbox.base import parse_policy
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.store import open_store
 from keel.worker import WorkerPool
-from tests.sandbox_support import ClaimedExecutor, FileDocker, write_helper_assets
+from tests.sandbox_support import (
+    ClaimedExecutor, FileDocker, absence_verified_before_create, write_helper_assets,
+)
 
 needs_subprocess = pytest.mark.skipif(os.environ.get("KEEL_TEST_SUBPROCESS") != "1",
                                       reason="set KEEL_TEST_SUBPROCESS=1")
@@ -116,11 +118,6 @@ async def wait_for_file(path: Path, child: subprocess.Popen, log: Path, seconds:
 
 async def terminal_events(store, run_id: str) -> list[str]:
     return [event.type for event in await store.events_after(run_id, 0) if event.type in TERMINAL_EVENTS]
-
-
-def absence_verified_before_create(journal, old_id: str, new_id: str) -> bool:
-    created = journal.index(("create", new_id))
-    return ("inspect", old_id, "absent") in journal[:created]
 
 
 @pytest.mark.parametrize("phase", PHASES)

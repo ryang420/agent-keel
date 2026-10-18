@@ -26,7 +26,7 @@ from keel.sandbox.base import SandboxError
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.store import open_store
 from tests.sandbox_support import (
-    LocalDocker, absence_verified_before_create, install_helper_assets, queue_run,
+    LocalDocker, absence_verified_before_create, install_helper_assets, queue_run, reset_postgres_schema, wait_until,
 )
 
 DSN = os.environ.get("KEEL_TEST_POSTGRES_DSN")
@@ -81,15 +81,7 @@ class Cluster:
 
 
 async def reset_schema() -> None:
-    import asyncpg
-
-    conn = await asyncpg.connect(DSN)
-    try:
-        await conn.execute("DROP TABLE IF EXISTS sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, "
-                           "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, "
-                           "blobs")
-    finally:
-        await conn.close()
+    await reset_postgres_schema(DSN)
 
 
 @pytest.fixture
@@ -219,6 +211,7 @@ async def test_idle_reaping_racing_a_claim_never_binds_the_removing_generation(c
             await finish(a, claim)
             claim = await a.coordinator.claim()
     assert outcomes  # which interleaving won is the database's choice; both are legal
+    print("idle reap / claim outcomes:", sorted(outcomes))
 
 
 def keel_app(store) -> httpx.AsyncClient:
@@ -276,6 +269,8 @@ async def test_a_policy_update_racing_a_claim_never_admits_the_stale_policy(clus
         old = await a.coordinator.prepare(warm.use)
         await finish(a, warm)
         await queue_run(a.store, "racing", profile_id=profile)
+        # The run is queued before the race, so the update is busy in either order (design §15 reduces this row
+        # to the enqueue race above plus the refusal, asserted below, to share the stale-policy generation).
         claim, update = await race(a.coordinator.claim, lambda: right.put(f"/v1/profiles/{profile}", json=body))
         assert update.status_code == 409 and update.json()["error"]["code"] == "sandbox_busy"  # a run exists
         assert claim is not None and claim.use is not None
@@ -402,8 +397,10 @@ async def test_an_orphan_on_one_instance_leaves_a_valid_user_on_another_running(
     command = ["sh", "-c", f'while [ ! -e "{gate}" ]; do sleep 0.02; done; echo survived']
     running = asyncio.create_task(
         b.coordinator.exec(shared, command, cwd=str(tmp_path), timeout_s=60, exec_id="x-survivor"))
-    while not backend.local._groups.get("x-survivor"):
-        await asyncio.sleep(0.01)  # wait for the survivor's process group to exist (not an ordering oracle)
+    async def survivor_started() -> bool:
+        return backend.local._groups.get("x-survivor") is not None
+
+    await wait_until(survivor_started, running, what="the survivor's process group")
 
     later = await cluster.later(LEASE + 1)
     assert await b.store.renew_usage(survivor.use, 10 * LEASE)  # B keeps renewing; A has stopped

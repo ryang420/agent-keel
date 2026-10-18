@@ -11,6 +11,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,6 +32,7 @@ jobs:
   image:
     name: image
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: test
     permissions:
       contents: read
@@ -80,6 +82,7 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: [test, image]
     permissions:
       contents: write

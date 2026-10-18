@@ -27,7 +27,7 @@ from keel.sandbox.docker import DockerSandbox
 from keel.sandbox.records import SandboxUncertain
 from keel.sandbox.runtime import helper_artifact
 from keel.store import open_store
-from tests.sandbox_support import queue_run
+from tests.sandbox_support import queue_run, reset_postgres_schema, wait_until
 
 needs_docker = pytest.mark.skipif(os.environ.get("KEEL_TEST_DOCKER") != "1", reason="set KEEL_TEST_DOCKER=1")
 DSN = os.environ.get("KEEL_TEST_POSTGRES_DSN")
@@ -111,15 +111,7 @@ async def single(request, tmp_path):
 
 
 async def reset_postgres() -> None:
-    import asyncpg
-
-    conn = await asyncpg.connect(DSN)
-    try:
-        await conn.execute("DROP TABLE IF EXISTS sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, "
-                           "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, "
-                           "blobs")
-    finally:
-        await conn.close()
+    await reset_postgres_schema(DSN)
 
 
 def coordinator_for(store, backend, owner: str, *, idle_seconds: float = 1800.0) -> SandboxCoordinator:
@@ -154,6 +146,15 @@ async def run(coordinator, bound, command: str, *, exec_id: str | None = None, t
               cwd: str = "/work", env: dict | None = None):
     return await coordinator.exec(bound, ["sh", "-c", command], cwd=cwd, timeout_s=timeout_s,
                                   exec_id=exec_id or f"x-{uuid.uuid4().hex[:12]}", env=env)
+
+
+async def file_exists(coordinator, bound, path: str) -> bool:
+    """Readiness probe for a payload marker file, read through the coordinated file helper."""
+    try:
+        await coordinator.read_file(bound, path, 10)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 async def exec_state(store, exec_id: str) -> str:
@@ -215,12 +216,7 @@ async def test_a_timeout_and_a_cancellation_end_the_whole_tree_through_the_super
 
     started = asyncio.create_task(run(coordinator, bound, "touch /work/started; sleep 3; touch /work/cancelled",
                                       exec_id="x-cancel"))
-    while True:  # readiness of the payload, not an ordering oracle: cancellation is the event under test
-        try:
-            await coordinator.read_file(bound, "/work/started", 10)
-            break
-        except FileNotFoundError:
-            await asyncio.sleep(0.05)
+    await wait_until(lambda: file_exists(coordinator, bound, "/work/started"), started)
     started.cancel()
     with pytest.raises(asyncio.CancelledError):
         await started
@@ -444,12 +440,7 @@ async def test_two_instances_share_a_generation_and_recover_an_orphan_without_to
             waiter, shared, f"touch /work/survivor-started; while [ ! -e {gate} ]; do sleep 0.05; done; "
                             "echo survived", exec_id="x-survivor"))
         await dying_coordinator.store.begin_exec(generation, "x-orphaned")  # the dying instance's last exec
-        while True:  # readiness of the survivor's payload
-            try:
-                await waiter.read_file(shared, "/work/survivor-started", 10)
-                break
-            except FileNotFoundError:
-                await asyncio.sleep(0.05)
+        await wait_until(lambda: file_exists(waiter, shared, "/work/survivor-started"), surviving)
 
         assert await waiter.store.renew_usage(survivor.use, 10 * LEASE)
         with skewed(c.store, await c.store.db.database_now() + LEASE + 1):
