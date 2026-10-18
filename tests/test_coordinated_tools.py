@@ -339,11 +339,11 @@ async def test_cancel_cleanup_without_receipt_keeps_registry_uncertain(managed):
 @pytest.mark.parametrize('valid', [True, False])
 async def test_facade_gates_docker_timeout_control_with_current_store_authority(managed, monkeypatch, valid):
     from keel.sandbox.docker import DockerSandbox
-    from tests.test_docker_operations import FakeProcess, attach, attach_spawn, receipt_json
+    from tests.test_docker_operations import FakeProcess, attach, attach_spawn, pin_identity, receipt_json
 
     facade, _, store, clock, bound, _ = managed
     docker = DockerSandbox(deployment='dep', receipt_timeout_s=0)
-    docker._identity = ('daemon-1', 'amd64')
+    pin_identity(docker, 'daemon-1')
     facade.backend = docker
     process = FakeProcess([], None)
     spawned = attach_spawn(docker, process)
@@ -387,11 +387,11 @@ async def test_facade_gates_docker_timeout_control_with_current_store_authority(
 
 async def test_missing_recorded_container_never_recreates_or_replays(managed):
     from keel.sandbox.docker import DockerSandbox
-    from tests.test_docker_operations import FakeProcess, attach, attach_spawn
+    from tests.test_docker_operations import FakeProcess, attach, attach_spawn, pin_identity
 
     facade, _, store, _, bound, _ = managed
     docker = DockerSandbox(deployment='dep', receipt_timeout_s=0)
-    docker._identity = ('daemon-1', 'amd64')
+    pin_identity(docker, 'daemon-1')
     facade.backend = docker
     process = FakeProcess([b'Error response from daemon: No such container'], 125)
     spawned = attach_spawn(docker, process)

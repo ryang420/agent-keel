@@ -161,6 +161,10 @@ async def _wait_for_status(client, profile_id: str, run_id: str, wanted: str, se
     return status
 
 
+def _labels(profile_id: str) -> tuple[tuple[str, str], ...]:
+    return (("keel.deployment", "dep"), ("keel.managed", "1"), ("keel.profile", profile_id))
+
+
 class _ServiceDocker(LocalDocker):
     """The service's coordinated backend in these tests; the legacy name-based sweeps must never run."""
 
@@ -231,9 +235,13 @@ async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_it
 
     def factory(**kwargs):
         backend = _ServiceDocker(**kwargs)
+        # More containers than one bounded batch, with the unknown one for p2 sorting last: startup keeps
+        # classifying batches until the whole inventory is covered before any sandbox admission.
+        for index in range(150):
+            backend.extra_inventory.append(ContainerObservation(
+                LOCAL_DAEMON, "0" * 60 + f"{index:04d}", f"keel-sbx-filler{index}", _labels(f"filler{index}")))
         backend.extra_inventory.append(ContainerObservation(
-            LOCAL_DAEMON, container_id(), "keel-sbx-unknown",
-            (("keel.deployment", "dep"), ("keel.managed", "1"), ("keel.profile", "p2")), running=True))
+            LOCAL_DAEMON, "f" * 64, "keel-sbx-unknown", _labels("p2"), running=True))
         backends.append(backend)
         return backend
 
@@ -246,7 +254,8 @@ async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_it
     async with app.router.lifespan_context(app):
         backend = backends[0]
         assert backend.kwargs["reap_seconds"] == 3.0
-        assert backend.inventory_calls >= 1  # the startup pass ran before workers claimed anything
+        assert backend.inventory_calls >= 2  # startup covered the whole inventory before workers started
+        assert app.state.keel.executor.coordinator.admitting()
         store = app.state.keel.store
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
                                      headers={"Authorization": "Bearer k"}) as client:
@@ -273,12 +282,14 @@ async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown
     install_helper_assets(tmp_path / "helper", monkeypatch)
     monkeypatch.setattr(service, "DockerSandbox", _ServiceDocker)
     monkeypatch.setattr(service, "MAINTENANCE_SECONDS", 0.05)
+    monkeypatch.setattr(service, "ADMISSION_RETRY_SECONDS", 0.05)
     calls: list[tuple[str, int]] = []
 
     async def reconcile_once(self, *, limit=100):
         calls.append(("reconcile", limit))
         if len(calls) == 1:
-            raise RuntimeError("the first pass fails")  # a failed pass is logged; maintenance continues
+            raise RuntimeError("the first pass fails")  # a failed attempt is logged; maintenance retries
+        self._inventory_daemon, self._inventory_pending = self._daemon_id, 0  # a complete inventory cycle
         return RecoveryReport()
 
     async def reap_idle_once(self, *, limit=100):
@@ -301,44 +312,141 @@ async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown
     assert len(calls) == stopped  # nothing runs after shutdown
 
 
-async def test_sandbox_admission_resumes_once_docker_initializes(tmp_path, monkeypatch, store):
-    from keel.sandbox import coordinator as coordinator_module
+async def test_claims_never_wait_on_docker_and_admission_opens_after_a_full_inventory(tmp_path, monkeypatch, store):
     from keel.sandbox.base import SandboxError
+    from keel.sandbox.coordinator import SandboxCoordinator
 
     class Flaky(LocalDocker):
         down = True
+        identity_calls = 0
 
         async def daemon_identity(self):
+            self.identity_calls += 1
             if self.down:
                 raise SandboxError("the daemon is down")
             return await super().daemon_identity()
 
-    monkeypatch.setattr(coordinator_module, "INITIALIZE_RETRY_S", 0.0)
     install_helper_assets(tmp_path / "helper", monkeypatch)
     backend = Flaky(daemon_id=LOCAL_DAEMON)
-    coordinator = coordinator_module.SandboxCoordinator(
+    coordinator = SandboxCoordinator(
         store, backend, deployment="dep", owner="w1", lease_seconds=30, idle_seconds=60, reap_seconds=1)
+    models = [{"provider": "fake", "model": "m"}]
+    await store.upsert_profile("boxed", models=models, sandbox={"image": "i", "workdir": "/w"}, soul="", skills=[])
+    await store.upsert_profile("chat", models=models, sandbox={}, soul="", skills=[])
+    runs = {}
+    for profile in ("boxed", "chat"):
+        await store.ensure_session(profile, profile + "-s")
+        runs[profile] = await store.create_run(
+            profile_id=profile, session_id=profile + "-s", provider="fake", model="m", reasoning_effort=None,
+            input_parts=[{"type": "text", "text": "hi"}], instructions=None)
+    claim = await coordinator.claim()  # withheld, not failed: the chat-only run is claimed without touching Docker
+    assert claim is not None and claim.run.id == runs["chat"].id and claim.use is None
+    assert backend.identity_calls == 0 and await coordinator.claim() is None
+    assert await coordinator.open_admission() is False and not coordinator.admitting()
+    backend.down = False
+    assert await coordinator.open_admission() is True and coordinator.admitting()
+    claim = await coordinator.claim()
+    assert claim is not None and claim.run.id == runs["boxed"].id and claim.use is not None
+
+
+async def test_docker_down_at_startup_keeps_sandbox_admission_closed_until_inventory_is_classified(
+        tmp_path, monkeypatch):
+    from keel import service
+    from keel.sandbox.base import SandboxError
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    monkeypatch.setattr(service, "ADMISSION_RETRY_SECONDS", 0.05)
+    state = {"down": True}
+    backends: list[_ServiceDocker] = []
+
+    class Flaky(_ServiceDocker):
+        async def daemon_identity(self):
+            if state["down"]:
+                raise SandboxError("down")
+            return await super().daemon_identity()
+
+        async def inventory(self):
+            if state["down"]:
+                raise SandboxError("down")
+            return await super().inventory()
+
+    def factory(**kwargs):
+        backend = Flaky(**kwargs)
+        backend.extra_inventory.append(ContainerObservation(
+            LOCAL_DAEMON, "f" * 64, "keel-sbx-legacy", _labels("p2"), running=True))
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(service, "DockerSandbox", factory)
+    providers = ProviderRegistry()
+    providers.register(FakeProvider())
+    sandbox = {"image": "img", "workdir": str(tmp_path / "work")}
+    app = service.create_service(_docker_settings(tmp_path), providers=providers)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
+                                     headers={"Authorization": "Bearer k"}) as client:
+            models = [{"provider": "fake", "model": "m"}]
+            for profile in ("p1", "p2"):
+                await client.put(f"/v1/profiles/{profile}", json={"models": models, "sandbox": sandbox})
+            legacy = (await client.post("/v1/profiles/p2/runs", json={
+                "input": "hi", "session_id": "s2", "provider": "fake", "model": "m"})).json()["run_id"]
+            healthy = (await client.post("/v1/profiles/p1/runs", json={
+                "input": "hi", "session_id": "s1", "provider": "fake", "model": "m"})).json()["run_id"]
+            await asyncio.sleep(0.2)
+            assert (await client.get(f"/v1/profiles/p1/runs/{healthy}")).json()["status"] == "queued"
+            state["down"] = False
+            assert await _wait_for_status(client, "p1", healthy, "completed") == "completed"
+            assert (await client.get(f"/v1/profiles/p2/runs/{legacy}")).json()["status"] == "queued"
+            row = await app.state.keel.store.db.fetchrow("SELECT state FROM sandboxes WHERE profile_id = 'p2'")
+            assert row == {"state": "blocked"} and backends[0].removed_ids == []
+
+
+async def test_a_hung_daemon_neither_stalls_startup_nor_chat_only_runs(tmp_path, monkeypatch):
+    import time
+
+    from keel import service
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    monkeypatch.setattr(service, "ADMISSION_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(service, "ADMISSION_RETRY_SECONDS", 0.05)
+
+    class Hung(_ServiceDocker):
+        async def daemon_identity(self):
+            await asyncio.Event().wait()  # a wedged daemon: the request never answers
+
+    monkeypatch.setattr(service, "DockerSandbox", Hung)
+    providers = ProviderRegistry()
+    providers.register(FakeProvider())
+    app = service.create_service(_docker_settings(tmp_path), providers=providers)
+    started = time.monotonic()
+    async with app.router.lifespan_context(app):
+        assert time.monotonic() - started < 1.0
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
+                                     headers={"Authorization": "Bearer k"}) as client:
+            await client.put("/v1/profiles/chat", json={"models": [{"provider": "fake", "model": "m"}]})
+            sent = time.monotonic()
+            run = (await client.post("/v1/profiles/chat/runs", json={
+                "input": "hi", "session_id": "s", "provider": "fake", "model": "m"})).json()["run_id"]
+            assert await _wait_for_status(client, "chat", run, "completed") == "completed"
+            assert time.monotonic() - sent < 1.0
+
+
+async def test_a_replaced_daemon_closes_sandbox_admission_for_this_process(tmp_path, monkeypatch, store):
+    from keel.sandbox.coordinator import SandboxCoordinator
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    backend = LocalDocker(daemon_id=LOCAL_DAEMON)
+    coordinator = SandboxCoordinator(
+        store, backend, deployment="dep", owner="w1", lease_seconds=30, idle_seconds=60, reap_seconds=1)
+    assert await coordinator.open_admission() is True
     await store.upsert_profile("boxed", models=[{"provider": "fake", "model": "m"}],
                                sandbox={"image": "i", "workdir": "/w"}, soul="", skills=[])
     await store.ensure_session("boxed", "s1")
-    run = await store.create_run(profile_id="boxed", session_id="s1", provider="fake", model="m",
-                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}], instructions=None)
-    assert await coordinator.claim() is None  # withheld, not failed: chat-only claims could still proceed
-    backend.down = False
-    claim = await coordinator.claim()
-    assert claim is not None and claim.run.id == run.id and claim.use is not None
-
-
-async def test_the_lifespan_closes_the_background_after_the_pool_runs(tmp_path, monkeypatch):
-    from unittest.mock import AsyncMock
-
-    from keel.background import Background
-
-    settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
-    app = create_service(settings)
-    close = AsyncMock()
-    monkeypatch.setattr(Background, "close", close)
-    async with app.router.lifespan_context(app):
-        assert isinstance(app.state.background, Background)
-    close.assert_awaited_once()
+    await store.create_run(profile_id="boxed", session_id="s1", provider="fake", model="m", reasoning_effort=None,
+                           input_parts=[{"type": "text", "text": "hi"}], instructions=None)
+    backend.daemon_id = "another-daemon"
+    await coordinator.reconcile_once()
+    assert not coordinator.admitting() and await coordinator.claim() is None
+    assert await coordinator.open_admission() is False
+    backend.daemon_id = LOCAL_DAEMON  # even the restored daemon reopens admission only after a restart
+    assert await coordinator.open_admission() is False and await coordinator.claim() is None

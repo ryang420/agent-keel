@@ -24,7 +24,10 @@ All notable changes to this project are documented here. The format follows
   list and the process-local idle reaper. `PUT /v1/profiles/{id}` returns 409 `sandbox_busy` when the effective
   sandbox policy would change while the profile has runs in progress or unreleased sandbox work; run enqueue and
   policy updates serialize on the profile row. When Docker or the sandbox helper is unavailable, sandbox runs stay
-  queued and chat-only runs proceed.
+  queued and chat-only runs proceed. Sandbox admission opens only after the instance has classified every
+  container of the deployment (bounded at startup, retried in the background), claims never wait on Docker, and
+  the Docker daemon ID is read afresh for every ownership or absence decision: a changed daemon closes admission
+  instead of making recorded containers look absent.
 
 ## [0.3.0-rc.2] - 2026-10-18
 

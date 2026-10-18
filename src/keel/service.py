@@ -26,6 +26,10 @@ log = logging.getLogger(__name__)
 # Idle and recovery scans: every pass handles a bounded batch and skips profiles another instance has locked.
 MAINTENANCE_SECONDS = 60.0
 MAINTENANCE_BATCH = 100
+# Opening sandbox admission (initialize, then classify the whole inventory) is bounded per attempt, including at
+# startup, and retried at this interval while closed. Claims never wait for it: chat-only runs proceed meanwhile.
+ADMISSION_TIMEOUT_SECONDS = 30.0
+ADMISSION_RETRY_SECONDS = 15.0
 
 
 def default_providers(settings: Settings) -> ProviderRegistry:
@@ -91,8 +95,27 @@ async def _maintenance_pass(coordinator: SandboxCoordinator) -> None:
                      ",".join(sorted(set(report.diagnostics))))
 
 
+async def _open_admission(coordinator: SandboxCoordinator) -> bool:
+    """One bounded attempt to open sandbox admission; progress made before a timeout is kept for the next one."""
+    try:
+        opened = await asyncio.wait_for(coordinator.open_admission(), ADMISSION_TIMEOUT_SECONDS)
+    except TimeoutError:
+        log.warning("opening sandbox admission timed out; sandbox runs stay queued and it is retried")
+        return False
+    except Exception:
+        log.warning("opening sandbox admission failed; sandbox runs stay queued and it is retried", exc_info=True)
+        return False
+    if opened:
+        log.info("sandbox admission is open")
+    return opened
+
+
 async def _maintain(coordinator: SandboxCoordinator) -> None:
     while True:
+        if not coordinator.admitting():
+            await asyncio.sleep(ADMISSION_RETRY_SECONDS)
+            await _open_admission(coordinator)
+            continue
         await asyncio.sleep(MAINTENANCE_SECONDS)
         await _maintenance_pass(coordinator)
 
@@ -108,18 +131,10 @@ def create_service(settings: Settings | None = None, *, providers: ProviderRegis
         app.state.background = keel.background
         try:
             if coordinator is not None:
-                # Startup reconciles inventory and the ledger before any claim; it never deletes containers based
-                # on a list of profiles with runs in flight. An unavailable daemon or helper only withholds sandbox
-                # admission (chat-only runs proceed) until a later claim or pass succeeds.
-                try:
-                    await coordinator.initialize()
-                except Exception:
-                    log.warning("sandbox admission is withheld until Docker and the sandbox helper are available",
-                                exc_info=True)
-                try:
-                    await asyncio.wait_for(_maintenance_pass(coordinator), MAINTENANCE_SECONDS)
-                except TimeoutError:
-                    log.warning("the startup sandbox reconciliation timed out; maintenance will continue it")
+                # Before workers start, classify the whole inventory and ledger (bounded); never delete containers
+                # based on a list of profiles with runs in flight. Until admission opens, sandbox runs stay queued
+                # and chat-only runs proceed; the maintenance task keeps retrying.
+                await _open_admission(coordinator)
             await pool.start()
             if coordinator is not None:
                 maintenance = asyncio.create_task(_maintain(coordinator), name="keel-sandbox-maintenance")

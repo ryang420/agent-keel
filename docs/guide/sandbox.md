@@ -71,15 +71,18 @@ change the docker client's own environment.
 
 One container serves a profile and is reused across runs and sessions. A policy can only change while the profile
 has no run in progress and no sandbox usage left (otherwise `PUT` returns 409 `sandbox_busy`); the next run then
-waits until the old container is removed and a new one is created. A container idle for `KEEL_SANDBOX_IDLE_SECONDS`
+waits until a maintenance pass removes the old container and a new one is created. Passes rotate through 100
+profile records at a time, so this takes about one minute per 200 sandbox records. A container idle for `KEEL_SANDBOX_IDLE_SECONDS`
 is removed.
 
 ## Leftovers and lost workers
 
-Each instance runs one sandbox coordinator, shared by its workers. At start, before its workers claim anything,
-it reconciles the recorded sandbox state with this deployment's containers on the configured Docker daemon; it then
-repeats a recovery pass and an idle pass about once a minute, each over at most 100 profiles, skipping profiles
-another instance is working on. Startup never removes containers because of which profiles have runs in flight:
+Each instance runs one sandbox coordinator, shared by its workers. An instance admits sandbox runs only after it has
+classified every container of this deployment on the configured Docker daemon against the recorded sandbox state,
+in batches of 100. At start it spends up to 30 seconds on this before its workers start; whatever is left continues
+in the background, retried every 15 seconds, while sandbox runs stay queued. Once admission is open it repeats a
+recovery pass and an idle pass about once a minute, each over at most 100 profiles, skipping profiles another
+instance is working on. Startup never removes containers because of which profiles have runs in flight:
 every removal is a recorded decision about one exact container ID. A container keel has no record of, or whose
 labels conflict with the record, is kept and blocks new sandbox runs for that profile until it is resolved.
 
@@ -88,9 +91,14 @@ first; the sweep then hands its sandbox usage to recovery, which drains the gene
 profile finish and then removes that exact container. No numeric process is signalled. The sweep never creates a
 container.
 
-If the Docker daemon or the sandbox helper cannot be served, the service still starts and runs chat-only profiles.
-Runs of sandbox profiles stay queued (they are never run without their tools) and can be stopped; claiming retries
-about every 15 seconds and resumes once Docker answers.
+Claims never wait for Docker. If the Docker daemon or the sandbox helper cannot be served (refused or hanging), the
+service still starts within about 30 seconds and runs chat-only profiles. Runs of sandbox profiles stay queued (they
+are never run without their tools) and can be stopped; admission is retried every 15 seconds and opens once Docker
+answers and the inventory has been classified.
+
+The daemon ID is read afresh for every ownership or absence decision. If it changes while an instance runs, that
+instance closes sandbox admission (an error is logged) and never treats the old daemon's containers as gone;
+restore the recorded daemon and restart the service.
 
 ## Coordinated recovery API
 

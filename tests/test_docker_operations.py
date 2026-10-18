@@ -74,6 +74,15 @@ class FakeDocker:
         return [list(args) for args, _ in self.calls]
 
 
+def pin_identity(backend: DockerSandbox, daemon_id: str, architecture: str = "amd64") -> None:
+    """Answer every daemon identity read with fixed values; unit tests make no info/version calls."""
+
+    async def identity() -> tuple[str, str]:
+        return daemon_id, architecture
+
+    backend.daemon_identity = identity
+
+
 def attach(backend: DockerSandbox, handler) -> FakeDocker:
     fake = FakeDocker(handler)
     backend._docker_raw = fake
@@ -84,7 +93,7 @@ def attach(backend: DockerSandbox, handler) -> FakeDocker:
 @pytest.fixture
 def backend(tmp_path) -> DockerSandbox:
     instance = DockerSandbox(deployment=DEPLOYMENT, receipt_timeout_s=0, mount_root=str(tmp_path))
-    instance._identity = (DAEMON, "amd64")  # cached daemon identity; no info/version calls in unit tests
+    pin_identity(instance, DAEMON)
     return instance
 
 
@@ -137,19 +146,57 @@ def image_volumes(volumes=None):
 # daemon_identity
 # ---------------------------------------------------------------------------
 
-async def test_daemon_identity_normalizes_and_is_cached():
+async def test_daemon_identity_reads_the_id_fresh_and_caches_only_the_architecture():
     instance = DockerSandbox(deployment=DEPLOYMENT)
     calls = []
+    current = {"id": "daemon-9"}
 
     async def raw(*args, stdin=None, timeout=60.0):
         calls.append(args)
-        return _DockerResult(0, "daemon-9\n" if args[0] == "info" else "x86_64\n")
+        return _DockerResult(0, current["id"] + "\n" if args[0] == "info" else "x86_64\n")
 
     instance._docker_raw = raw
     assert await instance.daemon_identity() == ("daemon-9", "amd64")
-    assert await instance.daemon_identity() == ("daemon-9", "amd64")
+    current["id"] = "daemon-10"  # a replaced daemon behind the same socket is noticed on the next read
+    assert await instance.daemon_identity() == ("daemon-10", "amd64")
     assert [list(call) for call in calls] == [["info", "--format", "{{.ID}}"],
-                                              ["version", "--format", "{{.Server.Arch}}"]]
+                                              ["version", "--format", "{{.Server.Arch}}"],
+                                              ["info", "--format", "{{.ID}}"]]
+
+
+async def test_a_replaced_daemon_never_turns_a_missing_container_into_absence(store, tmp_path, monkeypatch):
+    """Recovery inspects the recorded exact ID; after a daemon swap "no such container" proves nothing."""
+    from keel.sandbox.coordinator import SandboxCoordinator
+    from tests.sandbox_support import install_helper_assets, seed_profile, queue_run, seed_ready_sandbox
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    await seed_profile(store)
+    ready = await seed_ready_sandbox(store, daemon_id=DAEMON)
+    await queue_run(store, "s1")
+    claim = await store.claim_run_with_usage("w1", 30, deployment=DEPLOYMENT, daemon_id=DAEMON)
+    assert claim.use is not None
+    current = {"id": DAEMON}
+
+    def handler(args, stdin):
+        if args[0] == "info":
+            return 0, current["id"] + "\n"
+        if args[0] == "version":
+            return 0, "x86_64\n"
+        if args[0] == "ps":
+            return 0, ""
+        return 1, "Error: No such container: " + args[-1]
+
+    backend = DockerSandbox(deployment=DEPLOYMENT, receipt_timeout_s=0)
+    attach(backend, handler)
+    coordinator = SandboxCoordinator(store, backend, deployment=DEPLOYMENT, owner="w1", lease_seconds=30,
+                                     idle_seconds=60, reap_seconds=1)
+    await coordinator.initialize()
+    current["id"] = "daemon-2"
+    report = await coordinator.reconcile_once()
+    row = await store.db.fetchrow("SELECT state, container_id FROM sandboxes WHERE profile_id = 'p1'")
+    assert row == {"state": "ready", "container_id": ready["container_id"]}
+    assert (await store.get_usage(claim.use.usage_id)).state == "active"
+    assert report.blocked >= 1
 
 
 @pytest.mark.parametrize("raw", [("s390x",), ("arm64", "timeout")])
@@ -345,7 +392,7 @@ async def test_create_generation_requires_an_exact_returned_id(backend):
 
 
 async def test_create_generation_blocks_on_daemon_identity_drift(backend):
-    backend._identity = ("another-daemon", "amd64")
+    pin_identity(backend, "another-daemon")
     fake = attach(backend, _create_handler(exact_id()))
     outcome = await backend.create_generation(make_attempt("create"), policy())
     assert outcome.state == "definite_failure" and outcome.uncertain is False
@@ -515,7 +562,7 @@ async def test_install_helper_rejects_a_mismatched_artifact(backend, artifact_di
 
 
 async def test_install_helper_compares_against_the_daemon_architecture(backend, artifact_directory):
-    backend._identity = (DAEMON, "arm64")
+    pin_identity(backend, DAEMON, "arm64")
     artifact = make_artifact(artifact_directory, arch="arm64")
     container = exact_id()
     handler, captured = install_handler(container, artifact.path.read_bytes())
@@ -943,7 +990,7 @@ async def test_exec_bound_cancellation_cancels_through_the_helper_and_propagates
 
 
 async def test_exec_bound_blocks_on_daemon_identity_drift(backend):
-    backend._identity = ("another-daemon", "amd64")
+    pin_identity(backend, "another-daemon")
     ticket = make_ticket()
     attach_spawn(backend, FakeProcess([b"x"], 0))
     attach(backend, lambda args, stdin: (0, receipt_json(ticket)))

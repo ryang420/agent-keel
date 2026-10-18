@@ -357,7 +357,8 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             if body.get(field) is not None and not isinstance(body[field], str):
                 raise ApiError(400, "invalid_input", f"{field} must be a string.")
         session_id = _check_id(body.get("session_id") or f"ses_{uuid.uuid4().hex}", "session_id")
-        # Refuse before creating anything, so a refused run leaves no empty session behind.
+        # Refuse what can be checked before creating anything. A rare race with a profile update that disables the
+        # model or deletes the profile is refused under the guard below and can leave the new session empty.
         existing = await keel_.store.get_session(profile_id, session_id)
         if existing is not None and await keel_.store.active_run_for_session(session_id) is not None:
             raise ApiError(409, "session_busy", "This session already has a run in progress.")

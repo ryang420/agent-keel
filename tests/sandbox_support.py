@@ -266,7 +266,7 @@ async def local_coordinator(store, directory: Path, monkeypatch, *, owner: str =
     coordinator = SandboxCoordinator(
         store, backend, deployment=LOCAL_DEPLOYMENT, owner=owner, lease_seconds=lease_seconds,
         idle_seconds=idle_seconds, reap_seconds=1.0, bus=bus)
-    await coordinator.initialize()
+    assert await coordinator.open_admission()  # initialized, with its (empty) inventory classified
     return coordinator, backend
 
 

@@ -17,7 +17,7 @@ async def recovery(store, clock, helper_assets):
     backend = FakeDocker()
     coordinator = SandboxCoordinator(store, backend, deployment="dep", owner="w1", lease_seconds=30,
                                      idle_seconds=10, reap_seconds=1)
-    await coordinator.initialize()
+    assert await coordinator.open_admission()
     return coordinator, backend, store, clock
 
 

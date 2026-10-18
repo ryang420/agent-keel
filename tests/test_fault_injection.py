@@ -255,6 +255,7 @@ async def test_a_container_removed_between_two_tool_calls_fails_the_run_and_reco
     backend = DockerSandbox(deployment=f"test-{uuid.uuid4().hex[:8]}", kill_grace_s=1.0)
     coordinator = SandboxCoordinator(store, backend, deployment=backend.deployment, owner="w1", lease_seconds=30.0,
                                      idle_seconds=1800.0, reap_seconds=5.0)
+    assert await coordinator.open_admission()
 
     class RemoveBeforeTheSecondCall(FakeProvider):
         async def stream(self, request):

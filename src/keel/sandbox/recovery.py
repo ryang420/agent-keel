@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
+from keel.sandbox.base import SandboxError
 from keel.sandbox.records import DockerOutcome, RecoveryAction, RecoveryReport, SandboxKey
+
+log = logging.getLogger(__name__)
 
 
 def confirmed_absent(outcome: DockerOutcome) -> bool:
@@ -39,8 +43,12 @@ class SandboxRecoveryMixin:
         inspected = removed = released = blocked = 0
         diagnostics = []
         if not idle:
+            self._inventory_pending = None
             try:
                 daemon_id, _ = await self.backend.daemon_identity()
+                if self._daemon_id is not None and daemon_id != self._daemon_id:
+                    # Still classify: records naming the initialized daemon are blocked as a daemon mismatch.
+                    self._note_daemon_changed(daemon_id)
                 inventory = await self.backend.inventory()
                 verified: list[SandboxKey] = []
                 cursor = getattr(self, "_inventory_cursor", "")
@@ -49,12 +57,19 @@ class SandboxRecoveryMixin:
                             + [item for item in ordered if item.container_id <= cursor])[:limit]
                 if selected:
                     self._inventory_cursor = selected[-1].container_id
+                seen_daemon, seen = self._inventory_seen
+                if seen_daemon != daemon_id:
+                    seen = set()
+                    self._inventory_seen = (daemon_id, seen)
                 for observation in selected:
                     if dict(observation.labels).get("keel.deployment") != self.deployment:
+                        seen.add(observation.container_id)
                         continue
                     inspected += 1
                     action = await self.store.classify_inventory(
                         observation, owner=self.owner, lease_seconds=self.lease_seconds)
+                    if action is None or action.action != "skipped":
+                        seen.add(observation.container_id)  # classified now; a locked profile is retried later
                     if action is not None and action.action == "protected":
                         verified.append(action.key)
                     elif action is not None and action.action == "blocked":
@@ -80,6 +95,15 @@ class SandboxRecoveryMixin:
                             continue
                         if confirmed_daemon == daemon_id:
                             await self.store.clear_resolved_inventory_block(key, daemon_id=daemon_id)
+                # A cycle completes only when every container of a fresh listing has been classified and the
+                # daemon identity read after the scan is still the one read before it.
+                after, _ = await self.backend.daemon_identity()
+                if after != daemon_id:
+                    self._note_daemon_changed(after)
+                    raise SandboxError("the Docker daemon identity changed during the inventory")
+                self._inventory_pending = sum(1 for item in inventory if item.container_id not in seen)
+                if not self._inventory_pending:
+                    self._inventory_daemon = daemon_id
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -117,6 +141,14 @@ class SandboxRecoveryMixin:
         unresolved, oldest = await self.store.recovery_diagnostics(self.deployment)
         return RecoveryReport(inspected=inspected, removed=removed, released=released, blocked=blocked,
                               unresolved=unresolved, oldest_age_s=oldest, diagnostics=tuple(diagnostics[:100]))
+
+    def _note_daemon_changed(self, observed: str) -> None:
+        """Close sandbox admission for this process: a different daemon never proves the old containers absent,
+        and replacing the daemon requires an explicit stopped-service reconciliation (design section 14)."""
+        if not self._daemon_changed:
+            log.error("the Docker daemon identity changed from %r to %r; sandbox admission is closed until the "
+                      "recorded daemon is restored and the service restarted", self._daemon_id, observed)
+        self._daemon_changed = True
 
     async def _recover_key(self, key: SandboxKey) -> tuple[int, int, int, int]:
         row, before = await self.store.recovery_snapshot(key)

@@ -253,7 +253,7 @@ class DockerSandbox:
         self._last_used: dict[str, float] = {}  # container -> clock() of its last use
         self._clients: dict[str, asyncio.subprocess.Process] = {}  # exec_id -> its docker exec client
         self._locks: dict[str, asyncio.Lock] = {}
-        self._identity: tuple[str, str] | None = None  # (daemon ID, normalized architecture)
+        self._architecture: str | None = None  # the daemon's normalized architecture; its ID is never cached
         self._identity_lock = asyncio.Lock()
 
     def container_name(self, profile_id: str) -> str:
@@ -426,23 +426,26 @@ class DockerSandbox:
         return container_id
 
     async def daemon_identity(self) -> tuple[str, str]:
-        """The daemon ID and normalized architecture, cached after the first successful read."""
-        if self._identity is not None:
-            return self._identity
-        async with self._identity_lock:
-            if self._identity is None:
-                info = await self._docker_raw("info", "--format", "{{.ID}}")
-                daemon_id = info.output.strip()
-                if (info.timed_out or info.code != 0 or not daemon_id or len(daemon_id) > 128
-                        or any(character.isspace() for character in daemon_id)):
-                    raise SandboxError(
-                        "could not read the Docker daemon identity: " + info.output.strip()[:200])
-                version = await self._docker_raw("version", "--format", "{{.Server.Arch}}")
-                if version.timed_out or version.code != 0:
-                    raise SandboxError(
-                        "could not read the Docker daemon architecture: " + version.output.strip()[:200])
-                self._identity = (daemon_id, normalize_architecture(version.output.strip()))
-        return self._identity
+        """The daemon ID, read afresh on every call, and the normalized architecture, cached after the first read.
+
+        The ID is evidence for ownership and absence decisions (a replaced daemon behind the same socket must never
+        make a recorded container look absent), so it is never cached; a read failure raises and callers treat it
+        as uncertain.
+        """
+        info = await self._docker_raw("info", "--format", "{{.ID}}")
+        daemon_id = info.output.strip()
+        if (info.timed_out or info.code != 0 or not daemon_id or len(daemon_id) > 128
+                or any(character.isspace() for character in daemon_id)):
+            raise SandboxError("could not read the Docker daemon identity: " + info.output.strip()[:200])
+        if self._architecture is None:
+            async with self._identity_lock:
+                if self._architecture is None:
+                    version = await self._docker_raw("version", "--format", "{{.Server.Arch}}")
+                    if version.timed_out or version.code != 0:
+                        raise SandboxError(
+                            "could not read the Docker daemon architecture: " + version.output.strip()[:200])
+                    self._architecture = normalize_architecture(version.output.strip())
+        return daemon_id, self._architecture
 
     async def _recorded_key_diagnostic(self, key: SandboxKey) -> str | None:
         daemon_id, _ = await self.daemon_identity()

@@ -29,6 +29,7 @@ async def test_a_live_run_uses_the_terminal(store):
                                sandbox={"image": image, "workdir": "/work"})
     coordinator = SandboxCoordinator(store, backend, deployment=backend.deployment, owner="w1",
                                      lease_seconds=30.0, idle_seconds=1800.0, reap_seconds=5.0)
+    assert await coordinator.open_admission()
     executor = RunExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator)
     try:
         await store.ensure_session("p1", "s1")

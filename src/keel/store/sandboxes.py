@@ -1535,7 +1535,8 @@ class SandboxStoreMixin:
         profile = key.profile_id
         async with self.coordination_guard(profile, skip_locked=True) as available:
             if not available:
-                return None
+                # Another instance holds the profile: nothing was classified, so an inventory cycle stays open.
+                return RecoveryAction(key, "skipped", container_id=observation.container_id)
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox = await self._lock_sandbox(key, lock)

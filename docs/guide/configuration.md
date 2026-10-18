@@ -28,8 +28,8 @@ service key are required; an invalid value stops the service at start with a mes
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). With `docker`, an unreachable daemon or missing sandbox helper keeps sandbox runs queued while chat-only profiles still run. |
-| `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (checked about once a minute). |
+| `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). With `docker`, an unreachable daemon or missing sandbox helper keeps sandbox runs queued while chat-only profiles still run; sandbox runs are admitted once the deployment's containers have been classified. |
+| `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (passes run about once a minute over 100 profile records each, so removal can lag by about one minute per 200 records). |
 | `KEEL_SANDBOX_REAP_SECONDS` | `5` | Maximum time to prove sandbox process descendants have exited after the termination grace period; an unproven cleanup leaves the generation blocked for recovery. Must be above 0 and at most 86400 (the supervisor's one-day bound). |
 | `KEEL_SANDBOX_MOUNT_ROOT` | unset | Deployment-owned host directory for profile bind mounts. A profile may mount only paths under `<root>/<sha256(profile_id)>`; the operator must create and protect that directory. Without this setting, bind mounts are refused. |
 | `KEEL_DOCKER` | `docker` | The docker CLI to run. |

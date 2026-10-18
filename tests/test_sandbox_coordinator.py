@@ -57,7 +57,7 @@ async def coordination(store, clock, helper_assets):
     coordinator = SandboxCoordinator(
         store, backend, deployment=DEPLOYMENT, owner="w1", lease_seconds=30.0, idle_seconds=1800.0,
         reap_seconds=5.0)
-    await coordinator.initialize()
+    assert await coordinator.open_admission()
     return coordinator, backend, store, clock
 
 
