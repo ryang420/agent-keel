@@ -31,6 +31,8 @@ from keel.store.sql import SqlStore
 log = logging.getLogger(__name__)
 # Docker transport allowed for one helper control request on top of the TERM grace and the descendant reap timeout.
 CONTROL_TRANSPORT_S = 15.0
+# While Docker or the helper cannot be served, claims retry initialization at most this often.
+INITIALIZE_RETRY_S = 15.0
 
 
 def _observe(control: asyncio.Future) -> None:
@@ -60,6 +62,7 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         self._daemon_id: str | None = None
         self._artifact: HelperArtifact | None = None
         self._initialize_lock = asyncio.Lock()
+        self._initialize_retry_at: float | None = None  # loop time before which claims skip initialization
         # One cancellation control per (usage, exec), fixed at its first request and bounded by this budget.
         # Later requests join it (or read its outcome); entries go when the usage is released.
         self.control_budget_s = getattr(backend, "kill_grace_s", 3.0) + reap_seconds + CONTROL_TRANSPORT_S
@@ -98,11 +101,36 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
 
         The published helper digest is part of compatibility: a generation carrying another helper binary is left
         for recovery to replace rather than reused with the wrong cleanup evidence.
+
+        While the daemon or the helper artifact cannot be served, sandbox admission is withheld rather than failed:
+        sandbox-enabled runs stay queued (they never run tool-less) and chat-only runs are still claimed. Failed
+        initialization is retried at most every `INITIALIZE_RETRY_S` seconds.
         """
-        daemon_id, artifact = await self._ready()
+        try:
+            daemon_id, artifact = await self._ready_for_claim()
+        except SandboxError:
+            return await self.store.claim_run_with_usage(
+                self.owner, self.lease_seconds, deployment=self.deployment, daemon_id=None)
         return await self.store.claim_run_with_usage(
             self.owner, self.lease_seconds, deployment=self.deployment, daemon_id=daemon_id,
             helper_digest=artifact.sha256)
+
+    async def _ready_for_claim(self) -> tuple[str, HelperArtifact]:
+        now = asyncio.get_running_loop().time()
+        if self._initialize_retry_at is not None and now < self._initialize_retry_at:
+            raise SandboxError("sandbox admission is withheld until the coordinator initializes")
+        try:
+            ready = await self._ready()
+        except SandboxError:
+            if self._initialize_retry_at is None:
+                log.warning("sandbox admission is withheld: the Docker daemon or the sandbox helper is unavailable",
+                            exc_info=True)
+            self._initialize_retry_at = asyncio.get_running_loop().time() + INITIALIZE_RETRY_S
+            raise
+        if self._initialize_retry_at is not None:
+            log.info("sandbox admission resumed")
+            self._initialize_retry_at = None
+        return ready
 
     async def renew_usage(self, use: UseHandle) -> LeaseStamp | None:
         """Renew one matching, unexpired usage; a lost or released usage is never revived."""

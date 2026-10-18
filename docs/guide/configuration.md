@@ -15,7 +15,7 @@ service key are required; an invalid value stops the service at start with a mes
 | `KEEL_PORT` | `8700` | Listen port. If you change it, change the image's `HEALTHCHECK` too. |
 | `KEEL_WORKERS` | `4` | Runs executed at the same time by this instance. |
 | `KEEL_MAX_RUNNING` | `10` | Queued plus running runs allowed across all instances. A new run over the cap gets 429 `at_capacity`. |
-| `KEEL_LEASE_SECONDS` | `30` | Run lease. A worker renews it while it runs; a run whose lease lapses fails as `worker_lost`. Postgres queries time out after a third of the lease (at least 5 s), so one stalled query cannot outlast a renewal. |
+| `KEEL_LEASE_SECONDS` | `30` | Run lease, also used for sandbox usage and lifecycle-operation leases. A worker renews it every third of the lease while it runs; a run whose lease lapses fails as `worker_lost`. Postgres queries time out after a third of the lease (at least 5 s), so one stalled query cannot outlast a renewal. |
 | `KEEL_MAX_ITERATIONS` | `60` | Tool iterations one run may take. After that, one final model call without tools asks for a summary (so at most N + 1 model calls). |
 | `KEEL_COMPRESSION_THRESHOLD` | `0.75` | Fraction of the model's context window at which a session is compacted before the next model call: old tool results and images are replaced by placeholders, and if that is not enough the middle of the conversation is summarized. Above 0, at most 1. |
 | `KEEL_EVENT_RETENTION_DAYS` | `7` | Days a finished run's events are kept, a positive integer. An hourly task deletes older ones (runs, their output and messages are kept). |
@@ -28,12 +28,12 @@ service key are required; an invalid value stops the service at start with a mes
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). |
+| `KEEL_SANDBOX` | `docker` | `docker`, or `none` to run without tools (the model only answers). With `docker`, an unreachable daemon or missing sandbox helper keeps sandbox runs queued while chat-only profiles still run. |
 | `KEEL_SANDBOX_IDLE_SECONDS` | `1800` | A sandbox container idle this long is removed (checked about once a minute). |
 | `KEEL_SANDBOX_REAP_SECONDS` | `5` | Maximum time to prove sandbox process descendants have exited after the termination grace period; an unproven cleanup leaves the generation blocked for recovery. Must be above 0 and at most 86400 (the supervisor's one-day bound). |
 | `KEEL_SANDBOX_MOUNT_ROOT` | unset | Deployment-owned host directory for profile bind mounts. A profile may mount only paths under `<root>/<sha256(profile_id)>`; the operator must create and protect that directory. Without this setting, bind mounts are refused. |
 | `KEEL_DOCKER` | `docker` | The docker CLI to run. |
-| `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. At start, containers carrying this label are removed (except those of profiles with a run in flight), so it must be unique per deployment that shares a Docker daemon. |
+| `KEEL_DEPLOYMENT` | `keel` | A label (1-40 lowercase letters, digits or `-`, starting with a letter or digit) put on this deployment's containers. Sandbox records and reconciliation are scoped to it, so it must be unique per deployment that shares a Docker daemon. |
 
 See [sandbox.md](sandbox.md) for the profile's sandbox policy.
 

@@ -17,6 +17,8 @@ from keel.store.base import (
     Run, RunTransition, Session, SessionBusy, SessionNotFound, StoredMessage, TerminalEventType, TitleInUse,
     UniqueViolation, UnknownRun,
 )
+from keel.sandbox.base import SandboxPolicy
+from keel.sandbox.records import SandboxBusy
 from keel.store.migrations import migrate
 from keel.store.sandboxes import SandboxStoreMixin
 
@@ -119,6 +121,51 @@ class SqlStore(SandboxStoreMixin):
     async def profile_sandboxes(self) -> list[tuple[str, dict]]:
         rows = await self.db.fetch("SELECT id, sandbox FROM profiles")
         return [(row["id"], json.loads(row["sandbox"])) for row in rows]
+
+    async def assert_sandbox_policy_change_allowed(self, profile_id: str, *, previous: SandboxPolicy | None,
+                                                   proposed: SandboxPolicy | None) -> None:
+        """Raise SandboxBusy when an effective sandbox policy change could race work on this profile.
+
+        The caller holds the profile guard (after the global mount-policy lock when it takes one). An equivalent
+        canonical policy is always allowed; enabling or clearing a sandbox is a change. A change is busy while a run
+        is queued/running/stopping, a usage is unreleased (including an orphan awaiting recovery), an execution is
+        unresolved, or a lifecycle operation that can still affect an executable generation is unresolved. A retired
+        create that was never started is stopped-only: neither its tombstone nor its exact-ID cleanup is busy.
+        """
+        if (previous.digest() if previous else None) == (proposed.digest() if proposed else None):
+            return
+        if await self.db.fetchrow(
+                f"SELECT id FROM runs WHERE profile_id = ? AND status IN {_IN_FLIGHT} LIMIT 1", profile_id):
+            raise SandboxBusy("the profile has runs in progress")
+        if await self.db.fetchrow(
+                "SELECT id FROM sandbox_uses WHERE profile_id = ? AND state <> 'released' LIMIT 1", profile_id):
+            raise SandboxBusy("the profile has unreleased sandbox usage")
+        if await self.db.fetchrow(
+                "SELECT id FROM sandbox_execs WHERE profile_id = ? AND state IN ('pending', 'running', 'uncertain') "
+                "LIMIT 1", profile_id):
+            raise SandboxBusy("the profile has unresolved sandbox executions")
+        operations = await self.db.fetch(
+            "SELECT id, kind, authority, outcome, original_create_operation_id, cleanup_operation_id, "
+            "confirmed_absent_at FROM sandbox_operations WHERE profile_id = ?", profile_id)
+        by_id = {row["id"]: row for row in operations}
+
+        def stopped_only(create: dict | None) -> bool:
+            if create is None or create["kind"] != "create" or create["authority"] != "retired":
+                return False
+            return not any(row["kind"] == "start" and row["original_create_operation_id"] == create["id"]
+                           and row["outcome"] != "definite_failure" and row["confirmed_absent_at"] is None
+                           for row in operations)
+
+        for row in operations:
+            if row["outcome"] not in ("planned", "dispatched", "uncertain") or row["confirmed_absent_at"] is not None:
+                continue
+            if row["kind"] == "create" and stopped_only(row):
+                continue
+            create = by_id.get(row["original_create_operation_id"])
+            if (row["kind"] == "remove" and stopped_only(create)
+                    and create["cleanup_operation_id"] == row["id"]):
+                continue
+            raise SandboxBusy("the profile has unresolved sandbox lifecycle work")
 
     # memory
 

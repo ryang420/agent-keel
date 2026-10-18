@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format follows
   `sandbox_unavailable` after its tool result is stored, instead of recreating the container mid-run; recovery
   replaces the generation before the next run. Cancellation sends one bounded supervisor control request, with no
   hard-kill retry, and the lease sweeper hands lost runs to coordinator recovery instead of signalling a command.
+- The service runs one sandbox coordinator per instance for claims, startup inventory reconciliation and
+  minute-by-minute bounded recovery/idle passes, replacing the startup removal of containers by in-flight profile
+  list and the process-local idle reaper. `PUT /v1/profiles/{id}` returns 409 `sandbox_busy` when the effective
+  sandbox policy would change while the profile has runs in progress or unreleased sandbox work; run enqueue and
+  policy updates serialize on the profile row. When Docker or the sandbox helper is unavailable, sandbox runs stay
+  queued and chat-only runs proceed.
 
 ## [0.3.0-rc.2] - 2026-10-18
 

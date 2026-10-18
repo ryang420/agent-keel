@@ -251,14 +251,15 @@ class SandboxStoreMixin:
     # admission
 
     async def claim_run_with_usage(self, owner: str, lease_seconds: float, *, deployment: str,
-                                   daemon_id: str, helper_digest: str | None = None) -> RunClaim | None:
+                                   daemon_id: str | None, helper_digest: str | None = None) -> RunClaim | None:
         """Claim one queued run and reserve its usage under the profile guard.
 
         Candidates are read without write locks. Each profile is tried with `SKIP LOCKED`, so a blocked or busy
         profile at the head of the queue does not stop a healthy later profile. A ready compatible generation is
         shared immediately; otherwise this claim becomes the only preparation owner. `helper_digest` is the
         caller's local helper artifact: a generation published with another one is not shared, and recovery must
-        replace it. A NULL published digest (a row from before helper recording) stays usable.
+        replace it. A NULL published digest (a row from before helper recording) stays usable. A None `daemon_id`
+        means sandbox admission is withheld (Docker or the helper cannot be served): only chat-only runs are claimed.
         """
         async with self.db.transaction():
             candidates = await self.db.fetch(
@@ -279,6 +280,8 @@ class SandboxStoreMixin:
                         f"SELECT * FROM sandboxes WHERE {_SANDBOX_IDENTITY}",
                         deployment, candidate["profile_id"])
                     now = await self.coordination_now()
+                    if sandbox and daemon_id is None:
+                        continue
                     if sandbox:
                         # A record naming another daemon is a configuration/migration conflict, never an absence.
                         # It only matters to a sandboxed profile; chat-only runs need no Docker coordination.

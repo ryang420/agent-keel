@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from keel.config import tenant_id_for
 from keel.models import part_to_dict, ImagePart, TextPart
 from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict, profile_mount_root
+from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
     ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse,
 )
@@ -261,6 +262,8 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
         Omitted fields reset to empty values, and an omitted memory flag is false. Validate the body and sandbox
         policy before saving, returning 400 invalid_input on invalid configuration and the saved profile on success.
+        A change of the effective sandbox policy while the profile has runs in progress or unreleased sandbox work is
+        409 sandbox_busy, and nothing is applied.
         """
         body = await _json_body(request)
         _check_id(profile_id, "profile")
@@ -290,35 +293,44 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
         store = k(request).store
         async with store.db.transaction():
+            # Lock order: the global mount-policy lock, then the profile guard that serializes this comparison and
+            # update with enqueue, claims and sandbox admission (design section 6).
             if store.db.dialect == "postgres":
                 await store.db.execute("SELECT pg_advisory_xact_lock(7312100002)")
-            existing = await store.get_profile(profile_id)
-            if existing is not None and existing.tenant_id != request.state.tenant_id:
-                raise ApiError(404, "profile_not_found", "No such profile.")
-            policy = parse_policy(sandbox, mount_root) if sandbox else None
-            if existing is not None and existing.sandbox:
+            async with store.profile_guard(profile_id):
+                existing = await store.get_profile(profile_id)
+                if existing is not None and existing.tenant_id != request.state.tenant_id:
+                    raise ApiError(404, "profile_not_found", "No such profile.")
+                policy = parse_policy(sandbox, mount_root) if sandbox else None
+                previous = None
+                if existing is not None and existing.sandbox:
+                    try:
+                        previous = parse_policy(existing.sandbox, mount_root)
+                    except PolicyError as exc:
+                        raise ApiError(409, "sandbox_requires_migration",
+                                       "The existing sandbox mount policy needs an operator migration.") from exc
+                    new_mounts = policy.mounts if policy is not None else ()
+                    if previous.mounts and new_mounts != previous.mounts:
+                        raise ApiError(400, "invalid_input", "A profile's sandbox mounts cannot be changed.")
+                if sandbox:
+                    others = []
+                    for other_id, raw in await store.profile_sandboxes():
+                        if other_id != profile_id and raw:
+                            others.append(parse_policy(raw, "/"))
+                    conflict = private_mount_conflict(policy, others)
+                    if conflict is not None:
+                        raise ApiError(400, "invalid_input", conflict)
                 try:
-                    old_mounts = parse_policy(existing.sandbox, mount_root).mounts
-                except PolicyError as exc:
-                    raise ApiError(409, "sandbox_requires_migration",
-                                   "The existing sandbox mount policy needs an operator migration.") from exc
-                new_mounts = policy.mounts if policy is not None else ()
-                if old_mounts and new_mounts != old_mounts:
-                    raise ApiError(400, "invalid_input", "A profile's sandbox mounts cannot be changed.")
-            if sandbox:
-                others = []
-                for other_id, raw in await store.profile_sandboxes():
-                    if other_id != profile_id and raw:
-                        others.append(parse_policy(raw, "/"))
-                conflict = private_mount_conflict(policy, others)
-                if conflict is not None:
-                    raise ApiError(400, "invalid_input", conflict)
-            try:
-                profile = await store.upsert_profile(
-                    profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
-                    sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
-            except ProfileTenantMismatch:
-                raise ApiError(404, "profile_not_found", "No such profile.")
+                    await store.assert_sandbox_policy_change_allowed(profile_id, previous=previous, proposed=policy)
+                except SandboxBusy as exc:
+                    raise ApiError(409, "sandbox_busy", "The sandbox policy cannot change while the profile has "
+                                                        "runs or sandbox work in progress.") from exc
+                try:
+                    profile = await store.upsert_profile(
+                        profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
+                        sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
+                except ProfileTenantMismatch:
+                    raise ApiError(404, "profile_not_found", "No such profile.")
         return {"id": profile.id, "models": profile.models, "sandbox": profile.sandbox, "soul": profile.soul,
                 "skills": profile.skills, "memory": profile.memory, "updated_at": profile.updated_at}
 
@@ -363,10 +375,18 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                     blob = await keel_.store.put_blob(profile_id, session_id, part["media_type"], part["data_b64"])
                     blobs.append(blob)
                     parts[index] = part_to_dict(ImagePart(part["media_type"], blob_id=blob))
-            run = await keel_.store.create_run(
-                profile_id=profile_id, session_id=session_id, provider=provider, model=model,
-                reasoning_effort=body.get("reasoning_effort"), input_parts=parts,
-                instructions=body.get("instructions"))
+            async with keel_.store.profile_guard(profile_id) as exists:
+                # Final validation and insertion under the profile guard: a concurrent policy update either
+                # committed first and is validated against here, or sees this queued run and returns 409.
+                current = await keel_.store.get_profile(profile_id) if exists else None
+                if current is None or current.tenant_id != request.state.tenant_id:
+                    raise ApiError(404, "profile_not_found", "No such profile.")
+                if {"provider": provider, "model": model} not in current.models:
+                    raise ApiError(400, "model_not_allowed", "That model is not enabled for this profile.")
+                run = await keel_.store.create_run(
+                    profile_id=profile_id, session_id=session_id, provider=provider, model=model,
+                    reasoning_effort=body.get("reasoning_effort"), input_parts=parts,
+                    instructions=body.get("instructions"))
         except BaseException as exc:
             # Whatever went wrong after the first blob was written, no blob may be left without a run.
             if blobs:

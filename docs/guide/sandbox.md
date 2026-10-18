@@ -69,27 +69,36 @@ Every container is started with:
 Policy `env` values reach the container through a private temporary env file, never on a command line, and never
 change the docker client's own environment.
 
-One container serves a profile and is reused across runs and sessions; if the policy changes, a new container
-replaces it once no command is running in the old one. A container idle for `KEEL_SANDBOX_IDLE_SECONDS` is removed.
+One container serves a profile and is reused across runs and sessions. A policy can only change while the profile
+has no run in progress and no sandbox usage left (otherwise `PUT` returns 409 `sandbox_busy`); the next run then
+waits until the old container is removed and a new one is created. A container idle for `KEEL_SANDBOX_IDLE_SECONDS`
+is removed.
 
 ## Leftovers and lost workers
 
-At start, keel removes this deployment's containers (those labelled with its `KEEL_DEPLOYMENT`), except those of
-profiles with a run queued, running or stopping on any instance, so a restart does not pull a container from under
-a run another instance is executing. A removed container is created again on its next use.
+Each instance runs one sandbox coordinator, shared by its workers. At start, before its workers claim anything,
+it reconciles the recorded sandbox state with this deployment's containers on the configured Docker daemon; it then
+repeats a recovery pass and an idle pass about once a minute, each over at most 100 profiles, skipping profiles
+another instance is working on. Startup never removes containers because of which profiles have runs in flight:
+every removal is a recorded decision about one exact container ID. A container keel has no record of, or whose
+labels conflict with the record, is kept and blocks new sandbox runs for that profile until it is resolved.
 
 When a worker is lost (its instance crashed or stalled and the run's lease lapsed), the run fails as `worker_lost`
-and the command it left running is killed: keel reaches the profile's container and kills the command's whole
-process group. This works only when the instance that notices shares the lost worker's Docker daemon (or host, for
-the local sandbox); otherwise the command runs until its own timeout. The sweep never creates a container.
+first; the sweep then hands its sandbox usage to recovery, which drains the generation while other runs of the
+profile finish and then removes that exact container. No numeric process is signalled. The sweep never creates a
+container.
+
+If the Docker daemon or the sandbox helper cannot be served, the service still starts and runs chat-only profiles.
+Runs of sandbox profiles stay queued (they are never run without their tools) and can be stopped; claiming retries
+about every 15 seconds and resumes once Docker answers.
 
 ## Coordinated recovery API
 
 `SandboxCoordinator.reconcile_once()` reconciles persisted usage and lifecycle attempts, including stopped
 containers and late results from retired creates. `recover_run(run_id)` performs the same guarded recovery for
-one run; `reap_idle_once()` removes safely released idle generations. These interfaces are available for service
-integration; the worker and API have not yet switched to them. Each scan takes bounded batches (at most 100
-profile candidates and 100 inventory observations), rotating through retained tombstones between passes.
+one run; `reap_idle_once()` removes safely released idle generations. The service runs these passes (see above)
+and the lease sweep calls `recover_run`. Each scan takes bounded batches (at most 100 profile candidates and 100
+inventory observations), rotating through retained tombstones between passes.
 
 Expired usage drains its generation while other valid users can finish. Recovery removes only recorded exact
 container IDs and confirms absence before releasing bound orphan usage or replacing a generation. A never-bound

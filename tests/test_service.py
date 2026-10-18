@@ -5,12 +5,16 @@ import httpx
 from keel.config import ServiceCredential, Settings
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
+from keel.sandbox.records import ContainerObservation
 from keel.service import create_service
+from tests.sandbox_support import LOCAL_DAEMON, LocalDocker, container_id, install_helper_assets
 
 
 async def test_the_service_starts_runs_and_stops(tmp_path):
+    # Docker mode with no reachable Docker: chat-only runs still start and complete.
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{tmp_path / 'keel.sqlite3'}", workers=1)
+                        database_url=f"sqlite:///{tmp_path / 'keel.sqlite3'}", workers=1,
+                        docker=str(tmp_path / "no-docker"))
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     app = create_service(settings, providers=providers)
@@ -136,30 +140,193 @@ async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monke
             await close()
 
 
-async def test_start_spares_the_sandboxes_of_profiles_with_a_run_in_flight(tmp_path):
-    from keel.store import open_store
+def _docker_settings(tmp_path, **extra) -> Settings:
+    return Settings(credentials=(ServiceCredential(1, "k"),), database_url=f"sqlite:///{tmp_path / 'k.db'}",
+                    workers=1, docker=str(tmp_path / "no-docker"), deployment="dep", **extra)
 
-    db = tmp_path / "keel.sqlite3"
-    store = await open_store(f"sqlite:///{db}")
-    await store.upsert_profile("p2", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
-    await store.db.execute("UPDATE profiles SET tenant_id = ? WHERE id = ?", 1, "p2")
-    await store.ensure_session("p2", "s1")
-    await store.create_run(profile_id="p2", session_id="s1", provider="fake", model="m", reasoning_effort=None,
-                           input_parts=[{"type": "text", "text": "hi"}], instructions=None)
-    await store.close()
-    log = tmp_path / "docker.log"
-    fake = tmp_path / "docker"
-    fake.write_text('#!/bin/sh\necho "$@" >> "' + str(log) + '"\n'
-                    'case "$1" in ps) printf "c1 p1\\nc2 p2\\n";; esac\nexit 0\n')
-    fake.chmod(0o755)
-    settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{db}", workers=1, docker=str(fake))
+
+async def _close(closables) -> None:
+    for item in closables:
+        close = getattr(item, "aclose", None) or getattr(item, "close")
+        await close()
+
+
+async def _wait_for_status(client, profile_id: str, run_id: str, wanted: str, seconds: float = 5.0) -> str:
+    status = None
+    for _ in range(int(seconds / 0.02)):
+        status = (await client.get(f"/v1/profiles/{profile_id}/runs/{run_id}")).json()["status"]
+        if status == wanted:
+            break
+        await asyncio.sleep(0.02)
+    return status
+
+
+class _ServiceDocker(LocalDocker):
+    """The service's coordinated backend in these tests; the legacy name-based sweeps must never run."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(daemon_id=LOCAL_DAEMON)
+        self.kwargs = kwargs
+        self.extra_inventory: list[ContainerObservation] = []
+        self.inventory_calls = 0
+
+    async def inventory(self):
+        self.inventory_calls += 1
+        return [*await super().inventory(), *self.extra_inventory]
+
+    async def remove_orphans(self, keep=frozenset()):
+        raise AssertionError("startup must not remove containers by an in-flight profile list")
+
+    async def reap_idle(self):
+        raise AssertionError("idle reaping is the coordinator's")
+
+
+async def test_build_wires_one_coordinator_into_the_executor_and_the_pool(tmp_path):
+    from keel.sandbox.coordinator import SandboxCoordinator
+    from keel.service import build
+
+    settings = _docker_settings(tmp_path, lease_seconds=45.0, sandbox_reap_seconds=7.0, sandbox_idle_seconds=99.0)
+    keel, pool, closables, coordinator = await build(settings)
+    try:
+        assert isinstance(coordinator, SandboxCoordinator)
+        assert keel.executor.coordinator is coordinator and pool.coordinator is coordinator
+        assert coordinator.bus is keel.bus and coordinator.store is keel.store
+        # One lease length for the run claim, the usage and the lifecycle operations.
+        assert coordinator.lease_seconds == pool.lease_seconds == 45.0
+        assert coordinator.reap_seconds == coordinator.backend.reap_seconds == 7.0
+        assert coordinator.idle_seconds == 99.0
+        assert (coordinator.owner, coordinator.deployment) == (settings.instance_id, "dep")
+    finally:
+        await _close(closables)
+
+
+async def test_sandboxed_runs_wait_while_chat_only_runs_proceed_when_docker_cannot_initialize(tmp_path):
+    settings = _docker_settings(tmp_path)
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     app = create_service(settings, providers=providers)
     async with app.router.lifespan_context(app):
-        pass
-    assert "rm -f c1" in log.read_text().splitlines()
+        store = app.state.keel.store
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
+                                     headers={"Authorization": "Bearer k"}) as client:
+            models = [{"provider": "fake", "model": "m"}]
+            await client.put("/v1/profiles/boxed", json={"models": models, "sandbox": {"image": "i", "workdir": "/w"}})
+            await client.put("/v1/profiles/chat", json={"models": models})
+            boxed = (await client.post("/v1/profiles/boxed/runs", json={
+                "input": "hi", "session_id": "s1", "provider": "fake", "model": "m"})).json()["run_id"]
+            chat = (await client.post("/v1/profiles/chat/runs", json={
+                "input": "hi", "session_id": "s2", "provider": "fake", "model": "m"})).json()["run_id"]
+            assert await _wait_for_status(client, "chat", chat, "completed") == "completed"
+            # The sandboxed run at the head of the queue waits for sandbox admission; it never runs tool-less.
+            assert (await client.get(f"/v1/profiles/boxed/runs/{boxed}")).json()["status"] == "queued"
+            assert (await store.get_session("boxed", "s1")).system_prompt is None
+            assert (await client.post(f"/v1/profiles/boxed/runs/{boxed}/stop")).json()["status"] == "cancelled"
+
+
+async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_its_profile(tmp_path, monkeypatch):
+    from keel import service
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    backends: list[_ServiceDocker] = []
+
+    def factory(**kwargs):
+        backend = _ServiceDocker(**kwargs)
+        backend.extra_inventory.append(ContainerObservation(
+            LOCAL_DAEMON, container_id(), "keel-sbx-unknown",
+            (("keel.deployment", "dep"), ("keel.managed", "1"), ("keel.profile", "p2")), running=True))
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(service, "DockerSandbox", factory)
+    settings = _docker_settings(tmp_path, sandbox_reap_seconds=3.0)
+    providers = ProviderRegistry()
+    providers.register(FakeProvider())
+    sandbox = {"image": "img", "workdir": str(tmp_path / "work")}
+    app = create_service(settings, providers=providers)
+    async with app.router.lifespan_context(app):
+        backend = backends[0]
+        assert backend.kwargs["reap_seconds"] == 3.0
+        assert backend.inventory_calls >= 1  # the startup pass ran before workers claimed anything
+        store = app.state.keel.store
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
+                                     headers={"Authorization": "Bearer k"}) as client:
+            models = [{"provider": "fake", "model": "m"}]
+            for profile in ("p1", "p2"):
+                await client.put(f"/v1/profiles/{profile}", json={"models": models, "sandbox": sandbox})
+            blocked = (await client.post("/v1/profiles/p2/runs", json={
+                "input": "hi", "session_id": "s2", "provider": "fake", "model": "m"})).json()["run_id"]
+            healthy = (await client.post("/v1/profiles/p1/runs", json={
+                "input": "hi", "session_id": "s1", "provider": "fake", "model": "m"})).json()["run_id"]
+            assert await _wait_for_status(client, "p1", healthy, "completed") == "completed"
+            assert (await client.get(f"/v1/profiles/p2/runs/{blocked}")).json()["status"] == "queued"
+            row = await store.db.fetchrow("SELECT state, error_code FROM sandboxes WHERE profile_id = 'p2'")
+            assert row == {"state": "blocked", "error_code": "sandbox_inventory_conflict"}
+            # Unknown inventory is preserved as evidence, never removed by name, age or a stale profile list.
+            assert backend.removed_ids == [] and backend.calls.count("create") == 1
+
+
+async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown(tmp_path, monkeypatch):
+    from keel import service
+    from keel.sandbox.coordinator import SandboxCoordinator
+    from keel.sandbox.records import RecoveryReport
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    monkeypatch.setattr(service, "DockerSandbox", _ServiceDocker)
+    monkeypatch.setattr(service, "MAINTENANCE_SECONDS", 0.05)
+    calls: list[tuple[str, int]] = []
+
+    async def reconcile_once(self, *, limit=100):
+        calls.append(("reconcile", limit))
+        if len(calls) == 1:
+            raise RuntimeError("the first pass fails")  # a failed pass is logged; maintenance continues
+        return RecoveryReport()
+
+    async def reap_idle_once(self, *, limit=100):
+        calls.append(("idle", limit))
+        return RecoveryReport()
+
+    monkeypatch.setattr(SandboxCoordinator, "reconcile_once", reconcile_once)
+    monkeypatch.setattr(SandboxCoordinator, "reap_idle_once", reap_idle_once)
+    app = create_service(_docker_settings(tmp_path))
+    async with app.router.lifespan_context(app):
+        for _ in range(100):
+            if calls.count(("idle", 100)) >= 2:
+                break
+            await asyncio.sleep(0.02)
+    stopped = len(calls)
+    await asyncio.sleep(0.15)
+    assert calls[0] == ("reconcile", 100)
+    assert calls.count(("reconcile", 100)) >= 2 and calls.count(("idle", 100)) >= 2
+    assert set(calls) == {("reconcile", 100), ("idle", 100)}
+    assert len(calls) == stopped  # nothing runs after shutdown
+
+
+async def test_sandbox_admission_resumes_once_docker_initializes(tmp_path, monkeypatch, store):
+    from keel.sandbox import coordinator as coordinator_module
+    from keel.sandbox.base import SandboxError
+
+    class Flaky(LocalDocker):
+        down = True
+
+        async def daemon_identity(self):
+            if self.down:
+                raise SandboxError("the daemon is down")
+            return await super().daemon_identity()
+
+    monkeypatch.setattr(coordinator_module, "INITIALIZE_RETRY_S", 0.0)
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    backend = Flaky(daemon_id=LOCAL_DAEMON)
+    coordinator = coordinator_module.SandboxCoordinator(
+        store, backend, deployment="dep", owner="w1", lease_seconds=30, idle_seconds=60, reap_seconds=1)
+    await store.upsert_profile("boxed", models=[{"provider": "fake", "model": "m"}],
+                               sandbox={"image": "i", "workdir": "/w"}, soul="", skills=[])
+    await store.ensure_session("boxed", "s1")
+    run = await store.create_run(profile_id="boxed", session_id="s1", provider="fake", model="m",
+                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}], instructions=None)
+    assert await coordinator.claim() is None  # withheld, not failed: chat-only claims could still proceed
+    backend.down = False
+    claim = await coordinator.claim()
+    assert claim is not None and claim.run.id == run.id and claim.use is not None
 
 
 async def test_the_lifespan_closes_the_background_after_the_pool_runs(tmp_path, monkeypatch):

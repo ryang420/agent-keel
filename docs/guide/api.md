@@ -63,6 +63,12 @@ Errors have one shape, with a machine-readable code:
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 
+A replacement that changes the effective sandbox policy is refused with 409 `sandbox_busy` while the profile has a
+run queued, running or stopping, or sandbox work that has not been cleaned up yet; retry once it has finished.
+Policies are compared after normalisation, so resubmitting an equivalent policy (for example with default values
+spelled out) is not a change, and other fields can still be updated while runs are in progress. Omitting `sandbox`
+clears it, and enabling or clearing a sandbox counts as a change.
+
 ## Starting a run
 
 `POST /v1/profiles/{profile_id}/runs`:
@@ -187,6 +193,7 @@ not answer (rate limit, server error, timeout) is 503 `unavailable`.
 | 401 | `unauthorized` | Missing or wrong key. |
 | 404 | `profile_not_found`, `session_not_found`, `run_not_found` | No such object. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |
+| 409 | `sandbox_busy` | `PUT /v1/profiles/{id}` would change the effective sandbox policy (including enabling or clearing it) while the profile has a queued, running or stopping run, unreleased sandbox usage, or unresolved sandbox work. Nothing in the request is applied. |
 | 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |
 | 409 | `title_in_use` | Another session already has that title. |
 | 422 | `access_denied`, `not_found`, `unsupported` | `/v1/models/verify`: the model is unusable (no access, unknown id, or the provider refused the test request). |
