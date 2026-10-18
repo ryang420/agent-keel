@@ -14,6 +14,7 @@ publication here, and its exact target must be reconciled or removed before anyt
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from keel.sandbox.base import (
     CoordinatedSandboxBackend, ExecFileIO, ExecResult, PolicyError, SandboxError, parse_policy,
@@ -25,6 +26,8 @@ from keel.sandbox.records import (
 )
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION, HelperArtifact, helper_artifact
 from keel.store.sql import SqlStore
+
+log = logging.getLogger(__name__)
 
 
 class SandboxCoordinator(ExecFileIO):
@@ -132,10 +135,10 @@ class SandboxCoordinator(ExecFileIO):
             try:
                 await self.kill_tree(sandbox, exec_id)
             except Exception:
-                await self.store.mark_exec_uncertain(ticket, "cancel_cleanup_unverified")
+                await self._try_mark_exec_uncertain(ticket, "cancel_cleanup_unverified")
             raise
         except Exception as exc:
-            await self.store.mark_exec_uncertain(ticket, "dispatch_or_cleanup_unverified")
+            await self._try_mark_exec_uncertain(ticket, "dispatch_or_cleanup_unverified")
             raise SandboxUncertain("the sandbox execution outcome is uncertain") from exc
 
     def _require_bound(self, sandbox: BoundSandbox) -> None:
@@ -144,6 +147,14 @@ class SandboxCoordinator(ExecFileIO):
         self._require_handle(sandbox.use)
         if sandbox.profile_id != sandbox.use.key.profile_id:
             raise SandboxLeaseLost("the sandbox belongs to another usage profile")
+
+    async def _try_mark_exec_uncertain(self, ticket: ExecTicket, reason: str) -> None:
+        """Retain the primary failure if persistence is unavailable; the committed registry still protects it."""
+        try:
+            await self.store.mark_exec_uncertain(ticket, reason)
+        except Exception:
+            log.warning("could not persist uncertainty for sandbox exec %s; durable execution evidence retained",
+                        ticket.exec_id)
 
     async def _finish_exec(self, sandbox: BoundSandbox, ticket: ExecTicket,
                            receipt: CleanupReceipt) -> None:
@@ -161,15 +172,20 @@ class SandboxCoordinator(ExecFileIO):
         """Resolve current authority from durable identities; successful signal delivery alone proves nothing."""
         await self._ready()
         self._require_bound(sandbox)
-        ticket = await self.store.resolve_exec(sandbox, exec_id)
+        try:
+            ticket = await self.store.resolve_exec(sandbox, exec_id)
+        except SandboxError:
+            raise  # a genuine lease/binding rejection retains its authority failure type
+        except Exception as exc:
+            raise SandboxUncertain("the sandbox execution authority could not be verified") from exc
         try:
             receipt = await self.backend.control_exec(ticket, cancel=True)
             await self._finish_exec(sandbox, ticket, receipt)
         except asyncio.CancelledError:
-            await self.store.mark_exec_uncertain(ticket, "control_cancelled")
+            await self._try_mark_exec_uncertain(ticket, "control_cancelled")
             raise
         except Exception as exc:
-            await self.store.mark_exec_uncertain(ticket, "control_or_cleanup_unverified")
+            await self._try_mark_exec_uncertain(ticket, "control_or_cleanup_unverified")
             raise SandboxUncertain("the sandbox cancellation outcome is uncertain") from exc
 
     async def release(self, use: UseHandle, *, abandon_preparation: bool = False) -> bool:

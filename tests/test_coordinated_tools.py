@@ -466,3 +466,112 @@ async def test_script_cleanup_uncertainty_does_not_replace_cancellation(managed)
     with pytest.raises(asyncio.CancelledError):
         await task
     assert await facade.release(bound.use) is False
+
+
+@pytest.mark.parametrize('entrypoint', ['facade', 'tool'])
+async def test_dispatch_ack_loss_with_store_down_preserves_sandbox_failure(managed, monkeypatch, entrypoint):
+    facade, backend, store, _, bound, _ = managed
+    backend.failure = RuntimeError('dispatch acknowledgement lost')
+    attempts = []
+
+    async def unavailable(*args):
+        attempts.append(args)
+        raise ConnectionError('coordination store unavailable')
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store, 'mark_exec_uncertain', unavailable)
+        fault.setattr(store, 'resolve_exec', unavailable)
+        if entrypoint == 'facade':
+            with pytest.raises(SandboxUncertain) as failure:
+                await facade.exec(bound, ['true'], cwd='/', timeout_s=1, exec_id='lost-ack')
+            assert isinstance(failure.value.__cause__, RuntimeError)
+        else:
+            outcome = await invoke(managed, 'terminal', command='true')
+            assert outcome.error and isinstance(outcome.sandbox_error, SandboxUncertain)
+    assert len(backend.exec_calls) == 1 and backend.control_calls == []
+    assert len(attempts) == 1  # one best-effort mark; never replay dispatch or persistence
+    ticket = backend.exec_calls[0][0]
+    row = await store.db.fetchrow('SELECT state FROM sandbox_execs WHERE id = ?', ticket.exec_id)
+    assert row['state'] == 'pending'
+    assert await facade.release(bound.use) is False
+
+
+@pytest.mark.parametrize('entrypoint', ['facade', 'tool'])
+async def test_cancel_with_store_down_preserves_cancellation_and_pending_evidence(managed, monkeypatch, entrypoint):
+    facade, backend, store, _, bound, _ = managed
+    backend.block = asyncio.Event()
+    attempts = []
+
+    async def unavailable(*args):
+        attempts.append(args)
+        raise ConnectionError('coordination store unavailable')
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store, 'resolve_exec', unavailable)
+        fault.setattr(store, 'mark_exec_uncertain', unavailable)
+        if entrypoint == 'facade':
+            call = facade.exec(bound, ['bash', '-c', 'true'], cwd='/', timeout_s=60, exec_id='cancel-db-down')
+        else:
+            call = invoke(managed, 'terminal', command='true')
+        task = asyncio.create_task(call)
+        await asyncio.wait_for(backend.block.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert backend.control_calls == [] and len(backend.exec_calls) == 1
+    assert len(attempts) == 2  # failed authority resolution and one failed uncertainty record
+    ticket = backend.exec_calls[0][0]
+    row = await store.db.fetchrow('SELECT state FROM sandbox_execs WHERE id = ?', ticket.exec_id)
+    assert row['state'] == 'pending'
+    assert await facade.release(bound.use) is False
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+async def test_control_with_failed_uncertainty_record_preserves_primary_failure(managed, monkeypatch, cancelled):
+    facade, backend, store, _, bound, _ = managed
+    ticket = await store.begin_exec(bound, 'control-db-down')
+
+    async def unavailable(*args):
+        raise ConnectionError('coordination store unavailable')
+
+    async def lost_control(*args, **kwargs):
+        if cancelled:
+            raise asyncio.CancelledError
+        raise RuntimeError('control acknowledgement lost')
+
+    backend.control_exec = lost_control
+    with monkeypatch.context() as fault:
+        fault.setattr(store, 'mark_exec_uncertain', unavailable)
+        with pytest.raises(asyncio.CancelledError if cancelled else SandboxUncertain):
+            await facade.kill_tree(bound, ticket.exec_id)
+    row = await store.db.fetchrow('SELECT state FROM sandbox_execs WHERE id = ?', ticket.exec_id)
+    assert row['state'] == 'pending'
+    assert await facade.release(bound.use) is False
+
+
+async def test_control_store_outage_is_typed_without_signalling(managed, monkeypatch):
+    facade, backend, store, _, bound, _ = managed
+    ticket = await store.begin_exec(bound, 'unverified-authority')
+
+    async def unavailable(*args):
+        raise ConnectionError('coordination store unavailable')
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store, 'resolve_exec', unavailable)
+        with pytest.raises(SandboxUncertain) as failure:
+            await facade.kill_tree(bound, ticket.exec_id)
+        assert isinstance(failure.value.__cause__, ConnectionError)
+    assert backend.control_calls == []
+    assert await facade.release(bound.use) is False
+
+
+async def test_pre_admission_store_error_is_not_suppressed(managed, monkeypatch):
+    facade, backend, store, _, bound, _ = managed
+
+    async def rejected(*args):
+        raise RuntimeError('unrelated admission failure')
+
+    monkeypatch.setattr(store, 'begin_exec', rejected)
+    with pytest.raises(RuntimeError, match='unrelated admission failure'):
+        await facade.exec(bound, ['true'], cwd='/', timeout_s=1, exec_id='not-admitted')
+    assert backend.exec_calls == [] and backend.control_calls == []
