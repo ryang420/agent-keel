@@ -8,7 +8,8 @@ import pytest
 
 from keel.sandbox.base import parse_policy
 from keel.sandbox.records import (
-    ContainerObservation, DockerOutcome, SandboxBinding, SandboxBusy, SandboxLeaseLost, UsageBinding, UseHandle,
+    ContainerObservation, DockerOutcome, SandboxBinding, SandboxBusy, SandboxKey, SandboxLeaseLost, UsageBinding,
+    UseHandle,
 )
 from keel.store import open_store
 from tests.sandbox_support import (
@@ -639,3 +640,167 @@ async def test_store_methods_never_await_a_backend_inside_a_transaction(store):
     # Task 2's store has no Docker/model calls; every transaction closes before control returns to the caller.
     assert probe.depth == 0
     assert all(depth == 0 for _, depth in probe.backend_observations)
+
+
+async def _prepared(store, claim):
+    """Drive create, install and start to definite successes, ready for conditional publication."""
+    create, target = await _created(store, claim)
+    install = await store.begin_lifecycle(
+        claim.use, "install", target=target, create_operation_id=create.id, lease_seconds=30)
+    assert await store.authorize_dispatch(install) is True
+    await store.record_lifecycle_result(
+        install, DockerOutcome(state="succeeded", observation=ContainerObservation(
+            daemon_id=DAEMON, container_id=target.container_id, container_name=target.container_name,
+            running=False)))
+    start = await store.begin_lifecycle(
+        claim.use, "start", target=target, create_operation_id=create.id, lease_seconds=30)
+    assert await store.authorize_dispatch(start) is True
+    started = await store.record_lifecycle_result(
+        start, DockerOutcome(state="succeeded", observation=ContainerObservation(
+            daemon_id=DAEMON, container_id=target.container_id, container_name=target.container_name,
+            running=True)))
+    assert started.outcome == "succeeded"
+    return create, target, started
+
+
+async def _sandbox(store):
+    return await store.db.fetchrow(
+        "SELECT * FROM sandboxes WHERE deployment = ? AND profile_id = ?", DEPLOYMENT, "p1")
+
+
+async def test_publication_binds_the_usage_and_records_the_ready_generation(store):
+    claim = await make_claim(store, "s1")
+    create, target, start = await _prepared(store, claim)
+
+    bound = await store.publish_generation(claim.use, target, start.id)
+
+    assert bound.binding == target
+    assert bound.use == claim.use
+    usage = await store.get_usage(claim.use.usage_id)
+    assert usage.state == "active"
+    assert usage.binding == UsageBinding(
+        target.generation, target.generation_token, target.container_id, target.container_name)
+    row = await _sandbox(store)
+    assert row["state"] == "ready"
+    assert row["generation"] == target.generation
+    assert row["generation_token"] == target.generation_token
+    assert row["container_id"] == target.container_id
+    assert row["container_name"] == target.container_name
+    assert row["policy_digest"] == target.policy.digest()
+    assert row["helper_digest"] == target.helper_digest
+    assert row["helper_protocol"] == 1
+    assert row["current_operation_id"] is None and row["idle_since"] is None
+    assert (await store.db.fetchrow(
+        "SELECT COUNT(*) AS n FROM sandboxes WHERE state = 'ready'"))["n"] == 1
+    assert (await store.get_operation(create.id)).outcome == "succeeded"
+
+
+async def test_publication_requires_a_still_valid_unbound_preparation_usage(store):
+    claim = await make_claim(store, "s1")
+    create, target, start = await _prepared(store, claim)
+
+    stale = replace(claim.use, token="0" * 32)
+    with pytest.raises(SandboxLeaseLost):
+        await store.publish_generation(stale, target, start.id)
+
+    expired = replace(claim.use)
+    await store.db.execute(
+        "UPDATE sandbox_uses SET lease_expires_at = ? WHERE id = ?",
+        await store.db.database_now() - 1, claim.use.usage_id)
+    with pytest.raises(SandboxLeaseLost):
+        await store.publish_generation(expired, target, start.id)
+
+    await store.db.execute(
+        "UPDATE sandbox_uses SET lease_expires_at = ? WHERE id = ?",
+        await store.db.database_now() + 60, claim.use.usage_id)
+    await store.publish_generation(claim.use, target, start.id)
+    with pytest.raises(SandboxLeaseLost):  # a second publication is not a preparation owner
+        await store.publish_generation(claim.use, target, start.id)
+
+
+async def test_publication_requires_a_succeeded_current_exact_start(store):
+    claim = await make_claim(store, "s1")
+    create, target = await _created(store, claim)
+    install = await store.begin_lifecycle(
+        claim.use, "install", target=target, create_operation_id=create.id, lease_seconds=30)
+    assert await store.authorize_dispatch(install) is True
+    await store.record_lifecycle_result(install, DockerOutcome(state="succeeded"))
+
+    planned = await store.begin_lifecycle(
+        claim.use, "start", target=target, create_operation_id=create.id, lease_seconds=30)
+    with pytest.raises(SandboxBusy):  # never authorized
+        await store.publish_generation(claim.use, target, planned.id)
+
+    assert await store.authorize_dispatch(planned) is True
+    await store.record_lifecycle_result(planned, DockerOutcome(state="uncertain", diagnostic="timed out"))
+    with pytest.raises(SandboxBusy):
+        await store.publish_generation(claim.use, target, planned.id)
+
+    await store.db.execute(
+        "UPDATE sandbox_operations SET outcome = 'succeeded' WHERE id = ?", planned.id)
+    with pytest.raises(SandboxBusy):  # an unknown start id authorizes nothing
+        await store.publish_generation(claim.use, target, "op_missing")
+    await store.db.execute(
+        "UPDATE sandbox_operations SET authority = 'retired', retired_at = ? WHERE id = ?",
+        await store.db.database_now(), planned.id)
+    with pytest.raises(SandboxBusy):
+        await store.publish_generation(claim.use, target, planned.id)
+    assert (await _sandbox(store))["state"] == "creating"
+    assert (await store.get_usage(claim.use.usage_id)).state == "preparing"
+
+
+async def test_a_stale_publication_cannot_clear_a_newer_generation(store):
+    claim = await make_claim(store, "s1")
+    create, target, start = await _prepared(store, claim)
+    newer_id = container_id()
+    await store.db.execute(
+        "UPDATE sandboxes SET generation = generation + 1, generation_token = ?, container_id = ?, "
+        "container_name = ?, state = 'ready' WHERE deployment = ? AND profile_id = ?",
+        "1" * 32, newer_id, "keel-sbx-newer", DEPLOYMENT, "p1")
+    before = await _sandbox(store)
+
+    with pytest.raises(SandboxBusy):
+        await store.publish_generation(claim.use, target, start.id)
+
+    assert await _sandbox(store) == before
+    usage = await store.get_usage(claim.use.usage_id)
+    assert usage.state == "preparing" and usage.binding is None
+    mismatched = replace(target, container_id=container_id())
+    with pytest.raises(SandboxBusy):
+        await store.publish_generation(claim.use, mismatched, start.id)
+
+
+async def test_published_generation_reconstruction_checks_daemon_policy_and_helper(store):
+    await seed_profile(store)
+    generation = await seed_ready_sandbox(store, helper_digest="sha256:test-helper")
+    policy = parse_policy(DEFAULT_SANDBOX, mount_root="/")
+    key = SandboxKey(DEPLOYMENT, "p1", DAEMON)
+
+    binding = await store.get_published_generation(key, policy)
+    assert binding == _binding(generation)
+
+    other_daemon = SandboxKey(DEPLOYMENT, "p1", "daemon-2")
+    assert await store.get_published_generation(other_daemon, policy) is None
+    other_policy = parse_policy({"image": "other", "workdir": "/w"}, mount_root="/")
+    assert await store.get_published_generation(key, other_policy) is None
+
+    await store.db.execute(
+        "UPDATE sandboxes SET helper_protocol = 2 WHERE deployment = ? AND profile_id = ?",
+        DEPLOYMENT, "p1")
+    assert await store.get_published_generation(key, policy) is None
+
+    await store.db.execute(
+        "UPDATE sandboxes SET helper_protocol = NULL, policy_digest = 'not-a-digest' "
+        "WHERE deployment = ? AND profile_id = ?", DEPLOYMENT, "p1")
+    assert await store.get_published_generation(key, policy) is None
+
+
+async def test_a_ready_generation_with_a_null_helper_record_is_still_reconstructible(store):
+    await seed_profile(store)
+    generation = await seed_ready_sandbox(store)
+    policy = parse_policy(DEFAULT_SANDBOX, mount_root="/")
+
+    binding = await store.get_published_generation(SandboxKey(DEPLOYMENT, "p1", DAEMON), policy)
+
+    assert binding is not None and binding.helper_digest == ""
+    assert binding.container_id == generation["container_id"]

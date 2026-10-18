@@ -15,12 +15,13 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from keel.models import Usage
-from keel.sandbox.base import PolicyError, parse_policy
+from keel.sandbox.base import PolicyError, SandboxPolicy, parse_policy
 from keel.sandbox.records import (
     MAX_DIAGNOSTIC_CHARS, BoundSandbox, CleanupReceipt, DockerOutcome, ExecTicket, LeaseStamp, LifecycleAttempt,
     RecoveryAction, RunClaim, SandboxBinding, SandboxBusy, SandboxKey, SandboxLeaseLost, SandboxUsage, UsageBinding,
     UseHandle,
 )
+from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION
 from keel.store.base import Run, UniqueViolation
 
 _PREPARATION_KINDS = ("create", "install", "start")
@@ -215,12 +216,14 @@ class SandboxStoreMixin:
     # admission
 
     async def claim_run_with_usage(self, owner: str, lease_seconds: float, *, deployment: str,
-                                   daemon_id: str) -> RunClaim | None:
+                                   daemon_id: str, helper_digest: str | None = None) -> RunClaim | None:
         """Claim one queued run and reserve its usage under the profile guard.
 
         Candidates are read without write locks. Each profile is tried with `SKIP LOCKED`, so a blocked or busy
         profile at the head of the queue does not stop a healthy later profile. A ready compatible generation is
-        shared immediately; otherwise this claim becomes the only preparation owner.
+        shared immediately; otherwise this claim becomes the only preparation owner. `helper_digest` is the
+        caller's local helper artifact: a generation published with another one is not shared, and recovery must
+        replace it. A NULL published digest (a row from before helper recording) stays usable.
         """
         async with self.db.transaction():
             candidates = await self.db.fetch(
@@ -277,7 +280,8 @@ class SandboxStoreMixin:
                     use = None
                     if sandbox:
                         use = await self._reserve_usage(
-                            updated, sandbox, sandbox_row, owner, deployment, daemon_id, now, expires_at)
+                            updated, sandbox, sandbox_row, owner, deployment, daemon_id, now, expires_at,
+                            helper_digest)
                     return RunClaim(_run(updated), use, LeaseStamp(now, expires_at))
             return None
 
@@ -288,11 +292,15 @@ class SandboxStoreMixin:
             run_id, profile_id)
 
     async def _reserve_usage(self, run_row: dict, sandbox: dict, sandbox_row: dict | None, owner: str,
-                             deployment: str, daemon_id: str, now: float, expires_at: float) -> UseHandle:
+                             deployment: str, daemon_id: str, now: float, expires_at: float,
+                             helper_digest: str | None) -> UseHandle:
         digest = _effective_digest(sandbox)
         ready = (sandbox_row is not None and sandbox_row["state"] == "ready"
                  and sandbox_row["daemon_id"] == daemon_id and digest is not None
                  and sandbox_row["policy_digest"] == digest
+                 and (sandbox_row["helper_protocol"] is None
+                      or sandbox_row["helper_protocol"] == HELPER_PROTOCOL_VERSION)
+                 and (helper_digest is None or sandbox_row["helper_digest"] in (None, helper_digest))
                  and sandbox_row["generation_token"] is not None
                  and sandbox_row["container_id"] is not None and sandbox_row["container_name"] is not None)
         usage_id = "use_" + uuid.uuid4().hex
@@ -827,10 +835,13 @@ class SandboxStoreMixin:
                 "SELECT * FROM sandbox_operations WHERE id = ?", attempt.id)
             if current is None:
                 raise SandboxLeaseLost(f"operation {attempt.id!r} no longer exists")
-            if current["owner_token"] != attempt.owner_token or discovered is None:
+            if current["owner_token"] != attempt.owner_token:
                 return _attempt(current)
+            # Keep the late diagnostic as evidence even without a discovered container; the first recorded
+            # message stands, and authority and outcome are never touched here.
             evidence = await self.db.fetchrow(
                 "UPDATE sandbox_operations SET "
+                "result_message = CASE WHEN result_message IS NULL THEN ? ELSE result_message END, "
                 "container_id = CASE WHEN container_id IS NULL THEN ? ELSE container_id END, "
                 "discovered_container_id = CASE WHEN discovered_container_id IS NULL THEN ? "
                 "ELSE discovered_container_id END, updated_at = ? "
@@ -838,9 +849,87 @@ class SandboxStoreMixin:
                 "AND (CAST(? AS TEXT) IS NULL OR container_id IS NULL OR container_id = ?) "
                 "AND (CAST(? AS TEXT) IS NULL OR discovered_container_id IS NULL "
                 "OR discovered_container_id = ?) RETURNING *",
-                discovered, discovered, now, attempt.id, attempt.owner_token, discovered, discovered,
-                discovered, discovered)
+                _bounded(outcome.diagnostic), discovered, discovered, now, attempt.id, attempt.owner_token,
+                discovered, discovered, discovered, discovered)
             return _attempt(evidence if evidence is not None else current)
+
+    async def publish_generation(self, use: UseHandle, binding: SandboxBinding,
+                                 start_operation_id: str) -> BoundSandbox:
+        """Publish one verified preparation as the profile's current usable generation.
+
+        Everything is rechecked under the profile guard: the preparing usage still holds its lease and is unbound,
+        the sandbox still creates this exact generation, and both the original create and the recorded start are
+        current, succeeded attempts against this target. A stale caller publishes nothing; the conditional updates
+        and their rollback leave another generation's identity, pointer and valid usages untouched.
+        """
+        async with self.profile_guard(use.key.profile_id) as available:
+            if not available:
+                raise SandboxBusy(f"profile {use.key.profile_id!r} is unavailable")
+            lock = self._lock_suffix()
+            now = await self.coordination_now()
+            sandbox_row = await self._lock_sandbox(use.key, lock)
+            operations = await self._lock_operations(use.key, lock)
+            usage = await self.db.fetchrow(
+                f"SELECT * FROM sandbox_uses WHERE {_USAGE_IDENTITY}{lock}", use.usage_id, use.token, use.owner,
+                use.key.deployment, use.key.profile_id, use.key.daemon_id)
+            if (usage is None or usage["state"] != "preparing" or usage["lease_expires_at"] < now
+                    or not _usage_binding_is_null(usage)):
+                raise SandboxLeaseLost(f"usage {use.usage_id!r} is not a valid preparation owner")
+            if (sandbox_row is None or sandbox_row["daemon_id"] != use.key.daemon_id
+                    or sandbox_row["state"] != "creating"
+                    or sandbox_row["generation"] != binding.generation
+                    or sandbox_row["generation_token"] != binding.generation_token
+                    or sandbox_row["container_id"] is not None
+                    or sandbox_row["container_name"] is not None):
+                raise SandboxBusy("the sandbox is not creating this generation")
+            create_id = usage["create_operation_id"]
+            create = next((row for row in operations if row["id"] == create_id), None)
+            if (create is None or create["kind"] != "create" or create["authority"] != "current"
+                    or create["outcome"] != "succeeded" or create["usage_id"] != usage["id"]
+                    or create["generation"] != binding.generation
+                    or create["generation_token"] != binding.generation_token
+                    or create["container_id"] != binding.container_id):
+                raise SandboxBusy("the original create does not authorize this generation")
+            start = next((row for row in operations if row["id"] == start_operation_id), None)
+            if (start is None or start["kind"] != "start" or start["authority"] != "current"
+                    or start["outcome"] != "succeeded"
+                    or start["original_create_operation_id"] != create["id"]
+                    or start["usage_id"] != usage["id"]
+                    or start["generation"] != binding.generation
+                    or start["generation_token"] != binding.generation_token
+                    or start["container_id"] != binding.container_id):
+                raise SandboxBusy("the recorded start does not authorize publication")
+            if start["intended_name"] not in (None, binding.container_name):
+                raise SandboxBusy("the recorded start names another container")
+            if sandbox_row["current_operation_id"] != start["id"]:
+                raise SandboxBusy("another operation is current for this generation")
+            if any(row["kind"] in ("install", "start") and row["authority"] == "current"
+                   and row["outcome"] in ("planned", "dispatched") for row in operations):
+                raise SandboxBusy("another preparation step is still in flight")
+            bound_usage = await self.db.fetchrow(
+                "UPDATE sandbox_uses SET state = 'active', generation = ?, generation_token = ?, container_id = ?, "
+                "container_name = ? WHERE id = ? AND token = ? AND owner = ? AND deployment = ? AND profile_id = ? "
+                "AND daemon_id = ? AND state = 'preparing' AND generation IS NULL AND generation_token IS NULL "
+                "AND container_id IS NULL AND container_name IS NULL AND lease_expires_at >= ? RETURNING id",
+                binding.generation, binding.generation_token, binding.container_id, binding.container_name,
+                use.usage_id, use.token, use.owner, use.key.deployment, use.key.profile_id, use.key.daemon_id, now)
+            if bound_usage is None:
+                raise SandboxLeaseLost(f"usage {use.usage_id!r} changed during publication")
+            ready = await self.db.fetchrow(
+                "UPDATE sandboxes SET state = 'ready', container_id = ?, container_name = ?, policy_digest = ?, "
+                "helper_protocol = ?, helper_digest = ?, current_operation_id = NULL, idle_since = NULL, "
+                "error_code = NULL, error_message = NULL, transitioned_at = ? "
+                "WHERE deployment = ? AND profile_id = ? AND daemon_id = ? AND generation = ? "
+                "AND generation_token = ? AND state = 'creating' AND container_id IS NULL "
+                "AND current_operation_id = ? RETURNING deployment",
+                binding.container_id, binding.container_name, binding.policy.digest(), HELPER_PROTOCOL_VERSION,
+                binding.helper_digest, now, use.key.deployment, use.key.profile_id, use.key.daemon_id,
+                binding.generation, binding.generation_token, start["id"])
+            if ready is None:
+                raise SandboxBusy("the sandbox changed during publication")
+            return BoundSandbox(
+                profile_id=use.key.profile_id, name=binding.container_id, policy=binding.policy, use=use,
+                binding=binding)
 
     # unbound preparation retirement
 
@@ -1331,6 +1420,26 @@ class SandboxStoreMixin:
                         " AND state = 'released' AND released_at < ? RETURNING id", *ids, cutoff)
                     deleted += len(removed)
             return deleted
+
+    async def get_published_generation(self, key: SandboxKey, policy: SandboxPolicy) -> SandboxBinding | None:
+        """The published generation for a compatible policy, or None.
+
+        A usage binding records identity only, so the coordinator reconstructs the applied policy from the profile
+        only while its canonical digest still equals the published `policy_digest`. The helper digest comes from
+        the published row, never from the caller's local artifact. A row from before helper recording (NULL
+        protocol/digest) remains usable; a row publishing another helper protocol does not.
+        """
+        row = await self.db.fetchrow(
+            f"SELECT * FROM sandboxes WHERE {_SANDBOX_IDENTITY}", key.deployment, key.profile_id)
+        if (row is None or row["daemon_id"] != key.daemon_id or row["state"] != "ready"
+                or row["generation_token"] is None or row["container_id"] is None
+                or row["container_name"] is None or row["policy_digest"] != policy.digest()):
+            return None
+        if row["helper_protocol"] is not None and row["helper_protocol"] != HELPER_PROTOCOL_VERSION:
+            return None
+        return SandboxBinding(
+            row["generation"], row["generation_token"], row["container_id"], row["container_name"], policy,
+            row["helper_digest"] or "")
 
     async def get_usage(self, usage_id: str) -> SandboxUsage | None:
         row = await self.db.fetchrow("SELECT * FROM sandbox_uses WHERE id = ?", usage_id)
