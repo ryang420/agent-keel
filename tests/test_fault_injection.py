@@ -20,10 +20,9 @@ from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import CANCELLED_TOOL_RESULT, RunExecutor
-from keel.sandbox.base import SandboxError, parse_policy
-from keel.sandbox.local import LocalSandbox
 from keel.store import open_store
 from keel.worker import WorkerPool
+from tests.sandbox_support import ClaimedExecutor, local_coordinator
 
 needs_docker = pytest.mark.skipif(os.environ.get("KEEL_TEST_DOCKER") != "1", reason="set KEEL_TEST_DOCKER=1")
 needs_subprocess = pytest.mark.skipif(os.environ.get("KEEL_TEST_SUBPROCESS") != "1",
@@ -45,23 +44,28 @@ def answer(text="done"):
 
 
 @pytest.fixture
-async def parts(store, tmp_path):
+async def parts(store, tmp_path, monkeypatch, clock):
+    """A sandboxed profile whose runs are claimed through a coordinator on a database-aligned fake clock."""
+    clock.now = await store.db.database_now()
+    store.coordination_clock = clock
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
     work = tmp_path / "work"
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(work)})
-    sandbox = LocalSandbox(kill_grace_s=0.5)
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=sandbox, sleep=no_sleep)
-    return store, provider, registry, sandbox, executor, work
+    coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch, owner="worker-b")
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep,
+                               kill_grace_s=0.5)
+    return store, provider, registry, backend, executor, work
 
 
-async def start(store, text="hi", session="s1", owner="w1", lease_until=9_999_999):
+async def start(executor, text="hi", session="s1"):
+    store = executor.store
     await store.ensure_session("p1", session)
     await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m", reasoning_effort=None,
                            input_parts=[{"type": "text", "text": text}], instructions=None)
-    return await store.claim_run(owner, lease_until)
+    return await executor.claim_next()
 
 
 async def consistent(store, session="s1"):
@@ -105,44 +109,56 @@ class Dying:
         return call
 
 
-async def test_a_worker_that_dies_mid_command_is_swept_its_command_killed_and_the_next_turn_works(parts, clock):
-    store, provider, registry, sandbox, executor, work = parts
+async def test_a_worker_that_dies_mid_command_is_swept_its_generation_removed_and_the_next_turn_works(
+        parts, clock, tmp_path, monkeypatch):
+    store, provider, registry, backend, executor, work = parts
     provider.script = [[call("c1", f"sleep 30; touch {work}/late"), Completed(Usage(5, 1, 0, 0))]]
     dying = Dying(store)
-    worker_a = RunExecutor(dying, InMemoryEventBus(), registry, sandbox=sandbox, sleep=no_sleep)
-    run = await start(store, owner="worker-a", lease_until=clock.now + 30)
-    abandoned = asyncio.create_task(worker_a.execute(run))
+    coordinator_a, _ = await local_coordinator(dying, tmp_path / "bin", monkeypatch, owner="worker-a",
+                                               backend=backend)
+    worker_a = RunExecutor(dying, InMemoryEventBus(), registry, coordinator=coordinator_a, sleep=no_sleep)
+    await store.ensure_session("p1", "s1")
+    await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m", reasoning_effort=None,
+                           input_parts=[{"type": "text", "text": "hi"}], instructions=None)
+    claim = await coordinator_a.claim()
+    run = claim.run
+    abandoned = asyncio.create_task(worker_a.execute(run, usage=claim.use))
     try:
         for _ in range(250):
             current = await store.get_run_by_id(run.id)
-            if current.current_exec_id and sandbox._groups:
+            if current.current_exec_id and backend.local._groups:
                 break
             await asyncio.sleep(0.02)
         assert current.current_exec_id
-        pgid = sandbox._groups[current.current_exec_id]
+        pgid = backend.local._groups[current.current_exec_id]
         dying.dead = True
         clock.now += 31
-        pool_b = WorkerPool(store, InMemoryEventBus(), executor, owner="worker-b", clock=clock)
-        assert await pool_b.sweep_once() == 1
-        await asyncio.wait_for(abandoned, 10)  # its command was killed, so worker A's stalled tool call returned
-        lost = await store.get_run("p1", run.id)
-        assert (lost.status, lost.error_code, lost.current_exec_id) == ("failed", "worker_lost", None)
-        assert (await one_terminal_event(store, run.id)).data["error_code"] == "worker_lost"  # the sweeper's
+        pool_b = WorkerPool(store, InMemoryEventBus(), executor, owner="worker-b", clock=clock,
+                            coordinator=executor.coordinator)
+        assert await pool_b.sweep_once() == 1  # termination first, then recovery of the expired usage
+        await executor.coordinator.reconcile_once()
+        assert backend.removed_ids == [backend.created_ids[0]]  # recovery removes the whole generation
         assert await group_gone(pgid)
+        await asyncio.wait_for(abandoned, 10)  # its command ended with the container, so worker A returned
+        lost = await store.get_run("p1", run.id)
+        assert (lost.status, lost.error_code) == ("failed", "worker_lost")
+        assert (await one_terminal_event(store, run.id)).data["error_code"] == "worker_lost"  # the sweeper's
+        assert (await store.get_run_usage(run.id)).state == "released"
         provider.script = [answer("recovered")]
-        nxt = await start(store, "again")
+        nxt = await start(executor, "again")
         await executor.execute(nxt)
         assert (await store.get_run("p1", nxt.id)).output == "recovered"
         assert (await one_terminal_event(store, nxt.id)).type == "run.completed"
+        assert backend.created_id != backend.created_ids[0]  # a new generation
         messages = await consistent(store)
         assert [m.role for m in messages] == ["user", "assistant", "tool", "user", "assistant"]
         assert messages[2].text == CANCELLED_TOOL_RESULT
+        assert not (work / "late").exists()
     finally:
         abandoned.cancel()
         await asyncio.gather(abandoned, return_exceptions=True)
-        local = await sandbox.ensure("p1", parse_policy({"image": "local", "workdir": str(work)}))
-        for exec_id in list(sandbox._groups):
-            await sandbox.kill_tree(local, exec_id)
+        for exec_id in list(backend.local._groups):
+            await backend.local.kill_tree(None, exec_id)
 
 
 async def group_gone(pgid, seconds=5.0):
@@ -158,12 +174,12 @@ async def group_gone(pgid, seconds=5.0):
 async def test_three_provider_5xx_fail_the_run_and_the_next_turn_works(parts):
     store, provider, _, _, executor, _ = parts
     provider.script = [[ModelError("server_error", "upstream 503")] for _ in range(3)] + [answer("back")]
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     failed = await store.get_run("p1", run.id)
     assert (failed.status, failed.error_code) == ("failed", "server_error")
     assert len(provider.requests) == 3
-    nxt = await start(store, "again")
+    nxt = await start(executor, "again")
     await executor.execute(nxt)
     assert (await store.get_run("p1", nxt.id)).output == "back"
     assert (await one_terminal_event(store, run.id)).type == "run.failed"
@@ -174,7 +190,7 @@ async def test_three_provider_5xx_fail_the_run_and_the_next_turn_works(parts):
 async def test_two_provider_5xx_then_success_complete_and_count_usage_once(parts):
     store, provider, _, _, executor, _ = parts
     provider.script = [[ModelError("server_error", "upstream 503")] for _ in range(2)] + [answer("fine")]
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     done = await store.get_run("p1", run.id)
     assert (done.status, done.output, done.usage) == ("completed", "fine", Usage(10, 2, 0, 0))
@@ -186,12 +202,12 @@ async def test_two_provider_5xx_then_success_complete_and_count_usage_once(parts
 async def test_a_provider_failing_after_output_is_not_retried_and_the_next_turn_works(parts):
     store, provider, _, _, executor, _ = parts
     provider.script = [[TextDelta("partial "), ModelError("server_error", "connection reset")], answer("next")]
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     failed = await store.get_run("p1", run.id)
     assert (failed.status, failed.error_code, failed.output) == ("failed", "server_error", "partial ")
     assert len(provider.requests) == 1
-    nxt = await start(store, "again")
+    nxt = await start(executor, "again")
     await executor.execute(nxt)
     assert (await store.get_run("p1", nxt.id)).output == "next"
     assert (await one_terminal_event(store, run.id)).type == "run.failed"
@@ -199,61 +215,78 @@ async def test_a_provider_failing_after_output_is_not_retried_and_the_next_turn_
     await consistent(store)
 
 
-async def test_a_sandbox_call_that_fails_once_becomes_a_tool_error_and_the_run_continues(store, tmp_path):
-    class Flaky(LocalSandbox):
-        failures = 1
+async def test_a_failed_sandbox_call_ends_the_run_and_the_next_run_gets_a_recovered_generation(parts):
+    # The old backend recreated a vanished container and retried mid-run; a failed sandbox use now fails the run
+    # as sandbox_unavailable, and recovery replaces the generation before the next run.
+    store, provider, _, backend, executor, _ = parts
+    failures = [ConnectionError("the container is restarting")]
 
-        async def exec(self, *args, **kwargs):
-            if self.failures:
-                self.failures -= 1
-                raise SandboxError("the container is restarting")
-            return await super().exec(*args, **kwargs)
+    async def flaky(ticket, argv):
+        if failures:
+            raise failures.pop()
 
-    provider = FakeProvider(script=[[call("c1", "echo one"), Completed(Usage(5, 1, 0, 0))],
-                                    [call("c2", "echo two"), Completed(Usage(5, 1, 0, 0))], answer("done")])
-    registry = ProviderRegistry()
-    registry.register(provider)
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
-                               sandbox={"image": "local", "workdir": str(tmp_path / "work")})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=Flaky(kill_grace_s=0.5), sleep=no_sleep)
-    run = await start(store)
+    backend.exec_hook = flaky
+    provider.script = [[call("c1", "echo one"), Completed(Usage(5, 1, 0, 0))], answer("never")]
+    run = await start(executor)
     await executor.execute(run)
-    assert (await store.get_run("p1", run.id)).output == "done"
-    assert (await one_terminal_event(store, run.id)).type == "run.completed"
+    failed = await store.get_run("p1", run.id)
+    assert (failed.status, failed.error_code) == ("failed", "sandbox_unavailable")
+    assert (await one_terminal_event(store, run.id)).data["error_code"] == "sandbox_unavailable"
     results = [m for m in await consistent(store) if m.role == "tool"]
     assert "sandbox is unavailable" in results[0].text
-    assert json.loads(results[1].text)["output"] == "two"
+    first = backend.created_id
+    clock = store.coordination_clock
+    clock.now += 31  # the usage stays protective until its lease lapses; then recovery removes the generation
+    await executor.coordinator.reconcile_once()
+    assert backend.removed_ids == [first]
+    provider.script = [[call("c2", "echo two"), Completed(Usage(5, 1, 0, 0))], answer("done")]
+    nxt = await start(executor, "again")
+    await executor.execute(nxt)
+    assert (await store.get_run("p1", nxt.id)).output == "done"
+    assert backend.created_id != first
+    results = [m for m in await consistent(store) if m.role == "tool"]
+    assert json.loads(results[-1].text)["output"] == "two"
 
 
 @needs_docker
-async def test_a_container_removed_between_two_tool_calls_is_recreated(store):
+async def test_a_container_removed_between_two_tool_calls_fails_the_run_and_recovery_replaces_it(store):
+    from keel.sandbox.coordinator import SandboxCoordinator
     from keel.sandbox.docker import DockerSandbox
 
     backend = DockerSandbox(deployment=f"test-{uuid.uuid4().hex[:8]}", kill_grace_s=1.0)
+    coordinator = SandboxCoordinator(store, backend, deployment=backend.deployment, owner="w1", lease_seconds=30.0,
+                                     idle_seconds=1800.0, reap_seconds=5.0)
 
     class RemoveBeforeTheSecondCall(FakeProvider):
         async def stream(self, request):
             if len(self.requests) == 1:
-                await backend._docker("rm", "-f", backend.container_name("p1"))
+                row = await store.db.fetchrow("SELECT container_id FROM sandboxes WHERE profile_id = ?", "p1")
+                await backend._docker("rm", "-f", row["container_id"])
             async for event in super().stream(request):
                 yield event
 
     provider = RemoveBeforeTheSecondCall(script=[[call("c1", "echo one"), Completed(Usage(5, 1, 0, 0))],
                                                  [call("c2", "echo two"), Completed(Usage(5, 1, 0, 0))],
-                                                 answer("done")])
+                                                 answer("never")])
     registry = ProviderRegistry()
     registry.register(provider)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": IMAGE, "workdir": "/work"})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=backend, sleep=no_sleep)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep,
+                               kill_grace_s=1.0)
     try:
-        run = await start(store)
+        run = await start(executor)
         await executor.execute(run)
-        assert (await store.get_run("p1", run.id)).output == "done"
-        assert (await one_terminal_event(store, run.id)).type == "run.completed"
-        results = [m for m in await consistent(store) if m.role == "tool"]
-        second = json.loads(results[1].text)
-        assert second["exit_code"] == 0 and second["output"] == "two"
+        failed = await store.get_run("p1", run.id)
+        assert (failed.status, failed.error_code) == ("failed", "sandbox_unavailable")
+        await consistent(store)
+        await store.db.execute("UPDATE sandbox_uses SET lease_expires_at = 0 WHERE run_id = ?", run.id)
+        await coordinator.reconcile_once()
+        provider.script = [[call("c3", "echo three"), Completed(Usage(5, 1, 0, 0))], answer("done")]
+        nxt = await start(executor, "again")
+        await executor.execute(nxt)
+        assert (await store.get_run("p1", nxt.id)).output == "done"
+        assert json.loads([m for m in await consistent(store) if m.role == "tool"][-1].text)["output"] == "three"
     finally:
         await backend.remove_orphans()
 

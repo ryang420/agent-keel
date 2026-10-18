@@ -1,7 +1,4 @@
 import asyncio
-import contextlib
-import os
-import signal
 
 import pytest
 
@@ -10,9 +7,9 @@ from keel.models import Completed, TextDelta, Usage
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
-from keel.sandbox.base import SandboxError, parse_policy
-from keel.sandbox.local import LocalSandbox
+from keel.sandbox.base import SandboxError
 from keel.worker import WorkerPool
+from tests.sandbox_support import local_coordinator
 
 
 @pytest.fixture
@@ -72,6 +69,7 @@ async def test_a_stop_request_cancels_a_running_run(pool_parts):
 
 
 async def test_sweeping_fails_runs_whose_lease_expired(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, ProviderRegistry())
     run = await queue(store)
@@ -144,7 +142,7 @@ async def test_claim_errors_back_off_instead_of_spinning(pool_parts):
 
 
 class SlowRenewStore:
-    """Delegates to the real store; the first renew_lease is wrapped by `first`."""
+    """Delegates to the real store; the first run-lease renewal is wrapped by `first`."""
 
     def __init__(self, store, first):
         self._store = store
@@ -153,10 +151,10 @@ class SlowRenewStore:
     def __getattr__(self, name):
         return getattr(self._store, name)
 
-    async def renew_lease(self, *args):
+    async def renew_claim(self, *args):
         first, self._first = self._first, None
         if first is None:
-            return await self._store.renew_lease(*args)
+            return await self._store.renew_claim(*args)
         return await first(self._store, *args)
 
 
@@ -191,10 +189,10 @@ async def test_a_stop_landing_during_a_renewal_is_not_lost(pool_parts):
     renewed = asyncio.Event()
 
     async def renew_then_linger(real, *args):
-        status = await real.renew_lease(*args)
+        stamp = await real.renew_claim(*args)
         renewed.set()
         await asyncio.sleep(0.3)
-        return status
+        return stamp
 
     pool = WorkerPool(SlowRenewStore(store, renew_then_linger), bus, executor, owner="w1", workers=1,
                       poll_seconds=0.01, lease_seconds=3)
@@ -211,6 +209,7 @@ async def test_a_stop_landing_during_a_renewal_is_not_lost(pool_parts):
 
 
 async def test_sweep_notifies_every_expired_run_even_if_one_notify_fails(store, clock):
+    store.coordination_clock = clock
     bus = InMemoryEventBus()
     executor = RunExecutor(store, bus, ProviderRegistry())
     runs = [await queue(store, "s1"), await queue(store, "s2")]
@@ -262,19 +261,20 @@ async def test_a_failing_status_check_does_not_orphan_the_execution(pool_parts):
     assert all(t.done() for t in runs)
 
 
-async def test_a_stop_during_a_command_ends_the_run_quickly(store, tmp_path):
+async def test_a_stop_during_a_command_ends_the_run_quickly(store, tmp_path, monkeypatch):
     from keel.models import ToolCall, ToolCallReady
-    from keel.sandbox.local import LocalSandbox
 
     provider = FakeProvider(script=[[ToolCallReady(ToolCall("c1", "terminal", '{"command": "sleep 60"}')),
                                      Completed(Usage(1, 1, 0, 0))]])
     registry = ProviderRegistry()
     registry.register(provider)
     bus = InMemoryEventBus()
-    executor = RunExecutor(store, bus, registry, sandbox=LocalSandbox(kill_grace_s=0.5))
+    coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch, lease_seconds=3)
+    executor = RunExecutor(store, bus, registry, coordinator=coordinator, kill_grace_s=0.5)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "w")})
-    pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01, lease_seconds=3)
+    pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01, lease_seconds=3,
+                      coordinator=coordinator)
     await pool.start()
     try:
         run = await queue(store)
@@ -286,111 +286,50 @@ async def test_a_stop_during_a_command_ends_the_run_quickly(store, tmp_path):
         await bus.notify("stop:" + run.id)
         done = await wait_for_status(store, run.id, ("cancelled",), seconds=10)
         assert done.status == "cancelled"
-        assert done.current_exec_id is None
+        assert (await store.get_run_by_id(run.id)).current_exec_id is None  # cleared only after a receipt
+        assert backend.control_calls
     finally:
         await pool.close(drain_seconds=0.1)
 
 
-async def test_sweeping_kills_the_command_a_lost_worker_left_running(store, clock, tmp_path):
-    work = tmp_path / "w"
-    policy = {"image": "local", "workdir": str(work)}
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox=policy, soul="",
-                               skills=[])
-    sandbox = LocalSandbox(kill_grace_s=0.5)
-    box = await sandbox.ensure("p1", parse_policy(policy))
-    command = asyncio.create_task(sandbox.exec(box, ["sh", "-c", f"sleep 30; touch {work}/late"], cwd=str(work),
-                                               timeout_s=60, exec_id="x1"))
-    for _ in range(100):
-        if "x1" in sandbox._groups:
-            break
-        await asyncio.sleep(0.02)
-    pgid = sandbox._groups["x1"]
-    try:
-        run = await queue(store)
-        await store.claim_run("dead-worker", clock.now + 30)
-        await store.set_current_exec(run.id, "x1")
-        executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=sandbox)
-        pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
-        clock.now += 31
-        assert await pool.sweep_once() == 1
-        result = await asyncio.wait_for(command, 5)
-        assert result.exit_code != 0 and not (work / "late").exists()
-        swept = await store.get_run("p1", run.id)
-        assert (swept.status, swept.error_code, swept.current_exec_id) == ("failed", "worker_lost", None)
-    finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pgid, signal.SIGKILL)
-        command.cancel()
-        await asyncio.gather(command, return_exceptions=True)
+async def lost_run(store, clock, coordinator):
+    """A sandboxed run whose worker claimed it and died, with its lease past due on the fake clock."""
+    clock.now = await store.db.database_now()
+    store.coordination_clock = clock
+    run = await queue(store)
+    assert (await coordinator.claim()).run.id == run.id
+    clock.now += 31
+    return run
 
 
-async def test_a_sweep_notifies_before_killing_the_leftover_command(store, clock, tmp_path):
-    order = []
-    bus = InMemoryEventBus()
-    real_notify = bus.notify
-
-    async def notify(key):
-        order.append(("notify", key))
-        await real_notify(key)
-
-    bus.notify = notify
-
-    class Recorder(LocalSandbox):
-        async def kill_tree(self, sandbox, exec_id):
-            order.append(("kill", exec_id))
-
+async def test_the_sweeper_never_creates_a_sandbox(store, clock, tmp_path, monkeypatch):
+    coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "w")})
-    run = await queue(store)
-    await store.claim_run("dead-worker", clock.now + 30)
-    await store.set_current_exec(run.id, "x1")
-    executor = RunExecutor(store, bus, ProviderRegistry(), sandbox=Recorder())
-    pool = WorkerPool(store, bus, executor, owner="w1", clock=clock)
-    clock.now += 31
+    run = await lost_run(store, clock, coordinator)
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), coordinator=coordinator)
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock, coordinator=coordinator)
     assert await pool.sweep_once() == 1
-    assert order == [("notify", run.id), ("kill", "x1")]
-
-
-async def test_the_sweeper_never_creates_a_sandbox(store, clock, tmp_path):
-    killed = []
-
-    class NoCreate(LocalSandbox):
-        async def ensure(self, profile_id, policy):
-            killed.append("ensure")
-            raise AssertionError("the sweeper must not create a sandbox")
-
-        async def kill_tree(self, sandbox, exec_id):
-            killed.append((sandbox.name, exec_id))
-
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
-                               sandbox={"image": "local", "workdir": str(tmp_path / "w")})
-    run = await queue(store)
-    await store.claim_run("dead-worker", clock.now + 30)
-    await store.set_current_exec(run.id, "x1")
-    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=NoCreate())
-    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
-    clock.now += 31
-    assert await pool.sweep_once() == 1
-    assert killed == [("local-p1", "x1")]
+    assert "create" not in backend.calls and backend.exec_calls == [] and backend.control_calls == []
     assert not (tmp_path / "w").exists()
+    assert (await store.get_run("p1", run.id)).error_code == "worker_lost"
 
 
-async def test_a_sweep_survives_an_unreachable_sandbox(store, clock, tmp_path):
-    class Down(LocalSandbox):
-        async def kill_tree(self, sandbox, exec_id):
-            raise SandboxError("docker is down")
-
+async def test_a_sweep_survives_an_unreachable_sandbox(store, clock, tmp_path, monkeypatch):
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "w")})
-    run = await queue(store)
-    await store.claim_run("dead-worker", clock.now + 30)
-    await store.set_current_exec(run.id, "x1")
-    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=Down())
-    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
-    clock.now += 31
+    run = await lost_run(store, clock, coordinator)
+
+    async def down(run_id):
+        raise SandboxError("docker is down")
+
+    coordinator.recover_run = down
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), coordinator=coordinator)
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock, coordinator=coordinator)
     assert await pool.sweep_once() == 1
     swept = await store.get_run("p1", run.id)
-    assert (swept.status, swept.current_exec_id) == ("failed", None)
+    assert (swept.status, swept.error_code) == ("failed", "worker_lost")
     assert [e.type for e in await store.events_after(run.id, 0)] == ["run.failed"]
 
 

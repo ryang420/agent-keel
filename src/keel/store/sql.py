@@ -420,6 +420,10 @@ class SqlStore(SandboxStoreMixin):
         return _run(row) if row else None
 
     async def claim_run(self, owner: str, lease_until: float) -> Run | None:
+        """The legacy claim for chat-only workers; `lease_until` must be on the database coordination clock.
+
+        It reserves no sandbox usage, so a sandbox-enabled executor refuses to run what it returns.
+        """
         lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
         row = await self.db.fetchrow(
             "UPDATE runs SET status = 'running', lease_owner = ?, lease_expires_at = ?, started_at = ? "
@@ -514,20 +518,22 @@ class SqlStore(SandboxStoreMixin):
 
         Postgres locks the selected rows with SKIP LOCKED, so a sweep, a renewal and a finish serialise on the run
         row. SQLite serialises writers with BEGIN IMMEDIATE. A failure rolls the whole batch back; the next pass
-        selects the same runs again.
+        selects the same runs again. Deadlines are compared with database coordination time, the basis claims and
+        renewals use; the finish time stays transcript time.
         """
         now = self.clock()
         async with self.db.transaction():
+            deadline = await self.coordination_now()
             lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
             rows = await self.db.fetch(
                 "SELECT * FROM runs WHERE status IN ('running', 'stopping') AND lease_expires_at < ? "
-                f"ORDER BY id LIMIT ?{lock}", now, batch)
+                f"ORDER BY id LIMIT ?{lock}", deadline, batch)
             transitions = []
             for row in rows:
                 updated = await self.db.fetchrow(
                     "UPDATE runs SET status = 'failed', error_code = 'worker_lost', error = ?, finished_at = ?, "
                     "lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN ('running', 'stopping') "
-                    "AND lease_expires_at < ? RETURNING *", WORKER_LOST_MESSAGE, now, row["id"], now)
+                    "AND lease_expires_at < ? RETURNING *", WORKER_LOST_MESSAGE, now, row["id"], deadline)
                 if updated is None:  # renewed or finished despite the lock (defense in depth)
                     continue
                 event = await self._insert_event_locked(

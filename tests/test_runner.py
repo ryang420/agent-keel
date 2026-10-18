@@ -10,9 +10,9 @@ from keel.models import Completed, ToolCall, ToolCallReady, ReasoningItem, Reaso
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import DEFAULT_IDENTITY, RunExecutor
-from keel.sandbox.local import LocalSandbox
 from keel.titles import derive_title
 from keel.tools import ToolContext, run_tool
+from tests.sandbox_support import ClaimedExecutor, local_coordinator
 
 ITEM = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
 
@@ -30,11 +30,13 @@ async def setup(store):
     return store, provider, RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep)
 
 
-async def start(store, text="What is two plus two?", session="s1", instructions="Answer briefly."):
+async def start(store, text="What is two plus two?", session="s1", instructions="Answer briefly.", claim=True):
     await store.ensure_session("p1", session)
     run = await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m",
                                  reasoning_effort="low", input_parts=[{"type": "text", "text": text}],
                                  instructions=instructions)
+    if not claim:
+        return run
     return await store.claim_run("w1", 9_999_999)
 
 
@@ -340,7 +342,7 @@ async def test_memory_is_offered_without_a_sandbox(setup):
     assert (await store.get_session("p1", "s1")).system_prompt == session.system_prompt
 
 
-async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(store, tmp_path):
+async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(store, tmp_path, monkeypatch):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
@@ -348,8 +350,10 @@ async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(s
     work.mkdir()
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[], memory=True,
                                sandbox={"image": "local", "workdir": str(work)})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5), sleep=no_sleep)
-    await executor.execute(await start(store))
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep)
+    await start(store, claim=False)
+    await executor.execute(await executor.claim_next())
     assert [tool["name"] for tool in provider.requests[0].tools] == [*prompts.TOOL_ORDER, "memory"]
 
 

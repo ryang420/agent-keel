@@ -38,7 +38,7 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
                         compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3)
     keel, pool, closables, backend = await build(settings)
     try:
-        assert backend is None and keel.executor.sandbox is None
+        assert backend is None and keel.executor.coordinator is None and pool.coordinator is None
         assert keel.executor.background is keel.background
         assert keel.executor.compactor.threshold == 0.5
         assert (keel.executor.memory_chars, keel.executor.user_chars, keel.executor.memory_review_turns) == (

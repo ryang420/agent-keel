@@ -1,12 +1,19 @@
-"""Workers claim queued runs, keep their lease alive, honour stop requests, and sweep dead leases."""
+"""Workers claim queued runs, keep their leases alive, honour stop requests, and sweep dead leases.
+
+A sandbox-enabled worker claims through the coordinator, which reserves the run's usage in the same transaction.
+Two leases are then renewed independently on database time: the run lease until the run is terminal, and the usage
+lease until the executor's cleanup returns, even after the run has ended. Local stop deadlines come from the
+database's observation plus elapsed monotonic time, never from the host wall clock.
+"""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import time
 
-from keel.store.base import WORKER_LOST_MESSAGE
+from keel.sandbox.records import LeaseStamp, RunClaim
 
 log = logging.getLogger(__name__)
 _MAX_CLAIM_BACKOFF = 10.0
@@ -14,18 +21,37 @@ SHUTDOWN_MESSAGE = "The service was shutting down."
 _BACKGROUND = ("keel-sweeper", "keel-maintenance")
 
 
+@dataclass
+class _Deadlines:
+    """Local monotonic deadlines derived from the last confirmed lease of each kind."""
+
+    run: float
+    usage: float | None
+
+
+def _confirmed(sent: float, stamp: LeaseStamp) -> float:
+    """The local deadline of a lease the database granted: the request's send time plus the granted interval.
+    Counting from the send time, not the reply, keeps the local deadline at or before the database's."""
+    return sent + (stamp.expires_at - stamp.observed_at)
+
+
 class WorkerPool:
     def __init__(self, store, bus, executor, *, owner: str, workers: int = 4, lease_seconds: float = 30.0,
-                 poll_seconds: float = 0.5, clock=time.time, event_retention_s: float | None = None,
-                 maintenance_s: float = 3600.0) -> None:
+                 poll_seconds: float = 0.5, clock=time.time, monotonic=time.monotonic,
+                 event_retention_s: float | None = None, maintenance_s: float = 3600.0, coordinator=None) -> None:
+        if coordinator is None and getattr(executor, "coordinator", None) is not None:
+            # A legacy claim reserves no usage; a sandbox-enabled worker must claim through the coordinator.
+            raise ValueError("a sandbox-enabled executor needs a coordinated worker")
         self.store = store
         self.bus = bus
         self.executor = executor
+        self.coordinator = coordinator
         self.owner = owner
         self.workers = workers
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
-        self.clock = clock
+        self.clock = clock  # host time, only for event retention
+        self.monotonic = monotonic
         self.event_retention_s = event_retention_s
         self.maintenance_s = maintenance_s
         self._tasks: list[asyncio.Task] = []
@@ -46,7 +72,8 @@ class WorkerPool:
         """Stop claiming, give runs in flight `drain_seconds` to finish, then fail what is left as worker_lost.
 
         Not `cancelled`: that is what a user's stop looks like. The finish goes through finish_run, so a run
-        that completes at the same moment still ends exactly once.
+        that completes at the same moment still ends exactly once. Cancelled workers still wait for their
+        executor's cleanup, renewing usage meanwhile; work that cannot be cleaned up stays recorded for recovery.
         """
         self._closing = True
         self._stop.set()
@@ -71,8 +98,9 @@ class WorkerPool:
         self._inflight.clear()
 
     async def sweep_once(self) -> int:
-        """Fail one bounded batch of expired runs, then kill the commands their dead workers left running. The
-        notifications go first so a slow sandbox cannot delay terminal visibility."""
+        """Fail one bounded batch of expired runs and notify their readers, then ask the coordinator to recover
+        their sandbox usage. Termination commits first, so a slow sandbox cannot delay terminal visibility; a
+        terminal run is no proof its commands stopped, so nothing is signalled here."""
         transitions = await self.store.expire_leases()
         for transition in transitions:
             if transition.event is not None:
@@ -80,8 +108,12 @@ class WorkerPool:
                     await self.bus.notify(transition.run.id)
                 except Exception:
                     log.warning("could not notify about %s", transition.run.id, exc_info=True)
-        for transition in transitions:
-            await self.executor.kill_orphaned_command(transition.run)
+        if self.coordinator is not None:
+            for transition in transitions:
+                try:
+                    await self.coordinator.recover_run(transition.run.id)
+                except Exception:
+                    log.warning("could not recover the sandbox usage of %s", transition.run.id, exc_info=True)
         return len(transitions)
 
     async def _sweep(self) -> None:
@@ -121,11 +153,20 @@ class WorkerPool:
         except TimeoutError:
             pass
 
+    async def _claim(self) -> RunClaim | None:
+        if self.coordinator is not None:
+            return await self.coordinator.claim()
+        # A chat-only worker: the legacy claim, with its deadline on the database clock the sweeper compares with.
+        now = await self.store.coordination_now()
+        run = await self.store.claim_run(self.owner, now + self.lease_seconds)
+        return None if run is None else RunClaim(run, None, LeaseStamp(now, now + self.lease_seconds))
+
     async def _work(self) -> None:
         backoff = self.poll_seconds
         while not self._closing:
+            sent = self.monotonic()
             try:
-                run = await self.store.claim_run(self.owner, self.clock() + self.lease_seconds)
+                claim = await self._claim()
             except Exception:
                 # A down database: back off instead of logging a traceback every poll.
                 log.exception("claiming a run failed; retrying in %.1fs", backoff)
@@ -133,67 +174,159 @@ class WorkerPool:
                 backoff = min(backoff * 2, _MAX_CLAIM_BACKOFF)
                 continue
             backoff = self.poll_seconds
-            if run is None:
+            if claim is None:
                 await self._idle(self.poll_seconds)
                 continue
+            run = claim.run
             self._inflight[run.id] = run
             try:
-                await self._run_one(run)
+                await self._run_one(claim, sent)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 log.exception("run %s crashed the worker loop", run.id)
             finally:
                 self._inflight.pop(run.id, None)
 
-    async def _run_one(self, run) -> None:
+    async def _run_one(self, claim: RunClaim, sent: float) -> None:
+        run, use = claim.run, claim.use
+        if claim.lease.expires_at - claim.lease.observed_at <= 0:
+            # No positive lease interval: dispatch nothing. The sweeper and recovery own the claim.
+            log.warning("run %s was claimed without a positive lease; leaving it to the sweeper", run.id)
+            return
+        deadlines = _Deadlines(run=_confirmed(sent, claim.lease),
+                               usage=_confirmed(sent, claim.lease) if use is not None else None)
+        work = self.executor.execute(run, usage=use) if use is not None else self.executor.execute(run)
+        execution = asyncio.create_task(work, name=f"keel-run-{run.id}")
+        lost = asyncio.Event()
+        heartbeat = None
+        if use is not None:
+            heartbeat = asyncio.create_task(self._keep_usage(run, use, deadlines, lost, execution),
+                                            name=f"keel-usage-{run.id}")
         stop_key = "stop:" + run.id
-        execution = asyncio.create_task(self.executor.execute(run), name=f"keel-run-{run.id}")
-        deadline = self.clock() + self.lease_seconds
         try:
-            while not execution.done():
-                # Take the waiter first so a stop landing during the checks below is not lost.
-                waiter = self.bus.waiter(stop_key)
-                try:
-                    current = await self.store.get_run_by_id(run.id)
-                except Exception:
-                    log.warning("checking the status of %s failed", run.id, exc_info=True)
-                    if self.clock() > deadline:
-                        execution.cancel()
-                        break
-                else:
-                    if current is None or current.status != "running":
-                        execution.cancel()
-                        break
-                stop = asyncio.ensure_future(waiter.wait())
-                try:
-                    done, _ = await asyncio.wait({execution, stop}, timeout=self.lease_seconds / 3,
-                                                 return_when=asyncio.FIRST_COMPLETED)
-                finally:
-                    stop.cancel()
-                if execution in done:
-                    break
-                try:
-                    status = await self.store.renew_lease(run.id, self.owner, self.clock() + self.lease_seconds)
-                except Exception:
-                    log.warning("renewing the lease of %s failed", run.id, exc_info=True)
-                    if self.clock() > deadline:
-                        # The lease has lapsed; the sweeper owns this run now.
-                        execution.cancel()
-                        break
-                    continue
-                if status != "running":
-                    # "stopping", or None when the lease was lost to the sweeper.
-                    execution.cancel()
-                    break
-                deadline = self.clock() + self.lease_seconds
-            await asyncio.gather(execution, return_exceptions=True)
+            await self._supervise(claim, execution, deadlines, lost, stop_key)
+            await self._await_cleanup(execution)
         except asyncio.CancelledError:
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await self._await_cleanup(execution)
             raise
         except Exception:
             # Never return with the execution still running.
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await self._await_cleanup(execution)
             raise
         finally:
+            # Usage renewal ends only once the executor's cleanup (including release) has returned.
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
             self.bus.discard(stop_key)
+
+    async def _await_cleanup(self, execution: asyncio.Task) -> None:
+        """Wait for the executor to return, absorbing repeated cancellation; one is re-raised afterwards."""
+        received = 0
+        while not execution.done():
+            try:
+                await asyncio.shield(execution)
+            except asyncio.CancelledError:
+                if execution.done():
+                    break
+                received += 1
+                execution.cancel()
+            except Exception:
+                break
+        if received:
+            current = asyncio.current_task()
+            if current is not None:
+                for _ in range(received - 1):
+                    current.uncancel()
+            raise asyncio.CancelledError()
+
+    async def _supervise(self, claim: RunClaim, execution: asyncio.Task, deadlines: _Deadlines,
+                         lost: asyncio.Event, stop_key: str) -> None:
+        """Renew the run lease while the run is active; cancel the execution on a stop, a terminal or lost run, or
+        a lost usage. Returns once the execution is done or cancelled and the run lease no longer needs renewal."""
+        run = claim.run
+        interval = self.lease_seconds / 3
+        cancelled = False
+        while not execution.done():
+            if lost.is_set() and not cancelled:
+                execution.cancel()
+                cancelled = True
+            waiter = None
+            if not cancelled:
+                # Take the waiter first so a stop landing during the checks below is not lost.
+                waiter = self.bus.waiter(stop_key)
+                try:
+                    current = await asyncio.wait_for(self.store.get_run_by_id(run.id), self._left(deadlines.run))
+                except Exception:
+                    log.warning("checking the status of %s failed", run.id, exc_info=True)
+                    if self.monotonic() >= deadlines.run:
+                        execution.cancel()
+                        return  # the run lease has lapsed; the sweeper owns this run now
+                else:
+                    if current is None or current.status != "running":
+                        execution.cancel()
+                        cancelled = True
+            waits = {execution, asyncio.ensure_future(lost.wait())}
+            if waiter is not None and not cancelled:
+                waits.add(asyncio.ensure_future(waiter.wait()))
+            try:
+                done, _ = await asyncio.wait(waits, timeout=min(interval, self._left(deadlines.run)),
+                                             return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for waiting in waits:
+                    if waiting is not execution:
+                        waiting.cancel()
+            if execution in done:
+                return
+            sent = self.monotonic()
+            try:
+                stamp = await asyncio.wait_for(self.store.renew_claim(claim, self.lease_seconds),
+                                               self._left(deadlines.run))
+            except Exception:
+                log.warning("renewing the lease of %s failed", run.id, exc_info=True)
+                if self.monotonic() >= deadlines.run:
+                    execution.cancel()
+                    return  # the run lease has lapsed; the sweeper owns this run now
+                continue
+            if stamp is None or stamp.expires_at <= stamp.observed_at:
+                # Terminal, swept or owned by someone else: stop renewing the run lease. A terminal run's cleanup
+                # is shielded inside the executor, so cancelling it never interrupts the release.
+                execution.cancel()
+                return
+            deadlines.run = _confirmed(sent, stamp)
+
+    def _left(self, deadline: float) -> float:
+        return max(0.0, deadline - self.monotonic())
+
+    async def _keep_usage(self, run, use, deadlines: _Deadlines, lost: asyncio.Event,
+                          execution: asyncio.Task) -> None:
+        """Renew the usage every third of the lease until cancelled after executor cleanup. A definite loss, or
+        reaching the last confirmed deadline without a renewal, cancels the execution: no new exec can be admitted
+        anyway, since every admission rechecks the lease in the database."""
+        interval = self.lease_seconds / 3
+        while True:
+            await asyncio.sleep(min(interval, self._left(deadlines.usage)))
+            if self.monotonic() >= deadlines.usage:
+                log.warning("run %s: its sandbox usage lease could not be confirmed in time", run.id)
+                break
+            sent = self.monotonic()
+            try:
+                stamp = await asyncio.wait_for(self.coordinator.renew_usage(use), self._left(deadlines.usage))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("renewing the sandbox usage of %s failed", run.id, exc_info=True)
+                continue
+            if stamp is None or stamp.expires_at <= stamp.observed_at:
+                log.warning("run %s: its sandbox usage lease was lost", run.id)
+                break
+            deadlines.usage = _confirmed(sent, stamp)
+        if not execution.done():
+            note = getattr(self.executor, "note_lease_lost", None)
+            if note is not None:
+                note(run.id)
+            execution.cancel()
+        lost.set()

@@ -127,6 +127,7 @@ async def test_stopping_a_queued_run_cancels_it(store):
 
 
 async def test_expired_leases_fail_their_runs(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     run = await make_run(store)
     await store.claim_run("w1", clock.now + 30)
     assert await store.expire_leases() == []
@@ -147,7 +148,7 @@ async def test_finish_run_commits_the_canonical_event_with_the_state(store, cloc
     assert transition.event.type == "run.completed"
     assert transition.event.data == {"output": "done", "usage": usage.to_dict(), "incomplete": True}
     saved = await store.get_run("p1", completed.id)
-    assert saved.current_exec_id == "x1"  # the sweeper still needs it to kill a leftover command
+    assert saved.current_exec_id == "x1"  # a convenience pointer, kept as evidence
     assert saved.lease_owner is None and saved.lease_expires_at is None
 
     failed = await make_run(store, "failed")
@@ -184,6 +185,7 @@ async def test_finish_run_validates_its_arguments_before_reading_the_run(store):
 
 
 async def test_expire_leases_handles_a_bounded_batch(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     runs = []
     for index in range(5):
         run = await make_run(store, f"s{index}")
@@ -202,6 +204,7 @@ async def test_expire_leases_handles_a_bounded_batch(store, clock):
 
 
 async def test_a_failure_while_writing_events_rolls_the_whole_expiry_batch_back(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     runs = []
     for index in range(3):
         runs.append(await make_run(store, f"s{index}"))

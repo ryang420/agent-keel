@@ -10,9 +10,9 @@ from keel.events import InMemoryEventBus
 from keel.models import Completed, ToolCall, ToolCallReady, TextDelta, Usage
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
-from keel.runner import RunExecutor
 from keel.sandbox.base import SandboxError
-from keel.sandbox.local import LocalSandbox
+from keel.sandbox.records import DockerOutcome
+from tests.sandbox_support import ClaimedExecutor, local_coordinator
 
 
 async def no_sleep(seconds):
@@ -27,8 +27,16 @@ def answer(text="done"):
     return [TextDelta(text), Completed(Usage(10, 2, 0, 0))]
 
 
+async def coordinated(store, tmp_path, monkeypatch, registry, **options):
+    """A sandbox-enabled executor whose runs are claimed through a coordinator over host processes."""
+    coordinator, backend = await local_coordinator(store, tmp_path / "bin", monkeypatch)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, kill_grace_s=0.5,
+                               **options)
+    return executor, backend
+
+
 @pytest.fixture
-async def loop_parts(store, tmp_path):
+async def loop_parts(store, tmp_path, monkeypatch):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
@@ -39,23 +47,25 @@ async def loop_parts(store, tmp_path):
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="SOUL",
                                skills=["helper"], sandbox={"image": "local", "workdir": str(work),
                                                            "skills_path": str(tmp_path / "skills")})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
-                           sleep=no_sleep, max_iterations=3, now=lambda: datetime(2026, 10, 12, tzinfo=UTC))
+    executor, backend = await coordinated(store, tmp_path, monkeypatch, registry, sleep=no_sleep, max_iterations=3,
+                                          now=lambda: datetime(2026, 10, 12, tzinfo=UTC))
+    executor.backend = backend
     return store, provider, executor, work
 
 
-async def start(store, text="hi", session="s1", instructions=None):
+async def start(executor, text="hi", session="s1", instructions=None):
+    store = executor.store
     await store.ensure_session("p1", session)
     await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m", reasoning_effort=None,
                            input_parts=[{"type": "text", "text": text}], instructions=instructions)
-    return await store.claim_run("w1", 9_999_999)
+    return await executor.claim_next()
 
 
 async def test_a_tool_call_runs_and_its_result_feeds_the_next_call(loop_parts):
     store, provider, executor, work = loop_parts
     provider.script = [[call("terminal", command="echo keel-$((6*7))"), Completed(Usage(20, 5, 0, 0))],
                        answer("It printed keel-42")]
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     done = await store.get_run("p1", run.id)
     assert (done.status, done.output) == ("completed", "It printed keel-42")
@@ -78,8 +88,8 @@ async def test_a_tool_call_runs_and_its_result_feeds_the_next_call(loop_parts):
 async def test_the_system_prompt_is_built_once_and_reused(loop_parts):
     store, provider, executor, _ = loop_parts
     provider.script = [answer(), answer()]
-    await executor.execute(await start(store, "first", instructions="A"))
-    await executor.execute(await start(store, "second", instructions="B"))
+    await executor.execute(await start(executor, "first", instructions="A"))
+    await executor.execute(await start(executor, "second", instructions="B"))
     first, second = provider.requests
     assert first.system == second.system and first.tools == second.tools
     assert first.system.startswith("SOUL\n\n") and "- helper: Helps." in first.system
@@ -91,7 +101,7 @@ async def test_the_iteration_cap_ends_with_a_tool_less_call(loop_parts):
     store, provider, executor, _ = loop_parts
     provider.script = [[call("terminal", f"c{i}", command="true"), Completed(Usage(1, 1, 0, 0))] for i in range(3)]
     provider.script.append(answer("summary"))
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).output == "summary"
     last = provider.requests[-1]
@@ -104,7 +114,7 @@ async def test_bad_tool_calls_are_answered_and_the_run_continues(loop_parts):
     provider.script = [[ToolCallReady(ToolCall("c1", "no_such_tool", "{}")),
                         ToolCallReady(ToolCall("c2", "read_file", "{oops")), Completed(Usage(1, 1, 0, 0))],
                        answer("recovered")]
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).status == "completed"
     tools = [m.message for m in await store.messages("s1") if m.message.role == "tool"]
@@ -118,37 +128,34 @@ async def test_the_working_directory_carries_across_runs(loop_parts):
     (work / "sub").mkdir(parents=True)
     provider.script = [[call("terminal", command="cd sub"), Completed(Usage(1, 1, 0, 0))], answer(),
                        [call("terminal", command="pwd"), Completed(Usage(1, 1, 0, 0))], answer()]
-    await executor.execute(await start(store, "one"))
-    await executor.execute(await start(store, "two"))
+    await executor.execute(await start(executor, "one"))
+    await executor.execute(await start(executor, "two"))
     pwd = [m.message for m in await store.messages("s1") if m.message.role == "tool"][-1]
     assert Path(json.loads(pwd.text)["output"].strip()).resolve() == (work / "sub").resolve()
 
 
-async def test_a_sandbox_that_cannot_start_fails_the_run(store):
-    class Broken(LocalSandbox):
-        async def ensure(self, profile_id, policy):
-            raise SandboxError("Could not create the sandbox: no such image")
-
+async def test_a_sandbox_that_cannot_start_fails_the_run(store, tmp_path, monkeypatch):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "missing", "workdir": "/w"})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=Broken(), sleep=no_sleep)
-    run = await start(store)
+    executor, backend = await coordinated(store, tmp_path, monkeypatch, registry, sleep=no_sleep)
+    backend.set_result("create", DockerOutcome("definite_failure", diagnostic="no such image"))
+    run = await start(executor)
     await executor.execute(run)
     done = await store.get_run("p1", run.id)
     assert (done.status, done.error_code) == ("failed", "sandbox_unavailable")
     assert provider.requests == []
 
 
-async def test_a_profile_without_a_sandbox_gets_no_tools(store):
+async def test_a_profile_without_a_sandbox_gets_no_tools(store, tmp_path, monkeypatch):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[], sandbox={})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(), sleep=no_sleep)
-    await executor.execute(await start(store))
+    executor, _ = await coordinated(store, tmp_path, monkeypatch, registry, sleep=no_sleep)
+    await executor.execute(await start(executor))
     assert provider.requests[0].tools == () and provider.requests[0].system == "You are a helpful assistant."
 
 
@@ -165,7 +172,7 @@ async def test_cancelling_during_a_command_kills_it_and_answers_the_calls(loop_p
     provider.script = [[call("terminal", "c1", command="(sleep 1; touch late) & sleep 30"),
                         call("terminal", "c2", command="echo second"), Completed(Usage(1, 1, 0, 0))],
                        answer("after")]
-    run = await start(store)
+    run = await start(executor)
     task = asyncio.create_task(executor.execute(run))
     await wait_for_event(store, run.id, "tool.started")
     await asyncio.sleep(0.3)
@@ -179,7 +186,7 @@ async def test_cancelling_during_a_command_kills_it_and_answers_the_calls(loop_p
     tools = [m.message for m in await store.messages("s1") if m.message.role == "tool"]
     assert [(t.tool_call_id, t.text) for t in tools] == [("c1", "The command was cancelled."),
                                                          ("c2", "The command was cancelled.")]
-    await executor.execute(await start(store, "again"))
+    await executor.execute(await start(executor, "again"))
     roles = [m.role for m in provider.requests[-1].messages]
     assert roles == ["user", "assistant", "tool", "tool", "user"]
 
@@ -201,7 +208,7 @@ async def test_an_internal_error_answers_the_unanswered_calls(loop_parts):
         return await real(run_id, type_, data)
 
     executor.emit = flaky
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     done = await store.get_run("p1", run.id)
     assert (done.status, done.error_code) == ("failed", "internal_error")
@@ -209,7 +216,7 @@ async def test_an_internal_error_answers_the_unanswered_calls(loop_parts):
     assert [r[0] for r in results] == ["c1", "c2"]
     assert results[1][1] == "The command was cancelled."
     executor.emit = real
-    await executor.execute(await start(store, "again"))
+    await executor.execute(await start(executor, "again"))
     assert [m.role for m in provider.requests[-1].messages] == ["user", "assistant", "tool", "tool", "user"]
 
 
@@ -226,7 +233,7 @@ async def test_a_cancel_right_after_the_assistant_commit_answers_its_calls(loop_
         return stored
 
     store.append_message = append
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).status == "cancelled"
     assert [r[0] for r in await tool_results(store)] == ["c1", "c2"]
@@ -243,7 +250,7 @@ async def test_a_failed_assistant_commit_leaves_no_synthetic_results(loop_parts)
         return await real(session_id, run_id, message)
 
     store.append_message = append
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).error_code == "internal_error"
     assert await tool_results(store) == []
@@ -261,7 +268,7 @@ async def test_tool_completed_is_emitted_after_the_result_is_committed(loop_part
         return await real(run_id, type_, data)
 
     executor.emit = spy
-    await executor.execute(await start(store))
+    await executor.execute(await start(executor))
     assert seen == [1]
 
 
@@ -270,7 +277,7 @@ async def test_the_working_directory_is_saved_even_if_the_run_is_cancelled_in_th
     (work / "sub").mkdir(parents=True)
     provider.script = [[call("terminal", "c1", command="cd sub"), call("terminal", "c2", command="sleep 30"),
                         Completed(Usage(1, 1, 0, 0))]]
-    run = await start(store)
+    run = await start(executor)
     task = asyncio.create_task(executor.execute(run))
     await wait_for_event(store, run.id, "tool.started", count=2)
     task.cancel()
@@ -279,12 +286,10 @@ async def test_the_working_directory_is_saved_even_if_the_run_is_cancelled_in_th
     assert Path(cwd).resolve() == (work / "sub").resolve()
 
 
-async def test_a_skill_listing_that_cannot_run_fails_the_run_as_sandbox_unavailable(store, tmp_path):
-    class NoFind(LocalSandbox):
-        async def exec(self, sandbox, argv, **kwargs):
-            if "keel-discover" in argv:
-                raise SandboxError("the sandbox went away")
-            return await super().exec(sandbox, argv, **kwargs)
+async def test_a_skill_listing_that_cannot_run_fails_the_run_as_sandbox_unavailable(store, tmp_path, monkeypatch):
+    async def no_find(ticket, argv):
+        if "keel-discover" in argv:
+            raise SandboxError("the sandbox went away")
 
     provider = FakeProvider()
     registry = ProviderRegistry()
@@ -292,8 +297,9 @@ async def test_a_skill_listing_that_cannot_run_fails_the_run_as_sandbox_unavaila
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=["helper"],
                                sandbox={"image": "local", "workdir": str(tmp_path / "w"),
                                         "skills_path": str(tmp_path / "skills")})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=NoFind(), sleep=no_sleep)
-    run = await start(store)
+    executor, backend = await coordinated(store, tmp_path, monkeypatch, registry, sleep=no_sleep)
+    backend.exec_hook = no_find
+    run = await start(executor)
     await executor.execute(run)
     done = await store.get_run("p1", run.id)
     assert (done.status, done.error_code) == ("failed", "sandbox_unavailable")
@@ -313,7 +319,7 @@ async def test_a_cancel_before_a_result_commits_answers_that_call_exactly_once(l
         return await real(session_id, run_id, message)
 
     store.append_message = append
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).status == "cancelled"
     assert [r[0] for r in await tool_results(store)] == ["c1", "c2"]
@@ -332,7 +338,7 @@ async def test_a_result_that_committed_before_an_exception_is_not_duplicated(loo
         return stored
 
     store.append_message = append
-    run = await start(store)
+    run = await start(executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).error_code == "internal_error"
     assert [r[0] for r in await tool_results(store)] == ["c1", "c2"]
@@ -350,7 +356,7 @@ async def test_a_new_turn_answers_calls_a_dead_run_left_open(loop_parts):
     await store.append_message("s1", old.id, Message("assistant", (), tool_calls=(ToolCall("x1", "terminal", "{}"),)))
     await store.finish_run(old.id, "failed", output="", usage=Usage(), error_code="lost", error="swept")
     provider.script = [answer()]
-    await executor.execute(await start(store, "new"))
+    await executor.execute(await start(executor, "new"))
     roles = [m.role for m in provider.requests[0].messages]
     assert roles == ["user", "assistant", "tool", "user"]
     assert await tool_results(store) == [("x1", "The command was cancelled.")]
@@ -377,7 +383,7 @@ async def test_a_cancel_during_internal_error_cleanup_still_finishes_the_run(loo
         await original(run, state)
 
     executor._answer_pending = slow_answer
-    run = await start(store)
+    run = await start(executor)
     task = asyncio.create_task(executor.execute(run))
     await reached.wait()
     task.cancel()
@@ -402,7 +408,7 @@ async def test_a_forced_termination_suppresses_late_events_and_stays_the_last_ev
     executor.emit = emit
     provider.script = [[call("terminal", command="sleep 0.3"), Completed(Usage(1, 1, 0, 0))],
                        answer("after")]
-    run = await start(store)
+    run = await start(executor)
     task = asyncio.create_task(executor.execute(run))
     await tool_started.wait()
     forced = await store.finish_run(run.id, "failed", error_code="worker_lost", error="the worker was lost")
@@ -421,7 +427,7 @@ async def test_the_internal_error_path_kills_a_running_command(loop_parts):
     provider.script = [[call("terminal", "c1", command="(sleep 1; touch late) & sleep 30"),
                         Completed(Usage(1, 1, 0, 0))]]
     # Fail the run from outside the command while it is still running (after tool.started plus 0.3 s).
-    run = await start(store)
+    run = await start(executor)
     real_emit = executor.emit
 
     async def emit(run_id, type_, data):
@@ -467,7 +473,7 @@ async def test_a_stale_runs_late_cleanup_does_not_duplicate_the_repaired_result(
     store, provider, executor, _ = loop_parts
     old = await seed_open_call(store)
     provider.script = [answer()]
-    await executor.execute(await start(store, "new"))
+    await executor.execute(await start(executor, "new"))
     state = _RunState()
     await executor._answer_pending(old, state)
     assert await tool_results(store) == [("x1", "The command was cancelled.")]
@@ -484,58 +490,49 @@ async def test_a_failed_repair_write_fails_the_turn_before_the_user_message(loop
         return await real(session_id, run_id, message)
 
     store.append_message = append
-    run = await start(store, "new")
+    run = await start(executor, "new")
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).error_code == "internal_error"
     assert provider.requests == []
     assert [m.message.text for m in await store.messages("s1") if m.message.role == "user"] == ["old"]
 
 
-async def test_a_stored_policy_outside_the_mount_root_fails_the_run(store, tmp_path):
+async def test_a_stored_policy_outside_the_mount_root_fails_the_run(store, tmp_path, monkeypatch):
     provider = FakeProvider()
     registry = ProviderRegistry()
     registry.register(provider)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": "/w",
                                         "mounts": [{"source": "/etc", "target": "/x"}]})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(), sleep=no_sleep,
-                           mount_root="/srv/data")
-    run = await start(store)
+    executor, backend = await coordinated(store, tmp_path, monkeypatch, registry, sleep=no_sleep,
+                                          mount_root="/srv/data")
+    run = await start(executor)
     await executor.execute(run)
     done = await store.get_run("p1", run.id)
     assert (done.status, done.error_code) == ("failed", "sandbox_unavailable")
-    assert provider.requests == []
+    assert provider.requests == [] and backend.calls == []
+    assert (await store.get_run_usage(run.id)).state == "released"
 
 
 # --- final fix wave ---
 
-class CountingSandbox(LocalSandbox):
-    def __init__(self):
-        super().__init__(kill_grace_s=0.5)
-        self.execs = []
-
-    async def exec(self, sandbox, argv, **kwargs):
-        self.execs.append(argv)
-        return await super().exec(sandbox, argv, **kwargs)
-
 
 async def test_skill_discovery_is_cached_for_the_ttl(loop_parts):
     store, provider, executor, _ = loop_parts
-    counting = CountingSandbox()
     now = [100.0]
-    executor.sandbox, executor._clock, executor.skills_ttl_s = counting, lambda: now[0], 60.0
+    executor._clock, executor.skills_ttl_s = lambda: now[0], 60.0
     provider.script = [answer(), answer(), answer()]
 
     def discoveries():
-        return sum(1 for argv in counting.execs if "keel-discover" in argv)
+        return sum(1 for _, argv in executor.backend.exec_calls if "keel-discover" in argv)
 
-    await executor.execute(await start(store, "one"))
+    await executor.execute(await start(executor, "one"))
     assert discoveries() == 1
     now[0] = 130.0
-    await executor.execute(await start(store, "two"))
+    await executor.execute(await start(executor, "two"))
     assert discoveries() == 1
     now[0] = 161.0
-    await executor.execute(await start(store, "three"))
+    await executor.execute(await start(executor, "three"))
     assert discoveries() == 2
 
 
@@ -546,10 +543,10 @@ async def test_a_vanished_session_cwd_is_reset_in_the_store(loop_parts):
     provider.script = [[call("terminal", command="cd sub"), Completed(Usage(1, 1, 0, 0))], answer(),
                        [call("terminal", command="pwd"), call("execute_code", "c2", code="print(1)"),
                         Completed(Usage(1, 1, 0, 0))], answer()]
-    await executor.execute(await start(store, "one"))
+    await executor.execute(await start(executor, "one"))
     assert (await store.get_session("p1", "s1")).cwd.endswith("/sub")
     shutil.rmtree(work / "sub")
-    await executor.execute(await start(store, "two"))
+    await executor.execute(await start(executor, "two"))
     tools = [json.loads(m.message.text) for m in await store.messages("s1") if m.message.role == "tool"][-2:]
     assert all(t["exit_code"] == 0 for t in tools) and "no longer exists" in tools[0]["output"]
     assert (await store.get_session("p1", "s1")).cwd == str(work)
@@ -559,7 +556,7 @@ async def test_a_cancelled_tool_still_gets_its_tool_completed(loop_parts):
     store, provider, executor, _ = loop_parts
     provider.script = [[call("terminal", "c1", command="sleep 30"), call("terminal", "c2", command="echo second"),
                         Completed(Usage(1, 1, 0, 0))]]
-    run = await start(store)
+    run = await start(executor)
     task = asyncio.create_task(executor.execute(run))
     await wait_for_event(store, run.id, "tool.started")
     await asyncio.sleep(0.3)
@@ -586,8 +583,8 @@ async def test_every_request_of_a_multi_turn_session_renders_as_valid_responses_
         [call("terminal", "b1", command="sleep 30"), Completed(Usage(1, 1, 0, 0))],
         answer("saw the picture"),
     ]
-    await executor.execute(await start(store, "turn one"))
-    cancelled = await start(store, "turn two")
+    await executor.execute(await start(executor, "turn one"))
+    cancelled = await start(executor, "turn two")
     task = asyncio.create_task(executor.execute(cancelled))
     await wait_for_event(store, cancelled.id, "tool.started")
     await asyncio.sleep(0.3)
@@ -598,7 +595,7 @@ async def test_every_request_of_a_multi_turn_session_renders_as_valid_responses_
                            input_parts=[{"type": "text", "text": "turn three"},
                                         {"type": "image", "media_type": "image/png", "data_b64": png}],
                            instructions=None)
-    await executor.execute(await store.claim_run("w1", 9_999_999))
+    await executor.execute(await executor.claim_next())
     assert (await store.get_run("p1", cancelled.id)).status == "cancelled"
     transport = ResponsesTransport("fake", "http://unused", httpx.AsyncClient())  # build_body makes no request
     assert len(provider.requests) == 4

@@ -13,6 +13,12 @@ All notable changes to this project are documented here. The format follows
   policy/helper generations after their users finish.
 - The sandbox coordinator records commands, file/skill helpers and cleanup before dispatch, verifies supervisor
   receipts before finishing executions, and gates cancellation on the original execution and current usage lease.
+- Sandboxed runs execute only under a coordinated claim's usage. The worker renews the run lease until the run is
+  terminal and the usage lease until the executor's cleanup (including release) returns, both on database time,
+  and cancels a run by its last confirmed usage deadline. A failed sandbox use ends the run as
+  `sandbox_unavailable` after its tool result is stored, instead of recreating the container mid-run; recovery
+  replaces the generation before the next run. Cancellation sends one bounded supervisor control request, with no
+  hard-kill retry, and the lease sweeper hands lost runs to coordinator recovery instead of signalling a command.
 
 ## [0.3.0-rc.2] - 2026-10-18
 

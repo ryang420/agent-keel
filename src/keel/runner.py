@@ -23,17 +23,23 @@ from keel.prompt import DEFAULT_IDENTITY, build_system_prompt
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy, profile_mount_root
+from keel.sandbox.records import MAX_DIAGNOSTIC_CHARS, UseHandle
 from keel.skills import discover_skills
 from keel.store.base import Event, Run, StoredMessage, TitleInUse, UnknownRun
 from keel.titles import (
     MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
 )
 from keel.tools import ToolContext, ToolOutcome, run_tool
-from keel.tools.base import preview_for
+from keel.tools.base import preview_for, redact
 
 log = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 60
 CANCELLED_TOOL_RESULT = "The command was cancelled."
+LEASE_LOST_MESSAGE = "The run lost its sandbox lease."
+# A helper control request may take the TERM grace plus the descendant reap timeout plus this much Docker transport;
+# the runner waits one second more for the coordinator to record the receipt, then leaves the outcome uncertain.
+CONTROL_TRANSPORT_S = 15.0
+CONTROL_MARGIN_S = 1.0
 __all__ = ["CANCELLED_TOOL_RESULT", "DEFAULT_IDENTITY", "DEFAULT_MAX_ITERATIONS", "RunExecutor", "RunFailure"]
 
 
@@ -45,6 +51,18 @@ class RunFailure(Exception):
         self.code = code
 
 
+class _RunEnded(Exception):
+    """The run became terminal elsewhere (a sweep, recovery or stop); late model output must not run a tool."""
+
+
+def _sandbox_failure(error: Exception) -> RunFailure:
+    """sandbox_unavailable with a redacted diagnostic bounded like other stored sandbox evidence."""
+    message = "The sandbox is unavailable: " + redact(str(error) or type(error).__name__)
+    if len(message) > MAX_DIAGNOSTIC_CHARS:
+        message = message[:MAX_DIAGNOSTIC_CHARS - 3] + "..."
+    return RunFailure("sandbox_unavailable", message)
+
+
 @dataclass
 class _RunState:
     """What the failure and cancel paths need to know about a run in progress."""
@@ -52,8 +70,12 @@ class _RunState:
     text: list[str] = field(default_factory=list)       # the current model message's text so far
     usage: Usage = field(default_factory=Usage)
     pending: list[ToolCall] = field(default_factory=list)  # committed tool calls that have no result yet
-    sandbox: object = None
+    use: UseHandle | None = None  # the claim's usage; released in the executor's final cleanup
+    sandbox: object = None  # the bound sandbox once preparation published or shared a generation
     exec_id: str | None = None
+    control: asyncio.Future | None = None  # the one cancellation control of `control_exec`, joined by retries
+    control_exec: str | None = None
+    control_deadline: float = 0.0
     open_tool: tuple | None = None  # (call, preview, started at) of a tool that has started and not completed
     streamed: bool = False  # the current model call has produced output, so it must not be retried
 
@@ -80,29 +102,41 @@ def _unanswered(stored_messages, run_id: str | None = None) -> list[ToolCall]:
 
 
 class RunExecutor:
-    def __init__(self, store, bus, providers: ProviderRegistry, *, sandbox=None, sleep=asyncio.sleep,
-                 max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None, kill_timeout_s: float = 10.0,
-                 skills_ttl_s: float = 60.0, clock=time.monotonic, now=lambda: datetime.now(UTC),
-                 compression_threshold: float = 0.75, background=None, memory_chars: int = 2200,
-                 user_chars: int = 1375, memory_review_turns: int = 10) -> None:
+    """Runs one claimed run. With a coordinator, a sandboxed run executes only through the usage its claim reserved:
+    the executor prepares a bound handle, routes every tool through the coordinator facade, and releases the usage in
+    a final cleanup that cancellation cannot interrupt. It never creates a sandbox by profile name."""
+
+    def __init__(self, store, bus, providers: ProviderRegistry, *, coordinator=None, sleep=asyncio.sleep,
+                 max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None,
+                 kill_grace_s: float = 3.0, skills_ttl_s: float = 60.0, clock=time.monotonic,
+                 now=lambda: datetime.now(UTC), compression_threshold: float = 0.75, background=None,
+                 memory_chars: int = 2200, user_chars: int = 1375, memory_review_turns: int = 10) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
-        self.sandbox = sandbox
+        self.coordinator = coordinator
         self.background = background
         self.memory_chars = memory_chars
         self.user_chars = user_chars
         self.memory_review_turns = memory_review_turns
         self.max_iterations = max_iterations
         self.mount_root = mount_root
-        self.kill_timeout_s = kill_timeout_s
+        reap = coordinator.reap_seconds if coordinator is not None else 0.0
+        # One control request's receipt-aware budget; a timeout leaves the exec uncertain, never retried by PID.
+        self.cancel_budget_s = kill_grace_s + reap + CONTROL_TRANSPORT_S + CONTROL_MARGIN_S
         self.skills_ttl_s = skills_ttl_s
         self._sleep = sleep
         self._now = now
         self._clock = clock
         # (profile, policy digest, enabled skills) -> (expires at, discovered skills): later turns skip discovery
         self._skills_cache: dict[tuple, tuple[float, list]] = {}
+        self._lease_lost: set[str] = set()  # runs the worker cancelled because their usage lease was lost
         self.compactor = Compactor(store, threshold=compression_threshold, sleep=sleep, now=now, emit=self.emit)
+
+    def note_lease_lost(self, run_id: str) -> None:
+        """Called by the worker before it cancels a run whose usage it could not renew: the run fails as
+        sandbox_unavailable rather than looking like a user's stop."""
+        self._lease_lost.add(run_id)
 
     async def emit(self, run_id: str, type_: str, data: dict) -> Event | None:
         """Persist an ordinary event and wake its readers; None means a late write was suppressed."""
@@ -126,16 +160,18 @@ class RunExecutor:
         await self.bus.notify(run.id)
         return True
 
-    async def execute(self, run: Run) -> None:
-        state = _RunState()
+    async def execute(self, run: Run, *, usage: UseHandle | None = None) -> None:
+        """Never raises. The run ends in one terminal transition; then its usage, if any, is released. Run
+        termination and sandbox release are different events: release needs proven cleanup, so an uncertain
+        execution leaves the usage protective for recovery."""
+        state = _RunState(use=usage)
         try:
             await self.emit(run.id, "run.started", {"provider": run.provider, "model": run.model,
                                                     "reasoning_effort": run.reasoning_effort})
             await self._loop(run, state)
         except (ModelError, RunFailure) as error:
-            await self._finish(run, "failed", output="".join(state.text), usage=state.usage,
-                               error_code=error.code, error=str(error))
-        except asyncio.CancelledError:
+            await self._shielded(run, self._fail(run, state, error), "record the failure")
+        except (asyncio.CancelledError, _RunEnded):
             # Swallowed on purpose: the run ends cancelled and execute returns normally.
             current = asyncio.current_task()
             if current is not None:
@@ -145,6 +181,9 @@ class RunExecutor:
         except Exception:
             log.exception("run %s failed with an internal error", run.id)
             await self._shielded(run, self._fail_internal(run, state), "record the failure")
+        self._lease_lost.discard(run.id)
+        if usage is not None:
+            await self._shielded(run, self._release(run, state), "release its sandbox usage")
 
     async def _shielded(self, run: Run, work, what: str) -> None:
         """Run cleanup to completion even if the task is cancelled again meanwhile; those late cancellations
@@ -171,36 +210,53 @@ class RunExecutor:
         await self._finish(run, "failed", output="".join(state.text), usage=state.usage,
                            error_code="internal_error", error=message)
 
-    async def _kill_command(self, run: Run, state: _RunState) -> None:
-        """Kill the command the run is executing; cancelling the docker client alone would leave it running."""
-        if not (state.exec_id and state.sandbox is not None and self.sandbox is not None):
-            return
-        for timeout in (self.kill_timeout_s, 2.0):  # the second try is the last best-effort hard kill
-            try:
-                await asyncio.wait_for(self.sandbox.kill_tree(state.sandbox, state.exec_id), timeout)
-            except Exception:
-                log.warning("run %s: could not kill its command", run.id, exc_info=True)
-                continue
-            state.exec_id = None
-            await self._clear_exec(run)
-            return
+    async def _fail(self, run: Run, state: _RunState, error: ModelError | RunFailure) -> None:
+        """Fail the run with the error's code. Calls a failed sandbox use left unanswered are answered, so the
+        transcript stays valid even though no tool ran for them."""
+        if isinstance(error, RunFailure) and (state.pending or state.open_tool is not None):
+            await self._close_tool(run, state)
+            await self._answer_pending(run, state)
+        await self._finish(run, "failed", output="".join(state.text), usage=state.usage,
+                           error_code=error.code, error=str(error))
 
-    async def kill_orphaned_command(self, run: Run) -> None:
-        """For a run swept as worker_lost: kill the command its dead worker started, so it does not run on. Best
-        effort and never raises; the exec id is cleared either way, since the run is over. It never creates a
-        sandbox: this instance may not share the dead worker's Docker daemon, and then there is nothing to kill."""
-        if not run.current_exec_id:
+    async def _kill_command(self, run: Run, state: _RunState) -> None:
+        """Cancel the command the run is executing through its supervisor; closing the client alone proves nothing.
+
+        One control request per exec, bounded by the receipt-aware budget; a second call joins it with the same
+        deadline. Without a verified receipt the exec stays uncertain and its pointer stays set: no hard-kill
+        retry and no numeric process signal.
+        """
+        if not (state.exec_id and state.sandbox is not None and self.coordinator is not None):
             return
-        if self.sandbox is not None:
-            try:
-                profile = await self.store.get_profile(run.profile_id)
-                if profile is not None and profile.sandbox:
-                    policy = parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
-                    sandbox = self.sandbox.reference(run.profile_id, policy)
-                    await asyncio.wait_for(self.sandbox.kill_tree(sandbox, run.current_exec_id), self.kill_timeout_s)
-            except Exception:
-                log.warning("run %s: could not kill the command of its lost worker", run.id, exc_info=True)
+        loop = asyncio.get_running_loop()
+        if state.control is None or state.control_exec != state.exec_id:
+            state.control = asyncio.ensure_future(self.coordinator.kill_tree(state.sandbox, state.exec_id))
+            state.control_exec = state.exec_id
+            state.control_deadline = loop.time() + self.cancel_budget_s
+        control = state.control
+        try:
+            await asyncio.wait_for(asyncio.shield(control), max(0.0, state.control_deadline - loop.time()))
+        except TimeoutError:
+            control.cancel()  # its own handler records the uncertainty
+            await asyncio.gather(control, return_exceptions=True)
+            log.warning("run %s: its command's cleanup was not confirmed in time; recovery keeps the evidence",
+                        run.id)
+            return
+        except Exception:
+            log.warning("run %s: could not confirm its command's cleanup; recovery keeps the evidence", run.id,
+                        exc_info=True)
+            return
+        state.exec_id = None
         await self._clear_exec(run)
+
+    async def _release(self, run: Run, state: _RunState) -> None:
+        """Release the claim's usage after the run ended. Without a bound sandbox it abandons the preparation (the
+        store's guarded section 11.1 check decides); a False result leaves persistent evidence for recovery."""
+        if self.coordinator is None or state.use is None:
+            return
+        released = await self.coordinator.release(state.use, abandon_preparation=state.sandbox is None)
+        if not released:
+            log.warning("run %s: its sandbox usage was not released; recovery will reconcile it", run.id)
 
     async def _clear_exec(self, run: Run) -> None:
         try:
@@ -246,10 +302,15 @@ class RunExecutor:
                 log.warning("run %s: could not answer tool call %s", run.id, call.id, exc_info=True)
 
     async def _cancel(self, run: Run, state: _RunState) -> None:
-        """End a stopped run: kill its running command, answer its unanswered tool calls, finish it cancelled."""
+        """End a stopped run: kill its running command, answer its unanswered tool calls, finish it cancelled (or
+        failed, when the worker cancelled it because its usage lease was lost)."""
         await self._kill_command(run, state)
         await self._close_tool(run, state)
         await self._answer_pending(run, state)
+        if run.id in self._lease_lost:
+            await self._finish(run, "failed", output="".join(state.text), usage=state.usage,
+                               error_code="sandbox_unavailable", error=LEASE_LOST_MESSAGE)
+            return
         await self._finish(run, "cancelled", output="".join(state.text), usage=state.usage)
 
     async def _loop(self, run: Run, state: _RunState) -> None:
@@ -260,24 +321,29 @@ class RunExecutor:
         profile = await self.store.get_profile(run.profile_id)
         session = await self.store.get_session(run.profile_id, run.session_id)
         policy = None
-        if self.sandbox is not None and profile is not None and profile.sandbox:
+        if self.coordinator is not None and profile is not None and profile.sandbox:
             try:
                 policy = parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
             except PolicyError as exc:
                 raise RunFailure("sandbox_unavailable", f"The sandbox policy is invalid: {exc}") from exc
         ctx, skills = None, []
         if policy is not None:
+            if state.use is None:
+                # Only a coordinated claim reserves usage; never prepare a sandbox for a legacy claim.
+                raise RunFailure("sandbox_unavailable", "The run was claimed without sandbox usage.")
             try:
-                sandbox = await self.sandbox.ensure(run.profile_id, policy)
+                sandbox = await self.coordinator.prepare(state.use)
             except SandboxError as exc:
-                raise RunFailure("sandbox_unavailable", str(exc)) from exc
+                raise _sandbox_failure(exc) from exc
             state.sandbox = sandbox
+            policy = sandbox.policy  # the published generation's applied policy
             if policy.skills_path:
                 try:
                     skills = await self._skills(run.profile_id, sandbox, policy, profile.skills)
                 except SandboxError as exc:
-                    raise RunFailure("sandbox_unavailable", str(exc)) from exc
-            ctx = ToolContext(self.sandbox, sandbox, cwd=(session.cwd if session and session.cwd else policy.workdir),
+                    raise _sandbox_failure(exc) from exc
+            ctx = ToolContext(self.coordinator, sandbox,
+                              cwd=(session.cwd if session and session.cwd else policy.workdir),
                               skills=tuple(skills), on_exec=self._exec_recorder(run, state), store=self.store,
                               profile_id=run.profile_id, session_id=run.session_id, memory_chars=self.memory_chars,
                               user_chars=self.user_chars)
@@ -340,7 +406,8 @@ class RunExecutor:
                 raise
             if not calls:
                 if await self._finish(run, "completed", output=output, usage=state.usage, incomplete=incomplete):
-                    await self._after_complete(run, profile)
+                    # The worker may cancel a terminal run at any moment; completion work still finishes.
+                    await self._shielded(run, self._after_complete(run, profile), "finish the completed run")
                 return
             for call in calls:
                 outcome, duration, preview = await self._call_tool(run, call, ctx, state)
@@ -360,6 +427,10 @@ class RunExecutor:
                 if ctx.cwd != saved_cwd:
                     await self.store.set_session_cwd(run.session_id, ctx.cwd)
                     saved_cwd = ctx.cwd
+                if outcome.sandbox_error is not None:
+                    # The result is committed and paired; a failed sandbox use ends the run rather than continuing
+                    # against a generation whose state is now uncertain.
+                    raise _sandbox_failure(outcome.sandbox_error)
         raise AssertionError("unreachable: the final iteration offers no tools")
 
     async def _model_call(self, run: Run, turn: _Turn, state: _RunState, *,
@@ -433,7 +504,7 @@ class RunExecutor:
         cached = self._skills_cache.get(key)
         if cached is not None and self._clock() < cached[0]:
             return cached[1]
-        skills = await discover_skills(self.sandbox, sandbox, policy.skills_path, enabled)
+        skills = await discover_skills(self.coordinator, sandbox, policy.skills_path, enabled)
         if skills:  # an empty result may be a failed listing; look again next turn
             self._skills_cache[key] = (self._clock() + self.skills_ttl_s, skills)
         else:
@@ -445,7 +516,9 @@ class RunExecutor:
         preview = preview_for(call.name, call.arguments)
         started = time.monotonic()
         state.open_tool = (call, preview, started)
-        await self.emit(run.id, "tool.started", {"tool_call_id": call.id, "tool": call.name, "preview": preview})
+        if await self.emit(run.id, "tool.started", {"tool_call_id": call.id, "tool": call.name,
+                                                    "preview": preview}) is None:
+            raise _RunEnded(run.id)  # the run is already terminal: a late model result launches nothing
         ctx.tool_call_id = call.id
         outcome = await run_tool(call.name, call.arguments, ctx)
         return outcome, round(time.monotonic() - started, 3), preview

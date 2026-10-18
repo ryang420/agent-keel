@@ -48,7 +48,9 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
         backend = DockerSandbox(docker=settings.docker, deployment=settings.deployment,
                                 idle_seconds=settings.sandbox_idle_seconds, mount_root=settings.sandbox_mount_root)
     background = Background(limit=settings.background_limit)
-    executor = RunExecutor(store, bus, registry, sandbox=backend, max_iterations=settings.max_iterations,
+    # The sandbox coordinator (claims, startup reconciliation, maintenance) is wired with the service's
+    # coordinated startup; until then this executor runs no sandbox work.
+    executor = RunExecutor(store, bus, registry, max_iterations=settings.max_iterations,
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold,
                           background=background, memory_chars=settings.memory_chars, user_chars=settings.user_chars,
                           memory_review_turns=settings.memory_review_turns)

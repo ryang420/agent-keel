@@ -8,14 +8,43 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+from pathlib import Path
 import uuid
 from contextlib import asynccontextmanager
 
-from keel.sandbox.base import parse_policy
-from keel.sandbox.records import ContainerObservation, DockerOutcome, RunClaim
+import keel.sandbox.runtime as sandbox_runtime
+from keel.runner import RunExecutor
+from keel.sandbox.base import Sandbox, parse_policy
+from keel.sandbox.coordinator import SandboxCoordinator
+from keel.sandbox.local import LocalSandbox
+from keel.sandbox.records import CleanupReceipt, ContainerObservation, DockerOutcome, RunClaim
+from keel.sandbox.runtime import HELPER_MANIFEST_NAME, HELPER_MANIFEST_VERSION, HELPER_PROTOCOL_VERSION
 
 MODELS = [{"provider": "fake", "model": "m"}]
 DEFAULT_SANDBOX = {"image": "img", "workdir": "/w"}
+LOCAL_DEPLOYMENT = "dep"
+LOCAL_DAEMON = "daemon-1"
+
+
+def install_helper_assets(directory: Path, monkeypatch) -> dict[str, str]:
+    """Write synthetic helper artifacts into `directory` and point `artifact_directory` at it.
+
+    Tests never read the gitignored built binaries. The returned mapping holds each architecture's digest.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    digests, artifacts = {}, {}
+    for architecture in ("amd64", "arm64"):
+        data = f"synthetic keel supervisor for {architecture}".encode()
+        path = directory / f"keel-supervisor-linux-{architecture}"
+        path.write_bytes(data)
+        path.chmod(0o755)
+        digests[architecture] = hashlib.sha256(data).hexdigest()
+        artifacts[architecture] = {"file": path.name, "sha256": digests[architecture]}
+    manifest = {"version": HELPER_MANIFEST_VERSION, "protocol": HELPER_PROTOCOL_VERSION, "artifacts": artifacts}
+    (directory / HELPER_MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(sandbox_runtime, "artifact_directory", lambda: directory)
+    return digests
 
 
 class Barrier:
@@ -168,6 +197,99 @@ class FakeDocker:
 
     async def aclose(self) -> None:
         return None
+
+
+class LocalDocker(FakeDocker):
+    """A coordinated backend double whose bound executions run as host processes.
+
+    For executor and worker tests: sandbox paths are host paths, and a new generation creates its policy's
+    workdir. `exec_hook(ticket, argv)` runs before each dispatch and may block or raise; `control_hook(ticket)`
+    runs before each control request. A cancel ends the exec's process group through `LocalSandbox` and returns a
+    complete receipt, standing in for the supervisor (this double is test-only; production never signals a
+    numeric group from outside the container).
+    """
+
+    def __init__(self, *, kill_grace_s: float = 0.5, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.local = LocalSandbox(kill_grace_s=kill_grace_s)
+        self.exec_calls: list[tuple[str, list[str]]] = []
+        self.control_calls: list[str] = []
+        self._exec_containers: dict[str, str] = {}
+        self.exec_hook = None
+        self.control_hook = None
+
+    async def create_generation(self, attempt, policy) -> DockerOutcome:
+        try:
+            Path(policy.workdir).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # a workdir that cannot exist on this host simply fails the commands that need it
+        return await super().create_generation(attempt, policy)
+
+    @staticmethod
+    def _handle(ticket) -> Sandbox:
+        return Sandbox(ticket.use.key.profile_id, ticket.binding.container_id, ticket.binding.policy)
+
+    async def exec_bound(self, ticket, argv, *, cwd, timeout_s, env=None, stdin=None, authorize_control=None):
+        self.exec_calls.append((ticket.exec_id, list(argv)))
+        self._exec_containers[ticket.exec_id] = ticket.binding.container_id
+        if self.exec_hook is not None:
+            await self.exec_hook(ticket, argv)
+        result = await self.local.exec(self._handle(ticket), argv, cwd=cwd, timeout_s=timeout_s,
+                                       exec_id=ticket.exec_id, env=env, stdin=stdin)
+        return result, CleanupReceipt(ticket.exec_id, ticket.control_token, result.exit_code, True, True, None)
+
+    async def remove_id(self, attempt) -> DockerOutcome:
+        """Removing a container ends every process that ran in it, as Docker's forced removal does."""
+        result = await super().remove_id(attempt)
+        if result.state == "succeeded":
+            for exec_id, container in list(self._exec_containers.items()):
+                if container == attempt.container_id:
+                    await self.local.kill_tree(None, exec_id)
+        return result
+
+    async def control_exec(self, ticket, *, cancel: bool) -> CleanupReceipt:
+        self.control_calls.append(ticket.exec_id)
+        if self.control_hook is not None:
+            await self.control_hook(ticket)
+        if cancel:
+            await self.local.kill_tree(self._handle(ticket), ticket.exec_id)
+        return CleanupReceipt(ticket.exec_id, ticket.control_token, 0, True, True, None)
+
+
+async def local_coordinator(store, directory: Path, monkeypatch, *, owner: str = "w1",
+                            lease_seconds: float = 30.0, idle_seconds: float = 1800.0, bus=None,
+                            backend: LocalDocker | None = None) -> tuple[SandboxCoordinator, LocalDocker]:
+    """An initialized coordinator over a `LocalDocker`, with synthetic helper artifacts under `directory`."""
+    install_helper_assets(directory, monkeypatch)
+    backend = backend or LocalDocker(daemon_id=LOCAL_DAEMON)
+    coordinator = SandboxCoordinator(
+        store, backend, deployment=LOCAL_DEPLOYMENT, owner=owner, lease_seconds=lease_seconds,
+        idle_seconds=idle_seconds, reap_seconds=1.0, bus=bus)
+    await coordinator.initialize()
+    return coordinator, backend
+
+
+class ClaimedExecutor(RunExecutor):
+    """Test-only executor that remembers the usage each coordinated claim reserved, as the worker passes it.
+
+    `claim_next` claims through the coordinator when there is one (the legacy store claim otherwise); `execute`
+    without an explicit usage uses the remembered one.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.claims: dict = {}
+
+    async def claim_next(self, owner: str = "w1"):
+        if self.coordinator is None:
+            return await self.store.claim_run(owner, await self.store.coordination_now() + 3600)
+        claim = await self.coordinator.claim()
+        assert claim is not None, "the coordinator claimed nothing"
+        self.claims[claim.run.id] = claim.use
+        return claim.run
+
+    async def execute(self, run, *, usage=None) -> None:
+        await super().execute(run, usage=usage if usage is not None else self.claims.pop(run.id, None))
 
 
 async def seed_profile(store, profile_id: str = "p1", *, sandbox: dict | None = None):

@@ -11,6 +11,7 @@ from keel.events import InMemoryEventBus
 from keel.providers.base import ProviderRegistry
 from keel.providers.bedrock import BedrockMantleProvider
 from keel.runner import RunExecutor
+from keel.sandbox.coordinator import SandboxCoordinator
 from keel.sandbox.docker import DockerSandbox
 
 pytestmark = pytest.mark.skipif(
@@ -26,14 +27,17 @@ async def test_a_live_run_uses_the_terminal(store):
     image = os.environ.get("KEEL_TEST_DOCKER_IMAGE", "python:3.12-slim")
     await store.upsert_profile("p1", models=[{"provider": "bedrock", "model": model}], soul="", skills=[],
                                sandbox={"image": image, "workdir": "/work"})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=backend)
+    coordinator = SandboxCoordinator(store, backend, deployment=backend.deployment, owner="w1",
+                                     lease_seconds=30.0, idle_seconds=1800.0, reap_seconds=5.0)
+    executor = RunExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator)
     try:
         await store.ensure_session("p1", "s1")
         await store.create_run(profile_id="p1", session_id="s1", provider="bedrock", model=model,
                                reasoning_effort="low", instructions=None, input_parts=[{"type": "text", "text":
                                "Use the terminal tool to run: echo keel-$((6*7)). Then reply with exactly what it printed."}])
-        run = await store.claim_run("w1", 9_999_999)
-        await asyncio.wait_for(executor.execute(run), 180)
+        claim = await coordinator.claim()
+        run = claim.run
+        await asyncio.wait_for(executor.execute(run, usage=claim.use), 180)
         done = await store.get_run("p1", run.id)
         assert done.status == "completed" and "keel-42" in done.output
         assert any(e.type == "tool.started" for e in await store.events_after(run.id, 0))
