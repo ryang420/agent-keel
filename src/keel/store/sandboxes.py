@@ -1669,7 +1669,22 @@ class SandboxStoreMixin:
                 targets.append((key, sandbox["error_message"]))
         return targets
 
-    async def clear_resolved_inventory_block(self, key: SandboxKey, *, daemon_id: str) -> bool:
+    async def unpublished_inventory_block(self, key: SandboxKey) -> str | None:
+        """The conflicting container ID recorded on a `blocked` profile that has no published generation.
+
+        A legacy or unknown container blocks such a profile; the block can clear only after the caller proves this
+        exact ID absent (see `clear_resolved_inventory_block`).
+        """
+        row = await self.db.fetchrow(f"SELECT * FROM sandboxes WHERE {_SANDBOX_IDENTITY}", key.deployment,
+                                     key.profile_id)
+        if (row is None or row["daemon_id"] != key.daemon_id or row["state"] != "blocked"
+                or row["container_id"] is not None or row["error_code"] not in _INVENTORY_BLOCK_CODES
+                or not row["error_message"]):
+            return None
+        return row["error_message"]
+
+    async def clear_resolved_inventory_block(self, key: SandboxKey, *, daemon_id: str,
+                                             offending: str | None = None) -> bool:
         """Clear an admission block after the caller proves the recorded conflicting container absent.
 
         The exact-ID absence evidence must come from this same daemon. A profile still draining for another
@@ -1681,12 +1696,16 @@ class SandboxStoreMixin:
                 return False
             lock = self._lock_suffix()
             sandbox = await self._lock_sandbox(key, lock)
+            if (sandbox is not None and sandbox["container_id"] is None and offending is not None
+                    and sandbox["error_message"] == offending):
+                return await self._clear_unpublished_block(key, sandbox, daemon_id, lock)
             if (sandbox is None or sandbox["daemon_id"] != daemon_id
                     or sandbox["state"] not in ("draining", "blocked")
                     or sandbox["error_code"] not in _INVENTORY_BLOCK_CODES
                     or sandbox["container_id"] is None or sandbox["generation_token"] is None
                     or sandbox["error_message"] is None
-                    or sandbox["error_message"] == sandbox["container_id"]):
+                    or sandbox["error_message"] == sandbox["container_id"]
+                    or (offending is not None and sandbox["error_message"] != offending)):
                 return False
             usages = await self._lock_usages(key, lock)
             execs = await self._lock_execs(key, lock)
@@ -1705,6 +1724,41 @@ class SandboxStoreMixin:
                 "AND generation_token = ? AND state IN ('draining', 'blocked')",
                 now, key.deployment, key.profile_id, sandbox["container_id"], token)
             return True
+
+    async def _clear_unpublished_block(self, key: SandboxKey, sandbox: dict, daemon_id: str, lock: str) -> bool:
+        """Move a blocked profile without a published generation to `absent` once its conflict is proven gone.
+
+        Any unreleased usage, unresolved execution, unresolved current operation or known unconfirmed target keeps
+        the block: those still need their own recovery before a fresh generation may be prepared.
+        """
+        if (sandbox["daemon_id"] != daemon_id or sandbox["state"] != "blocked"
+                or sandbox["error_code"] not in _INVENTORY_BLOCK_CODES):
+            return False
+        usages = await self._lock_usages(key, lock)
+        execs = await self._lock_execs(key, lock)
+        operations = await self._lock_operations(key, lock)
+        if any(use["state"] != "released" for use in usages):
+            return False
+        if any(ex["state"] in _UNRESOLVED_EXEC_STATES for ex in execs):
+            return False
+        token = sandbox["generation_token"]
+        if any(op["authority"] == "current" and op["outcome"] in ("planned", "dispatched", "uncertain")
+               and op["confirmed_absent_at"] is None for op in operations):
+            return False
+        if token is not None and any(
+                op["generation_token"] == token and op["confirmed_absent_at"] is None
+                and (op["container_id"] is not None or op["discovered_container_id"] is not None)
+                for op in operations):
+            return False
+        now = await self.coordination_now()
+        cleared = await self.db.fetchrow(
+            "UPDATE sandboxes SET state = 'absent', generation_token = NULL, container_name = NULL, "
+            "policy_digest = NULL, helper_protocol = NULL, helper_digest = NULL, current_operation_id = NULL, "
+            "idle_since = NULL, error_code = NULL, error_message = NULL, transitioned_at = ? "
+            "WHERE deployment = ? AND profile_id = ? AND daemon_id = ? AND state = 'blocked' "
+            "AND container_id IS NULL AND error_message = ? RETURNING deployment",
+            now, key.deployment, key.profile_id, daemon_id, sandbox["error_message"])
+        return cleared is not None
 
     async def confirm_generation_missing(self, key: SandboxKey, container_id: str) -> bool:
         """Revoke users only after the caller has authoritative exact-ID absence evidence."""

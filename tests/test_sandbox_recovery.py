@@ -617,3 +617,48 @@ async def test_alternating_recovery_and_idle_batches_do_not_starve_later_profile
 async def test_candidate_cursor_rejects_unknown_purpose(store):
     with pytest.raises(ValueError):
         await store.recovery_candidates(purpose="invalid")
+
+
+async def test_an_unknown_container_on_an_unpublished_profile_blocks_until_proven_absent(recovery):
+    # A legacy or unknown container on a profile that never had a coordinated generation blocks only that profile.
+    # The block clears once the recorded exact ID is proven absent on the same daemon, never because of a lapse.
+    coordinator, backend, store, _ = recovery
+    await seed_profile(store, "p1")
+    unknown = "e" * 64
+    labels = (("keel.deployment", "dep"), ("keel.managed", "1"), ("keel.policy", "0" * 16), ("keel.profile", "p1"))
+    backend._created[unknown] = ("keel-sbx-legacy", labels, "0" * 16)
+    backend.running_ids.add(unknown)
+    await coordinator.reconcile_once()
+    await queue_run(store, "waits")
+    assert await coordinator.claim() is None
+    await coordinator.reconcile_once()  # still present: the block stays and nothing is removed
+    assert await coordinator.claim() is None and backend.removed_ids == []
+
+    backend._created.pop(unknown)  # the operator removed it after stopping the old writers
+    await coordinator.reconcile_once()
+    assert ("inspect", unknown, "absent") in backend.journal
+    row = await store.db.fetchrow("SELECT state, error_code FROM sandboxes WHERE profile_id = 'p1'")
+    assert (row["state"], row["error_code"]) == ("absent", None)
+    claim = await coordinator.claim()
+    assert claim is not None and (await store.get_usage(claim.use.usage_id)).state == "preparing"
+
+
+async def test_an_unpublished_block_stays_when_the_absence_is_not_authoritative(recovery):
+    coordinator, backend, store, _ = recovery
+    await seed_profile(store, "p1")
+    unknown = "d" * 64
+    labels = (("keel.deployment", "dep"), ("keel.managed", "1"), ("keel.policy", "0" * 16), ("keel.profile", "p1"))
+    backend._created[unknown] = ("keel-sbx-legacy", labels, "0" * 16)
+    await coordinator.reconcile_once()
+    backend._created.pop(unknown)
+
+    async def uncertain(container_id):
+        return DockerOutcome("uncertain", diagnostic="the inspect did not produce a definite result")
+
+    backend.inspect_id = uncertain
+    report = await coordinator.reconcile_once()
+    assert report.blocked >= 1
+    row = await store.db.fetchrow("SELECT state, error_message FROM sandboxes WHERE profile_id = 'p1'")
+    assert (row["state"], row["error_message"]) == ("blocked", unknown)
+    await queue_run(store, "waits")
+    assert await coordinator.claim() is None

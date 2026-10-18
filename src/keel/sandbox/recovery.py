@@ -182,6 +182,8 @@ class SandboxRecoveryMixin:
                     removed += await self._recover_action(action)
             else:
                 blocked += 1
+        if available and row is not None and row["container_id"] is None:
+            blocked += await self._resolve_unpublished_block(key)
         actions = await self.store.plan_recovery(key, owner=self.owner, lease_seconds=self.lease_seconds)
         _, orphaned = await self.store.recovery_snapshot(key)
         for use in orphaned:
@@ -220,6 +222,29 @@ class SandboxRecoveryMixin:
             except Exception:
                 blocked += 1
         return inspected, removed, released, blocked
+
+    async def _resolve_unpublished_block(self, key: SandboxKey) -> int:
+        """Clear a conflict on a profile with no published generation once its exact ID is proven absent.
+
+        Returns 1 while the block stays. Only the daemon's explicit missing-container answer for the recorded ID,
+        confirmed on the same daemon, counts; a failed inspection or a still-present container keeps the block.
+        """
+        offending = await self.store.unpublished_inventory_block(key)
+        if offending is None:
+            return 0
+        try:
+            outcome = await self.backend.inspect_id(offending)
+            if not confirmed_absent(outcome):
+                return 1
+            daemon, _ = await self.backend.daemon_identity()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return 1
+        if daemon != key.daemon_id:
+            return 1
+        return 0 if await self.store.clear_resolved_inventory_block(
+            key, daemon_id=daemon, offending=offending) else 1
 
     async def _finish_unavailable(self, run_id: str) -> None:
         transition = await self.store.finish_run(
