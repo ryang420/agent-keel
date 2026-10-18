@@ -83,12 +83,12 @@ class SandboxRecoveryMixin:
                 if verified:
                     for key, offending in await self.store.blocked_inventory_targets(
                             verified, daemon_id=daemon_id):
-                        if await self._unrecorded_profile_container(key, inventory):
-                            blocked += 1  # another unclassified container of this profile is still listed
+                        if await self._listing_keeps_block(key, inventory):
+                            blocked += 1  # another container of this profile is still unclassified or conflicting
                             continue
                         try:
                             outcome = await self.backend.inspect_id(offending)
-                            if not confirmed_absent(outcome):
+                            if not self._offender_settled(outcome, offending, inventory):
                                 continue
                             confirmed_daemon, _ = await self.backend.daemon_identity()
                         except asyncio.CancelledError:
@@ -97,7 +97,8 @@ class SandboxRecoveryMixin:
                             blocked += 1
                             continue
                         if confirmed_daemon == daemon_id:
-                            await self.store.clear_resolved_inventory_block(key, daemon_id=daemon_id)
+                            await self.store.clear_resolved_inventory_block(
+                                key, daemon_id=daemon_id, offending=offending)
                 # A cycle completes only when every container of a fresh listing has been classified and the
                 # daemon identity read after the scan is still the one read before it.
                 after, _ = await self.backend.daemon_identity()
@@ -236,13 +237,13 @@ class SandboxRecoveryMixin:
         if offending is None:
             return 0
         try:
-            outcome = await self.backend.inspect_id(offending)
-            if not confirmed_absent(outcome):
-                return 1
             # The block names one offender; others of this profile may sit outside any bounded scan batch (or
             # this may be the sweep's path, which scans nothing). A complete fresh listing must show none.
             listing = await self.backend.inventory()
-            if await self._unrecorded_profile_container(key, listing):
+            if await self._listing_keeps_block(key, listing):
+                return 1
+            outcome = await self.backend.inspect_id(offending)
+            if not self._offender_settled(outcome, offending, listing):
                 return 1
             daemon, _ = await self.backend.daemon_identity()
         except asyncio.CancelledError:
@@ -254,20 +255,40 @@ class SandboxRecoveryMixin:
         return 0 if await self.store.clear_resolved_inventory_block(
             key, daemon_id=daemon, offending=offending) else 1
 
-    async def _unrecorded_profile_container(self, key: SandboxKey, observations) -> bool:
-        """True when a complete listing still holds a container naming this profile that the ledger never recorded.
+    @staticmethod
+    def _offender_settled(outcome: DockerOutcome, offending: str, listing) -> bool:
+        """The recorded offender is proven absent by exact ID, or it is still present but in the complete listing,
+        where `_listing_keeps_block` has just classified it as no longer conflicting (for example a running retired
+        create that was stopped). A present offender missing from the deployment's listing (its deployment label
+        was changed) is never settled."""
+        if confirmed_absent(outcome):
+            return True
+        return outcome.observation is not None and any(item.container_id == offending for item in listing)
 
-        Such a container is unclassified evidence: an admission block must stay until it is gone, whichever single
-        offender the block happens to record. Containers the ledger attributes to the profile are classified by
-        their own recovery (a quarantined retired create, the published generation) and do not keep it blocked.
+    async def _listing_keeps_block(self, key: SandboxKey, observations) -> bool:
+        """True while a complete, unbatched listing holds a container of this profile that must keep its block.
+
+        Every listed container that names the profile, or whose exact ID the ledger records for it, is classified
+        with the same guarded classifier admission relies on. An unknown container, a recorded one whose labels or
+        policy disagree, a running retired create, or a profile another instance holds (`skipped`) keeps the block,
+        whichever single offender the block happens to record. The published generation (`protected`) does not, nor
+        does a stopped retired create that matches its ledger row: it is quarantined and removed by exact ID once
+        the block is gone (the classifier reports it as the profile's existing block, without a container of its
+        own), as section 9 lets historical stopped-only creates proceed separately.
         """
-        named = [item for item in observations
-                 if dict(item.labels).get("keel.profile") == key.profile_id
-                 and dict(item.labels).get("keel.deployment") in (None, key.deployment)]
-        if not named:
-            return False
         recorded = await self.store.recorded_container_ids(key)
-        return any(item.container_id not in recorded for item in named)
+        for item in observations:
+            labels = dict(item.labels)
+            if item.container_id not in recorded and labels.get("keel.profile") != key.profile_id:
+                continue
+            action = await self.store.classify_inventory(item, owner=self.owner, lease_seconds=self.lease_seconds)
+            if action is None or action.action == "skipped":
+                return True
+            if action.action == "blocked" and action.container_id is not None:
+                return True
+            if action.action == "remove":
+                await self._recover_action(action)
+        return False
 
     async def _finish_unavailable(self, run_id: str) -> None:
         transition = await self.store.finish_run(

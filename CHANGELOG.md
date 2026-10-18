@@ -31,9 +31,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
-  including on a profile that never had a coordinated sandbox. The block clears only once the recorded container
-  is proven absent on the same daemon and a complete fresh listing shows no other unrecorded container of that
-  profile.
+  including on a profile that never had a coordinated sandbox. A block clears only when the container it records
+  is proven absent by exact ID on the same daemon (or is still listed but now classifies as non-conflicting), and a
+  complete, unbatched listing of the deployment's containers, each container of that profile classified again,
+  finds none that conflicts: no unknown container, no recorded container whose labels or policy disagree, and no
+  running retired create. A failed listing or inspection keeps the block.
 - A Docker warning printed on stderr (for example a platform mismatch or missing swap accounting) no longer makes a
   successful container creation, inspection, inventory or daemon identity read uncertain: results are parsed from
   stdout only, and stderr is kept as a bounded diagnostic.

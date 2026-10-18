@@ -733,3 +733,72 @@ async def test_a_published_profile_block_stays_while_another_unknown_container_r
     reopened = await coordinator.claim()
     assert reopened is not None and reopened.run.profile_id == "p1"
     assert (await store.get_usage(reopened.use.usage_id)).binding.container_id == bound.name
+
+
+async def _late_retired_create(coordinator, store, backend):
+    """A retired create whose container arrived late (recorded in the ledger), as a stopped container."""
+    claim = await make_claim(store, "old")
+    attempt = await store.begin_lifecycle(claim.use, "create", target=None, create_operation_id=None,
+                                          lease_seconds=30)
+    assert await store.authorize_dispatch(attempt)
+    await store.record_lifecycle_result(attempt, DockerOutcome("uncertain"))
+    assert await store.retire_unbound_preparation(claim.use, abandon=True)
+    await store.finish_run(claim.run.id, "failed", error_code="sandbox_unavailable", error="gone")
+    late = await backend.create_generation(attempt, await coordinator._profile_policy(claim.use))
+    return late.observation.container_id
+
+
+@pytest.mark.parametrize("conflict", ["running_retired_create", "recorded_labels_disagree"])
+@pytest.mark.parametrize("path", ["recover_key", "limited_scan"])
+async def test_a_block_stays_while_a_recorded_container_of_the_profile_still_conflicts(recovery, conflict, path):
+    # Knowing a container's ID is not enough: a running retired create, or a recorded ID whose labels or policy
+    # disagree, is classified as a conflict, and the block must stay while such a container is listed.
+    coordinator, backend, store, _ = recovery
+    backend._containers = ["1" * 64]  # the late create sorts first, so a one-container batch can skip it
+    late = await _late_retired_create(coordinator, store, backend)
+    name, labels, digest = backend._created[late]
+    if conflict == "running_retired_create":
+        backend.running_ids.add(late)  # started outside keel: it may run payload code
+    else:
+        backend._created[late] = (name, tuple((key, "f" * 16 if key == "keel.policy" else value)
+                                              for key, value in labels), digest)
+    unknown = "f" * 64
+    _unknown(backend, unknown)
+    await coordinator.reconcile_once()
+    row = await store.db.fetchrow("SELECT state, error_message FROM sandboxes WHERE profile_id = 'p1'")
+    assert row["state"] == "blocked"
+    # The operator removes the unknown container; the recorded (ledger-known) one still conflicts.
+    backend._created.pop(unknown)
+    key = next(key for key in await store.recovery_candidates(limit=100) if key.profile_id == "p1")
+    if path == "recover_key":
+        await coordinator._recover_key(key)
+    else:
+        coordinator._inventory_cursor = late  # this one-container batch skips the conflicting container
+        await coordinator.reconcile_once(limit=1)
+    await queue_run(store, "waits")
+    assert late in backend._created
+    assert await coordinator.claim() is None, "admission reopened beside a conflicting recorded container"
+
+    if conflict == "running_retired_create":
+        backend.running_ids.discard(late)  # stopped again: an ordinary quarantined late create
+    else:
+        backend._created.pop(late)
+    for _ in range(3):
+        await coordinator.reconcile_once()
+    assert late not in backend._created
+    claim = await coordinator.claim()
+    assert claim is not None and claim.run.session_id == "waits"
+
+
+async def test_a_published_clear_is_bound_to_the_recorded_offender(recovery):
+    coordinator, backend, store, _ = recovery
+    claim = await make_claim(store, "current")
+    await coordinator.prepare(claim.use)
+    _unknown(backend, "a" * 64)
+    await coordinator.reconcile_once()
+    row = await store.db.fetchrow("SELECT error_message FROM sandboxes WHERE profile_id = 'p1'")
+    assert row["error_message"] == "a" * 64
+    # Evidence about another container never clears the block recorded on this one.
+    assert not await store.clear_resolved_inventory_block(claim.use.key, daemon_id="daemon-1", offending="b" * 64)
+    assert (await store.db.fetchrow("SELECT error_message FROM sandboxes WHERE profile_id = 'p1'"))[
+        "error_message"] == "a" * 64

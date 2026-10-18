@@ -571,7 +571,7 @@ class DockerSandbox:
         if result.code != 0:
             definite = _no_such_image(result.text) or _definite_daemon_error(result.text)
             return None, DockerOutcome("definite_failure" if definite else "uncertain",
-                                       diagnostic=result.text)
+                                       diagnostic=result.text[:2000])
         try:
             value = json.loads(result.output.strip() or "null")
         except ValueError:
