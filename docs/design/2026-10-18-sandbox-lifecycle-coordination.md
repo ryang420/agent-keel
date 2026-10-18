@@ -2,7 +2,8 @@
 
 Date: 2026-10-18. Status: draft for review.
 
-Revision: address delayed cancellation/PID reuse and durable recovery of retired creation attempts.
+Revision: address delayed cancellation/PID reuse, durable retired attempts, unbound usage recovery, and
+supervisor descendant-completion evidence.
 
 ## 1. Intent and agreed scope
 
@@ -24,6 +25,8 @@ The approved behavior is:
   unreleased usage. Submitting an equivalent policy remains allowed.
 - A lost or uncertain usage blocks new sandbox admission. Other valid users may finish. Once they release,
   remove the affected container generation, confirm removal, and only then admit replacement work.
+  An unbound preparation usage with no authorized start/exec may instead use the guarded release exception in
+  section 11.1; unresolved stopped-only creates remain the ledger's responsibility.
 - During recovery, new runs may queue under the existing capacity limit; blocked profiles must not consume
   execution workers or prevent healthy profiles from progressing.
 - Recovery can discard files in a container's writable layer. Existing persistent mounts retain their existing
@@ -138,6 +141,7 @@ One usage per sandbox-enabled run, with a unique `run_id`:
 |---|---|
 | Identity | usage ID, deployment/profile key, run ID, owner instance, opaque usage token |
 | Binding | generation/token and exact container ID; null until preparation has published a container |
+| Preparation | original create-operation ID when allocated, retained independently of the nullable binding |
 | State | `preparing`, `active`, `cleaning`, `orphaned`, or `released` |
 | Lease | heartbeat time and expiry |
 | Completion | release time, recovery reason |
@@ -145,6 +149,8 @@ One usage per sandbox-enabled run, with a unique `run_id`:
 `preparing`, `active`, and `cleaning` are valid only while their lease is unexpired. `orphaned` cannot renew or
 become active again. `released` is terminal. An expired row continues to block reaping/policy changes until
 reconciliation releases it.
+Unbound preparation recovery follows section 11.1. A null binding alone does not prove that no start was
+authorized: preparation and all linked operations must be checked before releasing the usage.
 
 Usage metadata must survive deletion of a terminal run/session during cleanup. `run_id` is a logical reference;
 session deletion must not cascade-delete usage or execution evidence. Existing session-deletion responses stay
@@ -174,6 +180,7 @@ start, and remove; link preparation steps to their original create attempt.
 | Field group | Contents |
 |---|---|
 | Identity | operation ID, kind, deployment/profile key, daemon ID, generation number/token, unique intended name, original create-operation ID |
+| Preparation owner | originating usage ID/token for preparation attempts, retained as recovery evidence |
 | Target | exact container ID when known; null only before a create result is discovered |
 | Ownership | owner instance, renewable owner token, lease deadline |
 | Authority | `current` or irrevocably `retired`, retirement time/reason |
@@ -415,13 +422,17 @@ Include the helper protocol/artifact digest in internal generation compatibility
 architecture/runtime or failed installation fails preparation closed; never fall back to PID-marker cleanup.
 See [Docker copy semantics](https://docs.docker.com/reference/cli/docker/container/cp/).
 
-The selected identity mechanism is exclusive parent ownership of an unreaped process-group leader:
+The selected identity mechanism is exclusive parent ownership of an unreaped process-group leader, combined
+with per-exec subreaper ownership of orphaned descendants:
 
 1. The helper reserves a generation-local, never-reused exec control identity before launching the command.
    Duplicate dispatch cannot start a second command. A Unix-domain endpoint and terminal receipt use this
    identity; retain its reservation/receipt until the generation is removed. Control requests include the exec
    identity and original usage binding. A control client never accepts or signals a supplied numeric PID.
-2. The supervisor directly forks the child. A private handshake establishes a fresh child session/process group
+2. Before forking any payload, the supervisor enables and verifies `PR_SET_CHILD_SUBREAPER`. Failure is a
+   preparation/launch failure, never permission to launch without descendant tracking. It launches exactly one
+   payload tree; transport/control clients are not its children. The supervisor directly forks the child.
+   A private handshake establishes a fresh child session/process group
    before payload execution. The supervisor remains outside that group, records the child from `fork`, and is
    its sole reaper. It must not set `SIGCHLD` to `SIG_IGN`, use `SA_NOCLDWAIT`, or allow another thread/handler to
    reap that child. Observe leader exit with `waitid(..., WNOWAIT)` until control is closed. Cancellation during
@@ -430,8 +441,10 @@ The selected identity mechanism is exclusive parent ownership of an unreaped pro
    It may call `killpg` only while it still owns the original unreaped leader. The live child or retained zombie
    reserves that PID, preventing reuse as another execution's group leader. The ownership invariant spans the
    signal syscall, including pauses immediately before it; reaping cannot race an in-flight signal handler.
-4. A cancel request initiates TERM and the configured grace/KILL sequence inside that supervisor. Retries join
-   the same cleanup; they do not restart its deadline. Before reaping the leader, transition to terminal,
+4. A cancel request initiates TERM and the configured grace/KILL sequence inside that supervisor. Natural leader
+   exit also enters cleanup for remaining descendants; background work does not survive a successful exec
+   receipt. Retries join the same cleanup; they do not restart its deadline. Before reaping the leader,
+   transition to `control_closed` (not successful completion),
    invalidate the endpoint and all queued signal work, and finish/cancel every timer that could issue a signal.
    Only then reap. A delayed control client sees the original terminal receipt or a closed endpoint; the exec
    identity is never rebound to another supervisor. Transport clients only exchange control messages.
@@ -443,6 +456,37 @@ The selected identity mechanism is exclusive parent ownership of an unreaped pro
    Missing supervisor/receipt, helper crash, lost acknowledgement, or protocol mismatch also makes the exec
    uncertain and the generation draining. No actor reconstructs ownership from a PID file, `/proc` lookup,
    `kill -0`, or PID/start-time comparison. Full exact-ID removal remains the recovery boundary.
+
+The descendant-completion protocol is:
+
+- While signaling is possible, keep the leader unreaped. All child observation/reaping belongs to the same
+  serialized state machine. Reap adopted exited children only by identities returned by child-wait operations,
+  excluding the pinned leader; never use an indiscriminate reaping call that could consume that leader.
+- On cancellation or natural leader exit, send TERM to the pinned group and allow the configured grace period,
+  then send KILL if cleanup has not completed. Signal success proves neither delivery to every descendant nor
+  exit. Group escapes are not chased by enumerating and signaling numeric PIDs.
+- After the final signal attempt and confirmed leader exit, close signal authority and cancel all timers, then
+  reap the leader. Enter `awaiting_descendants`: repeatedly reap exited children with nonblocking child waits.
+  The subreaper receives orphaned descendants when intermediate parents exit, including double-forked children.
+  A wait returning zero means children remain and is not success. Only `ECHILD`, after leader reaping and with
+  no future payload forks possible, proves this supervisor has no remaining payload descendants. A live deeper
+  descendant must still have a live ancestor in this tree or have been adopted; it cannot be omitted merely
+  because the original shell exited. This proof does not depend on process-group membership or open stdout.
+- Use a monotonic cleanup deadline: TERM grace plus a separately configured finite reap timeout, fixed when
+  cleanup begins and never extended by duplicate controls. If the leader or descendants have not exited by
+  that deadline, emit an uncertain outcome and drain the generation. An escaped descendant that survives group
+  KILL therefore cannot yield a successful receipt. Observed group escape is conservatively uncertain even if
+  it later exits. Lost child ownership, unexpected wait errors, or helper death also invalidate completion.
+- Persist a successful terminal receipt only after the `ECHILD` proof; include exec/control identity, leader
+  exit status, control-closed state, and descendant-completion outcome. Preserve the payload's exit status for
+  normal completion and existing timeout/cancellation semantics. A closed endpoint without that receipt is
+  uncertain. Once signal authority closes, even a cleanup timeout cannot reopen it or signal a saved PGID.
+
+Subreaper setup must precede the payload fork and remain enabled for the helper's lifetime. Container init is
+not a substitute: it cannot provide this exec's completion proof. Validate the mechanism under each supported
+runtime; [PR_SET_CHILD_SUBREAPER](https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html)
+defines orphan adoption and wait notification. The receipt proves completion of this payload tree, not that
+other sessions' processes or the entire container are absent.
 
 This pins process identity while signaling rather than checking identity and later signaling an unpinned PID.
 The kernel's unreaped-child rules and process-group/session rules are described in
@@ -467,10 +511,12 @@ cancellation, and error paths all execute this release protocol; an unreachable 
 for a later recovery pass.
 
 Normal release requires an unexpired matching usage token. Expired/orphaned usage can only be released by
-reconciliation after the generation is removed. A late completion can improve diagnostics, but cannot turn an
+reconciliation after the generation is removed, except for the proven unbound case in section 11.1.
+A late completion can improve diagnostics, but cannot turn an
 orphan back into a valid user or reverse draining.
 
-On expired usage, uncertain execution, or a missing generation:
+On expired usage, uncertain execution, or a missing generation, use the following protocol unless section 11.1
+proves that an unbound preparation can be released without waiting for its stopped-only create:
 
 1. Under the guard and usage locks, recheck deadlines/tokens, mark affected uses `orphaned`, and mark the
    generation `draining`. This is irreversible for those tokens. New admission checks also detect expired usage
@@ -491,7 +537,9 @@ If another remaining user loses its lease, it also becomes orphaned. There is no
 a still-valid user's container. Therefore recovery waits for valid users to finish or lose authority; bounded
 run duration is a separate budget feature. Record the blocked reason so an operator can diagnose a long drain.
 
-Docker unavailability keeps the profile blocked. A lost acknowledgement to removal is resolved by inspecting
+Docker unavailability keeps recovery requiring target removal blocked. The stopped-only unbound exception in
+section 11.1 does not require a Docker response to release its usage; new preparation still needs Docker.
+A lost acknowledgement to removal is resolved by inspecting
 the recorded ID. Renewed database connectivity does not itself authorize a new generation. For an uncertain
 create with no published target, only its labeled generation and durable attempt can be reconciled; no exec may
 have been admitted to it. Retired attempts remain discoverable independently of the current operation pointer.
@@ -501,6 +549,40 @@ If inspection confirms the bound container is already missing, its existing user
 replacement. Fail their still-active runs through the atomic lifecycle API with `sandbox_unavailable`, revoke
 their usages, and reconcile the now-confirmed absence before allowing a new generation. Do not wait for those
 users to discover a replacement and silently continue. Already-terminal outcomes remain unchanged.
+
+### 11.1 Releasing an unbound preparation usage
+
+A worker may die before dispatching create, or after dispatch without ever learning a container ID. The create
+may never arrive. Requiring confirmed removal in this case would block the profile forever even though no
+payload could run. Reconciliation may release this usage while retaining an unresolved create tombstone only
+through the following guarded transition:
+
+1. Acquire locks in section 6 order. Require an expired/orphaned usage or an explicit abandonment by its valid
+   owner during cancellation/failure; reconciliation must not revoke another owner's healthy preparation.
+   Verify the usage was never bound/published, identify its preparation via
+   the original create-operation link, and inspect all linked attempts. If no create was allocated, verify that
+   no preparation intent exists. Missing or conflicting evidence blocks this exception.
+2. Require no authorized start and no managed exec for that preparation, including committed intents whose
+   dispatch has not reached Docker. Require every dispatched helper-install or other preparation against a
+   known target to have been reconciled with confirmed target removal. An authorized start always takes the
+   ordinary removal path even if the usage binding is still null. Unresolved create alone may remain.
+3. Atomically revoke the usage token and retire all preparation authority before clearing its foreground
+   pointer. Cancel undispatched planned steps; retain all attempt evidence. Mark the usage `released` with
+   reason `preparation_retired_without_execution`. This is a reconciliation release, never renewal or a claim
+   that the create request failed. Retirement serializes with helper-install/start authorization; a stale owner
+   cannot authorize another step after this commit.
+4. Clear only the retired preparation's current references. Move the sandbox to `absent` only if no existing
+   target or other blocking recovery remains. A predecessor being replaced still requires confirmed removal;
+   this exception cannot erase its state or another usage's binding. New claims use a fresh usage and generation.
+5. Fail/cancel the abandoned run through the existing atomic lifecycle API if still needed; leave an already
+   terminal run unchanged. A released usage can never dispatch work even if its run has not yet become terminal.
+
+Apply the same preparation check when a still-valid owner cancels before publication: normal release must not
+leave live preparation authority behind. A crash before this transaction leaves the usage protective; a lost
+commit acknowledgement is resolved by reading the original usage and attempt identities, not by dispatching
+again. Retired unknown creates remain independently discoverable under sections 9 and 14, even after usage
+release or session deletion. Keep their originating usage evidence until those attempts are resolved; the
+usage release does not resolve or prune their tombstones. A late result is quarantined and removed by exact ID.
 
 ## 12. HTTP behavior and policy updates
 
@@ -611,6 +693,10 @@ sandbox and operations guidance, and the changelog with these compatibility chan
 | Old exec/start/remove arrives late | It targets only its old ID; no stale result can publish or recreate a usable replacement |
 | Cancellation pauses before signaling and the command exits | Supervisor retains the leader until all signal work is closed; delayed requests cannot target a reused PID |
 | Supervisor dies or cancellation acknowledgement is lost | Exec becomes uncertain; drain, preserve other valid users, and recover by full exact-ID removal |
+| Leader exits before its children or double-forked descendants | Subreaper retains responsibility; no successful receipt until control closes, leader is reaped, and child waits report `ECHILD` |
+| Descendant survives group KILL or escapes the group | Cleanup deadline produces uncertainty; no numeric-PID chase or false release |
+| Unbound usage expires and its create never arrives | Guarded retirement releases usage without waiting for nonexistent removal; retain the uncertain create tombstone |
+| Unbound recovery races start authorization | Retirement wins and forbids start, or start wins and confirmed target removal remains mandatory |
 | Retired create appears late | Match its durable attempt; quarantine, forbid start/exec, and clean up by observed ID |
 | Several retired creates appear after restart | Recover each from its own ledger row; never overwrite or clear the current generation |
 | Inventory container has no matching attempt or conflicting labels | Block affected admission and preserve evidence; no automatic adoption or deletion |
@@ -635,6 +721,13 @@ Required tests:
   actual database time and injected host-clock skew.
 - Kill an instance during creation, after Docker success but before publication, during exec dispatch, and during
   release. Verify another instance can recover without assuming an expired lease means the command stopped.
+- Expire preparation before create allocation, after dispatch intent but before delivery, and after a lost
+  create response. Keep the request undelivered indefinitely and verify section 11.1 releases the unbound usage
+  and a new run progresses. Restart, then deliver the old create: its tombstone still quarantines it. Repeat
+  with a lost release-commit acknowledgement and session deletion; neither permits duplicate dispatch.
+- Race unbound release with helper-install/start authorization and publication. Any authorized start, bound
+  usage, or unreconciled dispatched install prevents the exception. Verify cancellation before publication
+  retires preparation authority and that an old policy-replacement target cannot be cleared by this release.
 - Pause a valid user while another becomes orphaned. Verify new claims remain queued, healthy profiles progress,
   the valid user's container survives, and old-generation removal is confirmed before replacement.
 - Hold a pending exec until after revocation/removal, then deliver it. Verify it cannot target or recreate the new
@@ -647,6 +740,12 @@ Required tests:
 - Exercise cancel-versus-natural-exit, duplicate cancellation, leader exit with group children still running,
   helper death, lost receipts, expired-usage recovery, and delayed control after coordinator restart. Other valid
   sessions must survive; uncertain cleanup must never release usage or fall back to PID-marker signaling.
+- Exercise subreaper adoption through multiple intermediate exits and double forks, with stdout already closed.
+  Verify a zero return from a nonblocking wait is never completion, and successful receipts require `ECHILD`
+  after leader reaping. Pause group children after KILL dispatch to prove signal success cannot release usage.
+  Exercise a live `setsid` descendant, reap-deadline expiry, unexpected wait failure, and unavailable subreaper
+  support: fail closed or drain as applicable, without signaling another exec. Verify all signal timers are
+  permanently disabled before leader reaping, including when descendant waits later time out.
 - Retire multiple uncertain create attempts, publish a later generation, restart both coordinators, and deliver
   old containers in reverse order. Verify independent ledger discovery/removal, unchanged current identity and
   usages, and no late start/exec. Include stopped legitimate in-progress creation and conflicting/unknown labels.
