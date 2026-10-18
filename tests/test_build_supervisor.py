@@ -75,3 +75,58 @@ def test_elf_details_reports_dynamic_linking(tmp_path):
 def test_elf_details_rejects_an_unsupported_machine(tmp_path):
     with pytest.raises(build_supervisor.BuildError, match="machine"):
         build_supervisor.elf_details(_write(tmp_path, _elf(machine=3)))
+
+
+def _load_verifier():
+    spec = importlib.util.spec_from_file_location("verify_distribution",
+                                                  REPO_ROOT / "scripts" / "verify_distribution.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+verify_distribution = _load_verifier()
+
+
+def _wheel(tmp_path: Path, files: dict[str, bytes], manifest: dict) -> Path:
+    import json
+    import zipfile
+
+    path = tmp_path / "agent_keel-0-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as wheel:
+        wheel.writestr("keel/sandbox/bin/manifest.json", json.dumps(manifest))
+        for name, data in files.items():
+            wheel.writestr(f"keel/sandbox/bin/{name}", data)
+    return path
+
+
+def _manifest(files: dict[str, bytes]) -> dict:
+    import hashlib
+
+    names = {62: "amd64", 183: "arm64"}
+    return {"version": 1, "protocol": 1, "artifacts": {
+        names[int.from_bytes(data[18:20], "little")]: {"file": name, "sha256": hashlib.sha256(data).hexdigest()}
+        for name, data in files.items()}}
+
+
+def test_the_distribution_check_accepts_static_helpers_for_every_required_architecture(tmp_path):
+    files = {"keel-supervisor-amd64": _elf(machine=62), "keel-supervisor-arm64": _elf(machine=183)}
+    lines = verify_distribution.verify_wheel(_wheel(tmp_path, files, _manifest(files)), {"amd64", "arm64"})
+    assert [line.split(":")[0] for line in lines] == ["amd64", "arm64"]
+
+
+@pytest.mark.parametrize("problem", ["missing-architecture", "digest", "dynamic", "wrong-machine"])
+def test_the_distribution_check_rejects_an_incomplete_or_wrong_helper(tmp_path, problem):
+    files = {"keel-supervisor-amd64": _elf(machine=62), "keel-supervisor-arm64": _elf(machine=183)}
+    manifest = _manifest(files)
+    if problem == "missing-architecture":
+        del manifest["artifacts"]["arm64"]
+    elif problem == "digest":
+        manifest["artifacts"]["amd64"]["sha256"] = "0" * 64
+    elif problem == "dynamic":
+        files["keel-supervisor-amd64"] = _elf(machine=62, count=2, segments=[1, 3])
+        manifest = _manifest(files)
+    else:
+        manifest["artifacts"]["amd64"]["file"] = "keel-supervisor-arm64"
+    with pytest.raises(verify_distribution.VerifyError):
+        verify_distribution.verify_wheel(_wheel(tmp_path, files, manifest), {"amd64", "arm64"})

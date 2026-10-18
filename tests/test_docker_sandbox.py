@@ -1,11 +1,12 @@
 import asyncio
 import os
+import subprocess
 from pathlib import Path
 import uuid
 
 import pytest
 
-from keel.sandbox.base import (ExecResult, Sandbox, TIMEOUT_EXIT_CODE, SandboxError, parse_policy,
+from keel.sandbox.base import (TIMEOUT_EXIT_CODE, SandboxError, parse_policy,
                                profile_mount_root)
 from keel.sandbox.docker import DockerSandbox
 
@@ -73,7 +74,32 @@ async def docker(tmp_path):
     backend = DockerSandbox(deployment=f"test-{uuid.uuid4().hex[:8]}", kill_grace_s=1.0,
                             mount_root=str(tmp_path / "mounts"))
     yield backend
-    await backend.remove_orphans()
+    remove_deployment(backend.deployment)
+
+
+def remove_deployment(deployment: str) -> None:
+    """Test cleanup by exact ID: remove the containers labelled with this test's own deployment."""
+    listed = subprocess.run(["docker", "ps", "-a", "-q", "--no-trunc", "--filter", "label=keel.managed=1",
+                             "--filter", f"label=keel.deployment={deployment}"],
+                            capture_output=True, text=True, timeout=60)
+    if listed.returncode == 0 and listed.stdout.split():
+        subprocess.run(["docker", "rm", "-f", *listed.stdout.split()], capture_output=True, timeout=120)
+
+
+async def test_bound_sandboxes_never_reach_the_name_based_exec_retry_or_cleanup():
+    # The coordinated path replaced transparent mid-run recreation and PID-marker cleanup: a bound handle given
+    # to the legacy name-based methods is refused before any docker call (see test_sandbox_lifecycle_docker.py).
+    from keel.sandbox.records import BoundSandbox, SandboxBinding, SandboxKey, UseHandle
+
+    backend = DockerSandbox(docker="keel-no-such-docker", deployment="unit")
+    sandbox_policy = parse_policy({"image": "i", "workdir": "/w"})
+    binding = SandboxBinding(1, "t" * 32, "c" * 64, "keel-sbx-unit", sandbox_policy, "h" * 64)
+    use = UseHandle(SandboxKey("unit", "p1", "daemon"), "use-1", "u" * 32, "w1")
+    bound = BoundSandbox(profile_id="p1", name="c" * 64, policy=sandbox_policy, use=use, binding=binding)
+    with pytest.raises(SandboxError, match="coordinator facade"):
+        await backend.exec(bound, ["true"], cwd="/", timeout_s=1, exec_id="e")
+    with pytest.raises(SandboxError, match="coordinator facade"):
+        await backend.kill_tree(bound, "e")
 
 
 def policy(**extra):
@@ -145,68 +171,6 @@ async def test_kill_tree_after_a_cancelled_exec(docker):
 
 
 @needs_docker
-async def test_a_vanished_container_is_recreated(docker):
-    sandbox = await docker.ensure("p1", policy())
-    await docker.destroy(sandbox)
-    result = await docker.exec(sandbox, ["echo", "back"], cwd="/work", timeout_s=60, exec_id="e6")
-    assert result.output.strip() == "back"
-
-
-@needs_docker
-async def test_a_policy_change_recreates_the_container(docker):
-    first = await docker.ensure("p1", policy())
-    await docker.write_file(first, "/work/marker", b"1")
-    second = await docker.ensure("p1", policy(env={"NEW": "1"}))
-    with pytest.raises(FileNotFoundError):
-        await docker.read_file(second, "/work/marker", 10)
-
-
-@needs_docker
-async def test_idle_containers_are_reaped(docker):
-    now = [0.0]
-    docker.clock = lambda: now[0]
-    docker.idle_seconds = 10
-    await docker.ensure("p1", policy())
-    now[0] = 5
-    assert await docker.reap_idle() == 0
-    now[0] = 20
-    assert await docker.reap_idle() == 1
-
-
-def _gone_probe(running):
-    """A DockerSandbox whose commands print a daemon-style error; `running` is what inspect reports."""
-    backend = DockerSandbox(deployment="unit")
-    calls = {"exec": 0, "ensure": 0}
-    sandbox = Sandbox("p1", "c", parse_policy({"image": "i", "workdir": "/w"}))
-
-    async def exec_once(*args):
-        calls["exec"] += 1
-        return ExecResult(1, "Error response from daemon: No such container: c\n", False, 0.0)
-
-    async def docker(*args, **kwargs):
-        return (0, "true\n") if running else (1, "No such object")
-
-    async def ensure(profile_id, policy):
-        calls["ensure"] += 1
-        return sandbox
-
-    backend._exec_once, backend._docker, backend.ensure = exec_once, docker, ensure
-    return backend, sandbox, calls
-
-
-async def test_the_commands_own_daemon_error_text_is_not_retried():
-    backend, sandbox, calls = _gone_probe(running=True)
-    await backend.exec(sandbox, ["x"], cwd="/", timeout_s=1, exec_id="e")
-    assert calls == {"exec": 1, "ensure": 0}
-
-
-async def test_a_gone_container_is_retried_once():
-    backend, sandbox, calls = _gone_probe(running=False)
-    await backend.exec(sandbox, ["x"], cwd="/", timeout_s=1, exec_id="e")
-    assert calls == {"exec": 2, "ensure": 1}
-
-
-@needs_docker
 async def test_an_unreadable_file_is_a_permission_error(docker):
     sandbox = await docker.ensure("p1", policy(user="1000:1000"))
     result = await docker.exec(sandbox, ["sh", "-c", "echo x > /tmp/s && chmod 000 /tmp/s"], cwd="/", timeout_s=30,
@@ -225,13 +189,6 @@ async def test_a_large_read_is_clamped_to_what_fits(docker):
     await docker.write_file(sandbox, "/work/big", data)
     got = await docker.read_file(sandbox, "/work/big", 10 * 1024 * 1024)
     assert len(got) == _MAX_READ and got == data[:_MAX_READ]
-
-
-async def test_remove_orphans_warns_when_docker_cannot_list(caplog):
-    from keel.sandbox.docker import DockerSandbox
-    with caplog.at_level("WARNING"):
-        assert await DockerSandbox(docker="false").remove_orphans() == 0
-    assert "could not list leftover sandbox containers" in caplog.text
 
 
 # --- final fix wave ---

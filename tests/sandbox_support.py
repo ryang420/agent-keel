@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 
 import keel.sandbox.runtime as sandbox_runtime
 from keel.runner import RunExecutor
-from keel.sandbox.base import Sandbox, parse_policy
+from keel.sandbox.base import ExecResult, Sandbox, parse_policy
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.sandbox.local import LocalSandbox
 from keel.sandbox.records import CleanupReceipt, ContainerObservation, DockerOutcome, RunClaim
@@ -32,6 +32,13 @@ def install_helper_assets(directory: Path, monkeypatch) -> dict[str, str]:
 
     Tests never read the gitignored built binaries. The returned mapping holds each architecture's digest.
     """
+    digests = write_helper_assets(directory)
+    monkeypatch.setattr(sandbox_runtime, "artifact_directory", lambda: directory)
+    return digests
+
+
+def write_helper_assets(directory: Path) -> dict[str, str]:
+    """Write the synthetic helper artifacts and manifest only (a child process points at them itself)."""
     directory.mkdir(parents=True, exist_ok=True)
     digests, artifacts = {}, {}
     for architecture in ("amd64", "arm64"):
@@ -43,7 +50,6 @@ def install_helper_assets(directory: Path, monkeypatch) -> dict[str, str]:
         artifacts[architecture] = {"file": path.name, "sha256": digests[architecture]}
     manifest = {"version": HELPER_MANIFEST_VERSION, "protocol": HELPER_PROTOCOL_VERSION, "artifacts": artifacts}
     (directory / HELPER_MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
-    monkeypatch.setattr(sandbox_runtime, "artifact_directory", lambda: directory)
     return digests
 
 
@@ -83,6 +89,9 @@ class FakeDocker:
         self.inspections: list[str] = []
         self.removed_ids: list[str] = []
         self.running_ids: set[str] = set()
+        # Every external call and exact-ID inspection, in order: ("create"|"start"|"remove", id) and
+        # ("inspect", id, "present"|"absent"), so tests can check that absence was verified before a replacement.
+        self.journal: list[tuple[str, ...]] = []
         self.observe = None
         self._containers = list(containers or [])
         self._created: dict[str, tuple[str, tuple[tuple[str, str], ...], str]] = {}
@@ -134,6 +143,7 @@ class FakeDocker:
         self._enter("create")
         exact = self._next_container()
         self.created_ids.append(exact)
+        self.journal.append(("create", exact))
         self.attempts["create"].append(attempt)
         self.policies.append(policy)
         labels = (
@@ -169,6 +179,7 @@ class FakeDocker:
         if forced is not None:
             return forced
         self.running_ids.add(attempt.container_id)
+        self.journal.append(("start", attempt.container_id))
         observation = self._running_observation(attempt.container_id)
         if observation is None:
             return DockerOutcome("definite_failure", diagnostic="the container does not exist")
@@ -177,6 +188,7 @@ class FakeDocker:
     async def inspect_id(self, container_id: str) -> DockerOutcome:
         self.inspections.append(container_id)
         observation = self._running_observation(container_id)
+        self.journal.append(("inspect", container_id, "absent" if observation is None else "present"))
         if observation is None:
             return DockerOutcome("definite_failure", diagnostic="the container does not exist")
         return DockerOutcome("succeeded", observation=observation)
@@ -191,6 +203,7 @@ class FakeDocker:
         result = self._results.get("remove", DockerOutcome("succeeded"))
         if result.state == "succeeded":
             self.removed_ids.append(attempt.container_id)
+            self.journal.append(("remove", attempt.container_id))
             self._created.pop(attempt.container_id, None)
             self.running_ids.discard(attempt.container_id)
         return result
@@ -317,6 +330,16 @@ async def make_claim(store, session_id: str, *, profile_id: str = "p1", sandbox:
     return claim
 
 
+def absence_verified_before_create(journal: list[tuple[str, ...]], old_id: str, new_id: str) -> bool:
+    """True when an exact-ID inspection reported `old_id` absent after its removal and before `new_id` was created."""
+    try:
+        removed = journal.index(("remove", old_id))
+        created = journal.index(("create", new_id))
+    except ValueError:
+        return False
+    return any(entry == ("inspect", old_id, "absent") for entry in journal[removed:created])
+
+
 def container_id() -> str:
     """A bare Docker ID: 64 lowercase hex characters."""
     return uuid.uuid4().hex + uuid.uuid4().hex
@@ -400,3 +423,115 @@ async def current_container_id(store, key) -> str | None:
         "SELECT container_id FROM sandboxes WHERE deployment = ? AND profile_id = ?",
         key.deployment, key.profile_id)
     return row["container_id"] if row else None
+
+
+class FileDocker:
+    """A coordinated backend double whose containers live in files, so they outlive a killed keel process.
+
+    Like a real daemon, the state directory keeps every created container (name, labels, running state) across
+    process restarts, and `journal.jsonl` records each external call and exact-ID inspection in order. With
+    `hold` set to a phase, the call for that phase writes `entered-<phase>` and then never returns, so the test can
+    kill the process at that exact point: `create` before the container exists, `created` after Docker created it,
+    `install`, `start` after it is running, and `exec` once a payload was dispatched. Executions themselves are not
+    run; they succeed with a complete receipt.
+    """
+
+    def __init__(self, state: Path, *, hold: str | None = None, daemon_id: str = "daemon-file") -> None:
+        self.state = state
+        self.hold = hold
+        self.daemon_id = daemon_id
+        self.containers = state / "containers"
+        self.containers.mkdir(parents=True, exist_ok=True)
+
+    def _log(self, *entry: str) -> None:
+        with (self.state / "journal.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(list(entry)) + "\n")
+
+    def journal(self) -> list[tuple[str, ...]]:
+        path = self.state / "journal.jsonl"
+        if not path.exists():
+            return []
+        return [tuple(json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    async def _phase(self, phase: str) -> None:
+        if self.hold == phase:
+            (self.state / f"entered-{phase}").write_text("", encoding="utf-8")
+            await asyncio.get_running_loop().create_future()  # held until the process is killed
+
+    def _read(self, exact: str) -> dict | None:
+        path = self.containers / f"{exact}.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def _write(self, exact: str, value: dict) -> None:
+        temporary = self.containers / f".{exact}.tmp"
+        temporary.write_text(json.dumps(value), encoding="utf-8")
+        temporary.replace(self.containers / f"{exact}.json")
+
+    def _observation(self, exact: str, value: dict) -> ContainerObservation:
+        labels = tuple((name, label) for name, label in value["labels"])
+        return ContainerObservation(self.daemon_id, exact, value["name"], labels, value["running"],
+                                    dict(labels).get("keel.policy"))
+
+    def running(self) -> list[str]:
+        return sorted(path.stem for path in self.containers.glob("*.json") if json.loads(path.read_text())["running"])
+
+    def existing(self) -> list[str]:
+        return sorted(path.stem for path in self.containers.glob("*.json"))
+
+    async def daemon_identity(self) -> tuple[str, str]:
+        return self.daemon_id, "amd64"
+
+    async def inspect_id(self, container_id: str) -> DockerOutcome:
+        value = self._read(container_id)
+        self._log("inspect", container_id, "absent" if value is None else "present")
+        if value is None:
+            return DockerOutcome("definite_failure", diagnostic="the container does not exist")
+        return DockerOutcome("succeeded", observation=self._observation(container_id, value))
+
+    async def inventory(self) -> list[ContainerObservation]:
+        return [self._observation(exact, self._read(exact)) for exact in self.existing()]
+
+    async def create_generation(self, attempt, policy) -> DockerOutcome:
+        await self._phase("create")
+        exact = container_id()
+        labels = [["keel.create-operation", attempt.id], ["keel.deployment", attempt.key.deployment],
+                  ["keel.generation", str(attempt.generation)], ["keel.generation-token", attempt.generation_token],
+                  ["keel.managed", "1"], ["keel.policy", policy.digest()], ["keel.profile", attempt.key.profile_id]]
+        value = {"name": attempt.intended_name, "labels": labels, "running": False}
+        self._write(exact, value)
+        self._log("create", exact)
+        await self._phase("created")
+        return DockerOutcome("succeeded", observation=self._observation(exact, value))
+
+    async def install_helper(self, attempt, artifact) -> DockerOutcome:
+        await self._phase("install")
+        return DockerOutcome("succeeded")
+
+    async def start_id(self, attempt) -> DockerOutcome:
+        value = self._read(attempt.container_id)
+        if value is None:
+            return DockerOutcome("definite_failure", diagnostic="the container does not exist")
+        value["running"] = True
+        self._write(attempt.container_id, value)
+        self._log("start", attempt.container_id)
+        await self._phase("start")
+        return DockerOutcome("succeeded", observation=self._observation(attempt.container_id, value))
+
+    async def remove_id(self, attempt) -> DockerOutcome:
+        (self.containers / f"{attempt.container_id}.json").unlink(missing_ok=True)
+        self._log("remove", attempt.container_id)
+        return DockerOutcome("succeeded")
+
+    async def exec_bound(self, ticket, argv, *, cwd, timeout_s, env=None, stdin=None, authorize_control=None):
+        if self._read(ticket.binding.container_id) is None:
+            raise ConnectionError("the container does not exist")
+        self._log("exec", ticket.exec_id)
+        await self._phase("exec")
+        receipt = CleanupReceipt(ticket.exec_id, ticket.control_token, 0, True, True, None)
+        return ExecResult(0, "ok\n", False, 0.0), receipt
+
+    async def control_exec(self, ticket, *, cancel: bool) -> CleanupReceipt:
+        return CleanupReceipt(ticket.exec_id, ticket.control_token, 0, True, True, None)
+
+    async def aclose(self) -> None:
+        return None

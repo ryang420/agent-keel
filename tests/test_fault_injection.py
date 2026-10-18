@@ -287,7 +287,10 @@ async def test_a_container_removed_between_two_tool_calls_fails_the_run_and_reco
         assert (await store.get_run("p1", nxt.id)).output == "done"
         assert json.loads([m for m in await consistent(store) if m.role == "tool"][-1].text)["output"] == "three"
     finally:
-        await backend.remove_orphans()
+        listed = subprocess.run(["docker", "ps", "-a", "-q", "--no-trunc", "--filter",
+                                 f"label=keel.deployment={backend.deployment}"], capture_output=True, text=True)
+        if listed.stdout.split():  # test cleanup by exact ID, limited to this test's own deployment
+            subprocess.run(["docker", "rm", "-f", *listed.stdout.split()], capture_output=True)
 
 
 LAUNCHER = textwrap.dedent("""

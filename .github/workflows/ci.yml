@@ -48,17 +48,35 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e '.[dev]'
-      # The store, bus and runner tests drop and recreate keel's tables in this throwaway database.
+      # The store, bus, runner and sandbox coordination tests drop and recreate keel's tables in this throwaway
+      # database. Every module with PostgreSQL cases is listed explicitly.
       - run: >-
-          pytest -q tests/test_postgres_db.py tests/test_store.py tests/test_events.py tests/test_runner.py
+          pytest -q -rs tests/test_postgres_db.py tests/test_store.py tests/test_events.py tests/test_runner.py
           tests/test_worker.py tests/test_migrations.py tests/test_compaction.py tests/test_fault_injection.py
           tests/test_tenant_api.py tests/test_tenant_ownership.py tests/test_run_termination.py
+          tests/test_sandbox_store.py tests/test_sandbox_recovery_store.py tests/test_sandbox_postgres.py
+          tests/test_sandbox_coordinator.py tests/test_sandbox_recovery.py tests/test_sandbox_api.py
+          tests/test_sandbox_worker.py tests/test_coordinated_tools.py
         env:
           KEEL_TEST_POSTGRES_DSN: postgresql://keel:postgres@localhost:5432/keel_test
 
   docker:
     name: docker
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: keel
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: keel_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keel"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -67,13 +85,60 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - run: docker pull python:3.12-slim
-      - run: pytest -q tests/test_docker_sandbox.py tests/test_fault_injection.py
+      # The coordinator installs the packaged helper for the daemon's architecture; build it for this runner.
+      - run: python scripts/build_supervisor.py --arch amd64
+      - run: >-
+          pytest -q -rs tests/test_docker_sandbox.py tests/test_fault_injection.py
+          tests/test_sandbox_lifecycle_docker.py
         env:
           KEEL_TEST_DOCKER: "1"
+      # Two-instance lifecycle acceptance: independent stores over one PostgreSQL database sharing this daemon.
+      - name: two-instance PostgreSQL and Docker acceptance
+        run: pytest -q -rs tests/test_sandbox_lifecycle_docker.py tests/test_fault_injection.py
+        env:
+          KEEL_TEST_DOCKER: "1"
+          KEEL_TEST_POSTGRES_DSN: postgresql://keel:postgres@localhost:5432/keel_test
+      - run: pytest -q -rs tests/test_fault_injection.py tests/test_sandbox_lifecycle_subprocess.py
+        env:
+          KEEL_TEST_SUBPROCESS: "1"
+
+  native:
+    name: native (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      # Build and run the Linux supervisor tests for this architecture in a throwaway container.
+      - run: python3 scripts/run_native_tests.py --arch ${{ matrix.arch }}
+      # The PID-reuse proof needs a private PID namespace: a dedicated, privileged, test-only container.
+      - run: python3 scripts/run_native_tests.py --arch ${{ matrix.arch }} --privileged
 
   image:
     name: image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - run: docker build -t agent-keel:ci .
+      - name: Wheel and sdist carry the helper for both architectures
+        run: |
+          python scripts/build_supervisor.py --arch all
+          python -m pip install build
+          python -m build -o dist .
+          python scripts/verify_distribution.py wheel dist/*.whl --require amd64,arm64
+          python scripts/verify_distribution.py sdist dist/*.tar.gz
+      - name: Each platform image carries its own helper
+        run: |
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load -t "agent-keel:ci-$arch" .
+            docker run --rm -i --platform "linux/$arch" "agent-keel:ci-$arch" \
+              python - installed --require "$arch" < scripts/verify_distribution.py
+          done

@@ -933,7 +933,8 @@ def test_pid_reuse_is_blocked_while_pinned_and_never_signals_the_new_process(
 
     Run the Linux suite in a privileged container (or on a host with unprivileged user namespaces and
     CAP_SYS_ADMIN in the namespace's user namespace). Without that, the helper exits 77 and this test skips
-    explicitly; random PID churn is never accepted as evidence.
+    explicitly; random PID churn is never accepted as evidence. `scripts/run_native_tests.py --privileged` runs it
+    in that dedicated environment with KEEL_TEST_REQUIRE_PID_NAMESPACE=1, where a skip becomes a failure.
     """
     scratch = tmp_path / "pid-reuse"
     scratch.mkdir()
@@ -942,7 +943,10 @@ def test_pid_reuse_is_blocked_while_pinned_and_never_signals_the_new_process(
          str(exec_root), str(scratch)],
         capture_output=True, text=True, timeout=60)
     if result.returncode == 77:
-        pytest.skip(result.stderr.strip() or "private PID namespace or ns_last_pid is unavailable")
+        reason = result.stderr.strip() or "private PID namespace or ns_last_pid is unavailable"
+        if os.environ.get("KEEL_TEST_REQUIRE_PID_NAMESPACE") == "1":
+            pytest.fail(f"the dedicated PID-namespace environment is required here: {reason}")
+        pytest.skip(reason)
     assert result.returncode == 0, result.stderr
 
     report = json.loads(result.stdout.strip().splitlines()[-1])
