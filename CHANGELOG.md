@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0-rc.2] - 2026-10-18
+
 ### Added
 - `POST /v1/models/verify` checks a model id with two tiny calls (text, then a 1×1 image) and reports whether
   the model reads images. Any tenant key may call it; it stores nothing ([API guide](docs/guide/api.md)).
@@ -119,7 +121,8 @@ All notable changes to this project are documented here. The format follows
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.1...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.2...HEAD
+[0.3.0-rc.2]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.1...v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0-rc.1
 [0.2.0]: https://github.com/ryang420/agent-keel/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ryang420/agent-keel/releases/tag/v0.1.0
