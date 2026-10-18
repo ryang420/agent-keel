@@ -74,7 +74,7 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 
 ## Status
 
-Pre-1.0 (0.3.0-rc.1). The API and the database schema may change between releases. A database is upgraded in place at
+Pre-1.0 (0.3.0-rc.2). The API and the database schema may change between releases. A database is upgraded in place at
 start (numbered migrations); a database written by a newer keel is refused. Back up the database before upgrading.
 
 ## Development
