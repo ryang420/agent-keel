@@ -28,14 +28,26 @@ All notable changes to this project are documented here. The format follows
   container of the deployment (bounded at startup, retried in the background), claims never wait on Docker, and
   the Docker daemon ID is read afresh for every ownership or absence decision: a changed daemon closes admission
   instead of making recorded containers look absent.
+- Migration 5 adds the `sandboxes`, `sandbox_uses`, `sandbox_execs` and `sandbox_operations` tables. The maintenance
+  pass prunes resolved, unreferenced coordination records older than `KEEL_EVENT_RETENTION_DAYS` in batches of 100;
+  unresolved creates, unreleased usages, unresolved execs and current references are retained, and an uncertain
+  create is kept as a tombstone indefinitely. The stopped-service cutover, including legacy containers, is in
+  [the operations guide](docs/guide/operations.md#upgrading-to-the-coordinated-sandbox-lifecycle).
+
+### Changed
+- The Docker backend exposes only exact-ID coordinated operations. The name-based `ensure`/`reference`/`exec`,
+  PID-file `kill_tree`, process-local idle reaper and startup `remove_orphans` paths (and their process-local
+  state) are gone, so no caller can reach a container without a recorded attempt or ticket. `LocalSandbox`
+  (`KEEL_SANDBOX=none` development mode) is unchanged.
 
 ### Fixed
 - An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
   including on a profile that never had a coordinated sandbox. A block clears only when the container it records
-  is proven absent by exact ID on the same daemon (or is still listed but now classifies as non-conflicting), and a
-  complete, unbatched listing of the deployment's containers, each container of that profile classified again,
-  finds none that conflicts: no unknown container, no recorded container whose labels or policy disagree, and no
-  running retired create. A failed listing or inspection keeps the block.
+  is proven absent by exact ID on the same daemon (or is still listed but stopped as of the fresh exact-ID
+  inspection, where it classified as non-conflicting), and a complete, unbatched listing of the deployment's
+  containers, each container of that profile classified again, finds none that conflicts: no unknown container, no
+  recorded container whose labels or policy disagree, and no running retired create. A failed listing or
+  inspection keeps the block; a container that starts running between the listing and the inspection keeps it too.
 - A Docker warning printed on stderr (for example a platform mismatch or missing swap accounting) no longer makes a
   successful container creation, inspection, inventory or daemon identity read uncertain: results are parsed from
   stdout only, and stderr is kept as a bounded diagnostic.

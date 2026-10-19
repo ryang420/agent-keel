@@ -65,7 +65,7 @@ flowchart TB
 
 | 模块 | 作用 |
 |---|---|
-| `service.py` | 根据 `Settings` 组装服务：存储、总线、provider、沙箱后端、执行器、worker 池、API。负责启动（清理遗留沙箱）和关闭。 |
+| `service.py` | 根据 `Settings` 组装服务：存储、总线、provider、沙箱协调器、执行器、worker 池、API。负责启动（分类部署的沙箱清单并开放准入）、维护和关闭。 |
 | `config.py` | `Settings.from_env()`；校验每个 `KEEL_*` 变量，配置有误时立即报错。 |
 | `api.py` | FastAPI 应用：认证中间件、路由、错误信封、SSE 流。 |
 | `worker.py` | `WorkerPool`：认领、续租、处理停止、租约清扫、关闭时排空。 |
@@ -75,7 +75,7 @@ flowchart TB
 | `store/` | 基于 `Db` 适配器的 `Store`：`sql.py`（两种方言的全部查询）、`db.py`（SQLite）、`postgres.py`。 |
 | `events.py` | `InMemoryEventBus`、`PostgresEventBus`。 |
 | `providers/` | `ModelProvider` 接口、注册表、重试策略、Responses API 传输层、Bedrock（SigV4）、OpenAI。 |
-| `sandbox/` | `SandboxBackend`：策略解析、Docker 后端、供测试用的宿主进程后端。 |
+| `sandbox/` | 策略解析、协调的精确 ID Docker 后端及其 supervisor、恢复，以及供测试用的宿主进程后端。 |
 | `tools/` | 沙箱工具和 `memory` 工具，以及循环调用的唯一入口 `run_tool`。 |
 | `prompt.py`、`prompts/` | 会话的系统提示词，以及提示词和工具定义文本。 |
 | `skills.py` | 通过沙箱发现 skill，并生成提示词里的索引。 |
@@ -85,7 +85,8 @@ flowchart TB
 | `review.py` | 后台记忆复查。它只写记忆。 |
 
 只有存在多个实现的地方才定义接口：`Store`（SQLite、Postgres）、`EventBus`（进程内、Postgres）、
-`ModelProvider`（Bedrock、OpenAI，以及测试用的 fake）、`SandboxBackend`（Docker、本地）。其余都是具体代码。
+`ModelProvider`（Bedrock、OpenAI，以及测试用的 fake）、`SandboxExecutor`（协调的工具门面、供测试用的宿主
+进程后端）。其余都是具体代码。
 
 ---
 
@@ -278,7 +279,7 @@ run；之后每一轮只扫描上一轮截止时间之后结束的 run（再重�
 flowchart TB
     A["加载 profile 和 session<br/>解析沙箱策略"] --> B{"设置了策略且<br/>KEEL_SANDBOX=docker？"}
     B -->|否| C["没有沙箱工具<br/>开启记忆时仍提供 memory"]
-    B -->|是| D["sandbox.ensure(profile)<br/>发现 skills"]
+    B -->|是| D["coordinator.prepare(use)<br/>通过它发现 skills"]
     C --> E
     D --> E["系统提示词：<br/>沿用会话已有的，或构建并冻结"]
     E --> F["补齐未回复的工具调用<br/>追加用户消息，推导标题"]
@@ -402,20 +403,21 @@ flowchart LR
     EXEC --> IDLE["超过 KEEL_SANDBOX_IDLE_SECONDS 未使用<br/>且没有命令在运行：回收器将其删除"]
 ```
 
-- **名称与标签。** 容器名是 `keel-sbx-` 加上 `sha256(deployment \0 profile)` 的前 12 位十六进制字符。
-  标签 `keel.managed=1`、`keel.deployment`、`keel.profile` 和 `keel.policy`（策略摘要）让 keel 能找到、比较并清理
-  属于它自己的容器，而不会碰别人的。
-- **同一 profile 的各会话共用它的容器。** 容器是按 profile 的，不是按会话或按 run。keel 为每个会话记录一个
+- **名称与标签。** 一代容器的名称以 `keel-sbx-` 加 profile 开头；令牌使每一代名称唯一，账本记录它的精确容器
+  ID。标签 `keel.managed=1`、`keel.deployment`、`keel.profile`、`keel.policy`（策略摘要）、`keel.generation` 和
+  创建操作让 keel 比较并清理属于自己的容器，而不会碰别人的。之后所有操作都使用记录的精确 ID，而不是名称。
+- **同一 profile 的各会话共用它的一代容器。** 容器是按 profile 的，不是按会话或按 run。keel 为每个会话记录一个
   工作目录，但不会在容器内把一个会话与另一个会话隔离开；需要独立状态的账号应各自使用一个 profile，
   同一租户内也是如此。
-- **空闲回收。** 后台任务每 60 秒运行一次，删除闲置达到 `KEEL_SANDBOX_IDLE_SECONDS`（默认 30 分钟）且没有命令在
-  运行的容器。下一次 run 会重新创建。
-- **遗留容器。** 启动时，`remove_orphans` 会删除带有本部署标签的容器，但保留那些在任一实例上有 queued、running
-  或 stopping 状态 run 的 profile 的容器，所以多个实例时也是安全的。如果某个 run 恰好在这次查询与 `docker rm`
-  之间被别的实例认领，它可能会失去容器；执行路径会把消失的容器重建一次。被删除的空闲容器会在下次使用时重建。
-- **终止命令。** 停止 run 时，会终止容器内该命令的进程组：先 `TERM`，等 3 秒宽限期，再 `KILL`，最后连
-  `docker exec` 客户端本身也杀掉。只杀客户端会让命令继续运行。当前命令的 id 保存在 `runs.current_exec_id` 中，
-  供终止时使用，终止后清空；清扫器也用它来终止失联 worker 留下的命令（[§5](#5-worker租约与恢复)）。
+- **空闲回收。** 每分钟一次的维护任务在 usage 释放后，按精确 ID 删除闲置达到 `KEEL_SANDBOX_IDLE_SECONDS`
+  （默认 30 分钟）的一代容器。下一次 run 会得到新的一代。
+- **清单与遗留容器。** 启动时以及每轮维护都会分批分类本部署的每个容器。未知、遗留或冲突的容器会保留为证据，
+  并且只阻塞其 profile 的沙箱准入；绝不会按 profile 名称或通过 in-flight 查询删除。策略或 helper 不兼容的一代
+  会在其使用者结束后由恢复流程替换。未解决的 create 保留为 tombstone，确保不会被创建两次。
+- **终止命令。** 停止 run 时解析已记录的执行票据，并请求启动该命令的 supervisor 取消它：`TERM`、宽限期、
+  `KILL`，然后返回回执，证明 leader 及其后代都已退出。宿主侧不做数字 PID 或进程组查找。当前命令的 id 保存在
+  `runs.current_exec_id` 中；租约清扫器把失联的 run 交给协调器恢复，而不是自己向命令发信号
+  （[§5](#5-worker租约与恢复)）。
 - **密钥不出现在命令行。** 策略里的 `env` 通过一个私有的临时 `--env-file` 传入（权限 0600，位于 0700 目录，用完
   立即删除），所以这些值不会出现在 `ps` 里。
 

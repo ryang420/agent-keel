@@ -263,24 +263,39 @@ prompts are tuned against these texts): `terminal`, `execute_code`, `read_file`,
 `patch`, `search_files`, `skill_view`, `skills_list`, `memory`. `execute_code` runs a Python
 script in the sandbox (no persistent kernel or RPC bridge). The first version of the loop (M2) ships eight of the nine; `memory` arrives in M3 (§7).
 
-**`SandboxBackend`** — the tools never touch host paths; every file and process operation goes
+**`SandboxExecutor`** — the tools never touch host paths; every file and process operation goes
 through the backend, so a backend without a shared host filesystem works unchanged:
 
 ```
-ensure(profile, policy) -> handle         # create or reuse the profile's sandbox
-exec(handle, command, cwd, timeout, env)  # streaming stdout/stderr, exit code
-read_file / write_file / list(handle, path, ...)
-kill_tree(handle, exec_id)                # the command and all its children
-destroy(handle)
+exec(handle, argv, *, cwd, timeout_s, env, stdin) -> ExecResult
+read_file(handle, path, max_bytes) / write_file(handle, path, data)
+kill_tree(handle, exec_id)
 ```
 
-**Docker backend (first version).** One long-lived container per profile, configured by the
+`LocalSandbox` (`KEEL_SANDBOX=none`) implements this surface directly for development. The Docker
+backend does not: the agent loop reaches it through the coordinator facade, which admits a durable
+usage and an exact-ID execution ticket before any payload is dispatched. The wider lifecycle interface
+(`daemon_identity`, `inventory`, `inspect_id`, `create_generation`, `install_helper`, `start_id`,
+`remove_id`, `exec_bound`, `control_exec`) is described in
+[2026-10-18-sandbox-lifecycle-coordination.md](2026-10-18-sandbox-lifecycle-coordination.md).
+
+**Coordinated Docker backend (as built).** One published generation per profile, configured by the
 profile's sandbox policy: image, network, mounts, CPU, memory and pid limits, user, and
-**`runtime`: `runc` (default) | `runsc` (gVisor) | `kata` (Kata Containers, microVM)**.
-Commands run through `docker exec`, with the working directory carried by an in-band marker.
-`kill_tree` kills the whole process group (built in, where Hermes needs a patch). A vanished
-container is recreated on the next call (Hermes needs a restart). Idle containers are reaped;
-orphans are removed at start.
+**`runtime`: `runc` (default) | `runsc` (gVisor) | `kata` (Kata Containers, microVM)**. A generation is
+created (never started), has a statically linked supervisor installed as a root-owned 0755 file, and
+is then started; all three steps are separately recorded attempts in the coordination ledger (four
+tables added by migration 5). Commands run through that supervisor by exact container ID. Cancellation
+goes to the same supervisor, which pins the process group at start, applies TERM, the grace period and
+KILL, and returns a terminal receipt proving the leader and descendants are gone; there is no PID file
+or numeric PID fallback. A container is never recreated transparently mid-run: an unavailable
+generation ends the run and recovery replaces it before the next run. Idle generations and
+policy/helper-incompatible generations are removed by exact ID once their usage is released, and
+startup never removes containers by profile name or in-flight list: unknown or conflicting inventory
+is kept as evidence and blocks only its profile's admission.
+
+The first M2 implementation used `ensure`/`exec`/`kill_tree` by profile-derived name, a PID-file
+marker and startup orphan removal. Those paths are removed; the lifecycle design above supersedes
+them.
 
 Isolation path: ship M2 on `runc`; then run the eval and contract checks on `runsc` and switch
 the default when they pass the gate. `kata` (with Cloud Hypervisor, which supports virtio-fs
@@ -324,8 +339,9 @@ collides gets `#N`. Titles are sanitized (control, zero-width and bidi character
 ## 10. Stop and failure
 
 `POST stop` cancels a queued run at once, committing `run.cancelled` with the state; a running
-run becomes `stopping`, and the worker cancels an in-flight model stream, calls `kill_tree` on a
-running command, then ends the run `cancelled`. Messages already committed stay; an assistant
+run becomes `stopping`, and the worker cancels an in-flight model stream, asks the recorded
+execution ticket's supervisor to cancel a running command, then ends the run `cancelled`. Messages
+already committed stay; an assistant
 tool call without a result gets a synthetic "cancelled" tool result so the next turn's request is
 valid. The first terminal transition to commit wins, and its event is the run's last: cleanup
 that runs after a forced termination still kills commands and repairs tool results, but its

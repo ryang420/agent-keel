@@ -69,7 +69,7 @@ Everything is in `src/keel/`.
 
 | Module | Role |
 |---|---|
-| `service.py` | Builds the service from `Settings`: store, bus, providers, sandbox backend, executor, worker pool, API. Owns start-up (removes leftover sandboxes) and shutdown. |
+| `service.py` | Builds the service from `Settings`: store, bus, providers, sandbox coordinator, executor, worker pool, API. Owns start-up (classifies the deployment's sandbox inventory and opens admission), maintenance and shutdown. |
 | `config.py` | `Settings.from_env()`; validates every `KEEL_*` variable and fails fast on a bad one. |
 | `api.py` | FastAPI app: auth middleware, routes, error envelope, the SSE stream. |
 | `worker.py` | `WorkerPool`: claim, lease renewal, stop handling, lease sweeper, drain on shutdown. |
@@ -79,7 +79,7 @@ Everything is in `src/keel/`.
 | `store/` | `Store` over a `Db` adapter: `sql.py` (all queries, both dialects), `db.py` (SQLite), `postgres.py`. |
 | `events.py` | `InMemoryEventBus`, `PostgresEventBus`. |
 | `providers/` | `ModelProvider` interface, registry, retry policy, the Responses-API transport, Bedrock (SigV4), OpenAI. |
-| `sandbox/` | `SandboxBackend`: policy parsing, the Docker backend, a host-process backend for tests. |
+| `sandbox/` | Policy parsing, the coordinated exact-ID Docker backend and its supervisor, recovery, and a host-process backend for tests. |
 | `tools/` | The sandbox tools, the `memory` tool and `run_tool`, the single entry point the loop calls. |
 | `prompt.py`, `prompts/` | The session system prompt and the prompt / tool-definition texts. |
 | `skills.py` | Skill discovery through the sandbox and the prompt index. |
@@ -89,8 +89,8 @@ Everything is in `src/keel/`.
 | `review.py` | A background memory review. It writes memory only. |
 
 Interfaces exist only where there is more than one implementation: `Store` (SQLite, Postgres), `EventBus` (in-memory,
-Postgres), `ModelProvider` (Bedrock, OpenAI, a fake for tests), `SandboxBackend` (Docker, local). Everything else is
-concrete code.
+Postgres), `ModelProvider` (Bedrock, OpenAI, a fake for tests), `SandboxExecutor` (coordinated tool facade, local
+host-process backend for tests). Everything else is concrete code.
 
 ---
 
@@ -293,7 +293,7 @@ and stores a "cancelled" result for each, so the next request always pairs every
 flowchart TB
     A["load profile and session<br/>parse the sandbox policy"] --> B{"policy set and<br/>KEEL_SANDBOX=docker?"}
     B -->|no| C["no sandbox tools<br/>memory still offered when on"]
-    B -->|yes| D["sandbox.ensure(profile)<br/>discover skills"]
+    B -->|yes| D["coordinator.prepare(use)<br/>discover skills through it"]
     C --> E
     D --> E["system prompt:<br/>reuse the session's, or build and freeze it"]
     E --> F["repair unanswered tool calls<br/>append the user message, derive a title"]
@@ -431,22 +431,26 @@ flowchart LR
     EXEC --> IDLE["no use for KEEL_SANDBOX_IDLE_SECONDS<br/>and nothing running: the reaper removes it"]
 ```
 
-- **Name and labels.** The container is `keel-sbx-` plus the first 12 hex characters of
-  `sha256(deployment \0 profile)`. Labels `keel.managed=1`, `keel.deployment`, `keel.profile` and `keel.policy`
-  (the policy digest) let keel find, compare and clean up its own containers and nobody else's.
-- **A profile's sessions share its container.** A container is per profile, not per session or per run. keel keeps a
-  working directory per session but does not isolate one session from another inside the container; if that matters,
-  use a separate profile for each independent account, including accounts in the same tenant.
-- **Idle reaping.** A background task runs every 60 s and removes containers idle for `KEEL_SANDBOX_IDLE_SECONDS`
-  (default 30 min) that are running nothing. The next run recreates one.
-- **Leftovers.** At start, `remove_orphans` removes the containers labelled for this deployment, except those of
-  profiles with a run queued, running or stopping on any instance, so it is safe with several instances. A run
-  claimed elsewhere between that query and `docker rm` can lose its container; the exec path recreates a vanished
-  container once. A removed idle container is recreated on its next use.
-- **Killing a command.** Stopping a run kills the command's process group inside the container: `TERM`, a 3 s grace
-  period, then `KILL`, and finally the `docker exec` client itself. Killing only the client would leave the command
-  running. The id of the current command is kept in `runs.current_exec_id` for the kill and cleared after it; the
-  sweeper uses it to kill a lost worker's command ([§5](#5-workers-leases-and-recovery)).
+- **Name and labels.** A generation's container name starts with `keel-sbx-` plus the profile; a token makes it
+  unique per generation, and the ledger records its exact container ID. Labels `keel.managed=1`, `keel.deployment`,
+  `keel.profile`, `keel.policy` (the policy digest), `keel.generation` and the create operation let keel compare its
+  own containers and nobody else's. Every later operation uses the recorded exact ID, never the name.
+- **A profile's sessions share its generation.** A container is per profile, not per session or per run. keel keeps
+  a working directory per session but does not isolate one session from another inside the container; if that
+  matters, use a separate profile for each independent account, including accounts in the same tenant.
+- **Idle reaping.** A minute-by-minute maintenance pass removes a generation idle for
+  `KEEL_SANDBOX_IDLE_SECONDS` (default 30 min), by exact ID, once its usage is released. The next run gets a new
+  generation.
+- **Inventory and leftovers.** At start and in each maintenance pass, the coordinator classifies every container of
+  the deployment in bounded batches. An unknown, legacy or conflicting container is kept as evidence and blocks only
+  its profile's sandbox admission; it is never removed by profile name or by an in-flight query. A generation with an
+  incompatible policy or helper is replaced by recovery after its users finish. An unresolved create is retained as
+  a tombstone so it is never created twice.
+- **Killing a command.** Stopping a run resolves the recorded execution ticket and asks the supervisor that started
+  the command to cancel it: `TERM`, the grace period, then `KILL`, followed by a receipt proving the leader and its
+  descendants are gone. No host-side numeric PID or process-group lookup is involved. The current command's id is
+  kept in `runs.current_exec_id`; the lease sweeper hands a lost run to coordinator recovery instead of signalling
+  the command itself ([§5](#5-workers-leases-and-recovery)).
 - **Secrets stay off the command line.** Policy `env` goes through a private temporary `--env-file` (mode 0600, in a
   0700 directory, deleted right after), so values never appear in `ps`.
 

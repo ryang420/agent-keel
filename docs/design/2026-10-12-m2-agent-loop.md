@@ -151,9 +151,17 @@ Consumers' prompts are tuned against these texts.
 
 ## 5. Sandbox
 
+> **Superseded lifecycle.** This section records M2 as built: containers by profile-derived name, a
+> PID-file process-group marker, recreation after a missing container and startup removal of
+> "orphaned" containers. The coordinated exact-ID lifecycle in
+> [2026-10-18-sandbox-lifecycle-coordination.md](2026-10-18-sandbox-lifecycle-coordination.md) replaced
+> all four, so several instances can share a Docker daemon safely. The current Docker backend has no
+> name-based entry point; `LocalSandbox` (`KEEL_SANDBOX=none`) still implements the M2-shaped surface
+> below for development.
+
 ### Interface
 
-Arch §6's `SandboxBackend`, with M2's signatures:
+The M2 surface:
 
 ```
 ensure(profile_id, policy) -> Sandbox
@@ -165,11 +173,16 @@ kill_tree(sandbox, exec_id) -> None
 destroy(sandbox) -> None
 ```
 
-- **Operation ids.** Every `exec` gets an `exec_id`. The worker keeps the run's current `exec_id`, so
-  stop can kill it (§7).
-- **File operations.** `read_file`, `write_file` and listing go through `exec` with fixed helper
-  commands (`cat`, `base64`, `find`). That way a backend needs only exec, and paths are never
-  interpreted on the keel host.
+The coordinated Docker backend does not expose this surface. The tools reach it through a facade
+that first records a usage and, for a command, a durable execution ticket; the backend then runs
+exact-ID operations (`exec_bound`, `control_exec`, `inspect_id`, ...) against the published
+generation. Tool call ids still identify an execution, and stop resolves them through the ledger
+rather than through process-local state.
+
+- **Operation ids.** Every execution has an `exec_id`; the coordinator keeps the current ticket, so
+  stop can cancel exactly the command the run started.
+- **File operations.** `read_file`, `write_file` and listing go through an execution with fixed
+  helper commands (`cat`, `base64`, `find`), so paths are never interpreted on the keel host.
 
 ### The sandbox policy
 
@@ -193,14 +206,15 @@ policy names nothing about any consumer.
 ```
 
 - **Required fields:** `image`, `workdir` and `runtime`. `runtime` is one of `runc`, `runsc`, `kata`
-  (arch §6); M2 is verified on `runc`.
+  (arch §6); M2 was verified on `runc`.
 - **Host paths.** `mounts[].source` is a path on the Docker host, and keel never opens it. The consumer
   provides it because it owns the host layout. A deployment can restrict sources to a prefix
   (`KEEL_SANDBOX_MOUNT_ROOT`); a policy outside it is refused with 400.
 - **Values in env.** `env` values are stored in the profile and passed to the container. They are never
   echoed in events or logs.
-- **Policy changes.** A changed policy is detected by a hash label on the container. The container is
-  recreated on next use, once no command is running in it.
+- **Policy changes.** The policy hash is part of the generation's identity. A changed policy is never
+  applied by recreating a container mid-run: `PUT` returns 409 `sandbox_busy` while the profile has
+  sandbox work in progress, and recovery replaces the incompatible generation after its users finish.
 
 ### Docker backend
 
@@ -208,21 +222,30 @@ The backend uses the `docker` CLI, through `asyncio.create_subprocess_exec` with
 shell on the keel side. Hermes drives Docker the same way. The keel image therefore ships the static
 `docker` client.
 
-- **One container per profile.** It is named `keel-sbx-<profile>-<hash8>`, with labels for the keel
-  deployment, the profile and the policy hash. It is started with `docker run -d --init` and the
-  policy's limits, network, mounts, env, user and `--runtime`, and runs `sleep infinity`. Sessions of
-  one profile share it.
-- **Commands.** `docker exec` runs `setsid bash -lc '<command>'` with a PID-file marker, so the command
-  is its own process group. `kill_tree` sends `TERM` to the group, then `KILL` after 3 s, through a
-  second `docker exec`.
+- **One generation per profile.** A published generation is identified by its 64-hex container ID; its
+  name carries the profile and a generation token, and its labels carry the deployment, profile,
+  policy digest, generation and create operation. Creation, helper installation and start are
+  separately recorded attempts, and the container is never started before the supervisor is installed.
+  Sessions of one profile share the generation.
+- **Commands.** An execution is recorded, then run by the in-container supervisor by exact ID. The
+  supervisor is a subreaper that pins the command's process group at start. Cancellation goes to that
+  same supervisor, which sends `TERM`, waits the grace period and sends `KILL`, then returns a receipt
+  proving the leader and descendants are gone. There is no PID file, numeric PID fallback or search by
+  profile.
 - **Working directory.** The working directory is per session, `<workdir>`, unless the consumer's
   instructions say otherwise. It is carried between commands by an in-band marker: the wrapper prints
   `pwd` after the command, keel strips it from the output, and the next command starts there. The value
   is stored on the session (`sessions.cwd`).
-- **Recovery.** A missing container is recreated, and the call retried once.
-- **Idle and orphaned containers.** Containers idle for `KEEL_SANDBOX_IDLE_SECONDS` (default 1800)
-  are removed by the sweeper. At start, containers with this deployment's label that no live run uses
-  are removed. This is safe in M2 because it runs a single instance (M1 README).
+- **Recovery.** A failed sandbox use ends the run as `sandbox_unavailable` after its tool result is
+  stored; it is never retried against a transparently recreated container mid-run. Recovery inspects by
+  exact ID and replaces a missing, stopped or incompatible generation before the next run. An
+  unresolved create is kept as a tombstone and is not retried until it is resolved.
+- **Idle and orphaned containers.** The coordinator removes an idle generation by exact ID once its
+  usage is released. Startup (and each maintenance pass) classifies every container of the deployment
+  in bounded batches; an unknown, legacy or conflicting container is kept as evidence and blocks only
+  its profile's sandbox admission (`sandbox_inventory_conflict`). Nothing is removed by profile name or
+  by a process-local in-flight list. Coordination needs PostgreSQL when more than one instance shares
+  a daemon.
 
 ### Security
 
@@ -255,7 +278,8 @@ Arch §10 for M2:
 - **`POST stop` on a running run** sets `stopping`, as in M1. The worker's stop watcher then does
   three things:
   - cancels the model stream, if one is open;
-  - calls `kill_tree` on the run's current `exec_id`, if a command is running;
+  - asks the coordinator to cancel the run's current execution ticket, if a command is running; the
+    request goes to the supervisor that started the command, which proves the process tree ended;
   - lets the executor's cancel path finish the run `cancelled`.
 - **The terminal event commits with the finish.** The executor does not emit `run.cancelled` itself:
   `finish_run` writes the state and the event in one transaction. A run finished by a lease sweep or a
@@ -267,8 +291,9 @@ Arch §10 for M2:
 - **Unanswered tool calls.** Every tool call of the last assistant message that has no result gets a
   synthetic tool message: content `"The command was cancelled."`, `tool_call_id` set. The next turn's
   request is then valid.
-- **Bound on stopping.** Kill plus finish stays well within the client's stop timeout. The kill escalates
-  from `TERM` to `KILL` in 3 s.
+- **Bound on stopping.** Kill plus finish stays well within the client's stop timeout. The supervisor
+  escalates from `TERM` to `KILL` after the grace period and bounds the proof wait
+  (`KEEL_SANDBOX_REAP_SECONDS`); an unproven cleanup leaves the generation blocked for recovery.
 
 ## 8. Data model changes
 
@@ -279,8 +304,8 @@ M2 needs a fresh database (no migrations yet).
 - **`messages`:** `tool_calls`, `tool_call_id` and `tool_name` are now written. M1 already had the
   columns.
 - **`blobs`:** a new table (§6).
-- **`runs`:** adds `current_exec_id`. The worker writes it, and the stop path reads it from the same
-  process.
+- **`runs`:** adds `current_exec_id`. The worker writes it, and cancellation resolves it through the
+  coordinator's stored execution ticket, so stop does not depend on process-local state.
 - **`run_events`:** the new event types from §3.
 
 ## 9. Configuration
@@ -301,14 +326,14 @@ M2 needs a fresh database (no migrations yet).
   - the captured Hermes prompt pieces and tool schemas load unchanged;
   - the system prompt and tool list are byte-identical across two turns of one session;
   - `instructions` are appended last.
-- **Docker integration tests** are opt-in (`KEEL_TEST_DOCKER=1`) and use a small public image. They
-  cover:
-  - `ensure`, then exec, then a carried working directory;
-  - timeout kills the process tree;
-  - `kill_tree` during `sleep`;
-  - a vanished container is recreated;
-  - a policy change recreates the container;
-  - idle reaping.
+- **Docker integration tests** are opt-in (`KEEL_TEST_DOCKER=1`) and use a small public image. M2
+  covered create, exec and a carried working directory, a timeout killing the process tree,
+  cancellation during `sleep`, recreation after a vanished container, replacement after a policy
+  change, and idle reaping. Those behaviours still hold, but the lifecycle tests were rewritten by the
+  2026-10-18 design: coordinated runs, exact-ID operations, native supervisor cancellation, recovery
+  and cutover are covered in `tests/test_sandbox_lifecycle_docker.py`, `tests/test_docker_operations.py`
+  and `tests/test_fault_injection.py`; `tests/test_docker_sandbox.py` checks that no name-based entry
+  point remains.
 - **Live run (`KEEL_LIVE_BEDROCK=1`).** One model run calls `terminal` (`echo`) in a Docker sandbox and
   answers with its output.
 - **The gate itself** runs in the consumer's own repository: contract checks, then quality rounds
