@@ -8,6 +8,7 @@ from keel.store.base import (
     ProfileDeletionBusy,
     ProfileDeletionConflict,
     ProfileTenantMismatch,
+    UniqueViolation,
 )
 
 PHASES = ("blocked", "draining", "purged")
@@ -34,6 +35,18 @@ class ProfileDeletionStoreMixin:
         """
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("operation_id must be a non-empty string")
+        # Two instances may race to insert the fence for an absent profile row.
+        # The loser re-reads the winner's committed row instead of surfacing a
+        # unique-constraint error.
+        for attempt in range(2):
+            try:
+                return await self._begin_once(profile_id, tenant_id, operation_id)
+            except UniqueViolation:
+                if attempt == 1:
+                    raise ProfileDeletionBusy(profile_id) from None
+        raise ProfileDeletionBusy(profile_id)
+
+    async def _begin_once(self, profile_id: str, tenant_id: int, operation_id: str) -> DeletionRecord:
         async with self.db.transaction():
             profile = await self.db.fetchrow("SELECT tenant_id FROM profiles WHERE id = ?", profile_id)
             if profile is not None and profile["tenant_id"] is not None:

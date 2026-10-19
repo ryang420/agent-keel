@@ -140,6 +140,21 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
                 if key.daemon_id != self._daemon_id:
                     raise SandboxBusy("the profile's sandbox belongs to another daemon")
                 counts = await self._recover_key(key)
+                # `_recover_key`'s final idle pass only replaces incompatible
+                # generations. A retirement must also remove a ready generation
+                # whose policy still matches, so plan that removal explicitly
+                # with a zero idle threshold.
+                try:
+                    _, artifact = await self._ready()
+                    for action in await self.store.plan_idle_removal(
+                            key, owner=self.owner, lease_seconds=self.lease_seconds, idle_seconds=0.0,
+                            helper_digest=artifact.sha256):
+                        await self._recover_action(action)
+                        counts = (counts[0], counts[1] + 1, counts[2], counts[3])
+                except SandboxBusy:
+                    raise
+                except Exception:
+                    pass  # the next pass retries; a bounded wait decides the outcome
                 row, usages = await self.store.recovery_snapshot(key)
                 if (row is None or row["state"] == "absent") and not any(
                         use.state != "released" for use in usages):
