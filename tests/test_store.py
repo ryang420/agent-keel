@@ -438,23 +438,6 @@ async def test_compaction_state_is_stored_and_cleared(store):
     assert (session.system_prompt, session.context_tokens, session.compaction_failed_at) == ("NEW", None, None)
 
 
-async def test_in_flight_profiles_are_those_with_a_queued_or_running_run(store):
-    for profile in ("p1", "p2", "p3", "p4"):
-        await store.upsert_profile(profile, models=[], sandbox={}, soul="", skills=[])
-        await store.ensure_session(profile, "s-" + profile)
-    runs = {}
-    for profile in ("p1", "p2", "p3", "p4"):
-        runs[profile] = await store.create_run(profile_id=profile, session_id="s-" + profile, provider="fake",
-                                               model="m", reasoning_effort=None,
-                                               input_parts=[{"type": "text", "text": "hi"}], instructions=None)
-    await store.claim_run("w1", 9_999_999)  # one of them is now running, which is still in flight
-    await store.finish_run(runs["p3"].id, "completed")
-    while (await store.get_run("p4", runs["p4"].id)).status != "running":
-        assert await store.claim_run("w1", 9_999_999) is not None
-    assert (await store.request_stop("p4", runs["p4"].id)).run.status == "stopping"
-    assert await store.in_flight_profiles() == {"p1", "p2", "p4"}
-
-
 async def test_pruning_deletes_only_events_of_runs_finished_before_the_cutoff(store, clock):
     from keel.models import Message, TextPart
 

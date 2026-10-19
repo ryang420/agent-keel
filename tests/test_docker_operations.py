@@ -373,6 +373,24 @@ async def test_create_generation_accepts_a_mount_beside_the_runtime_path(backend
     assert any(args[0] == "create" for args in fake.commands())
 
 
+async def test_create_generation_rechecks_a_retarged_host_symlink(tmp_path):
+    root = str(tmp_path / "mounts")
+    own = Path(profile_mount_root(root, "p1"))
+    other = Path(profile_mount_root(root, "p2"))
+    own.mkdir(parents=True)
+    other.mkdir(parents=True)
+    alias = own / "alias"
+    alias.symlink_to(own, target_is_directory=True)
+    selected = parse_policy({"image": IMAGE, "workdir": "/w",
+                             "mounts": [{"source": str(alias), "target": "/data"}]}, str(own))
+    alias.unlink()
+    alias.symlink_to(other, target_is_directory=True)
+    instance = DockerSandbox(deployment=DEPLOYMENT, mount_root=root)
+    pin_identity(instance, DAEMON)
+    with pytest.raises(SandboxError, match="mount policy"):
+        await instance.create_generation(make_attempt("create"), selected)
+
+
 @pytest.mark.parametrize("create,state", [
     ((1, "Error response from daemon: image not found\n"), "definite_failure"),
     ((125, "unknown flag: --something\n"), "uncertain"),
@@ -1115,11 +1133,8 @@ def test_env_file_rejects_values_that_cannot_be_written(env):
 # No primitive may resurrect the legacy ensure/replay behaviour.
 # ---------------------------------------------------------------------------
 
-async def test_exact_id_primitives_never_call_ensure(backend, artifact_directory):
-    async def ensure(*args, **kwargs):
-        raise AssertionError("an exact-ID primitive must never call ensure")
-
-    backend.ensure = ensure
+async def test_exact_id_primitives_have_no_legacy_ensure_to_fall_back_to(backend, artifact_directory):
+    assert not hasattr(backend, "ensure")  # there is no name-based create/start path to resurrect
     container = exact_id()
     ticket = make_ticket(container_id=container)
     artifact = make_artifact(artifact_directory)

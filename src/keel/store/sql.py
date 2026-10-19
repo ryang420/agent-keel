@@ -456,10 +456,6 @@ class SqlStore(SandboxStoreMixin):
             session_id, except_id)
         return int(row["n"])
 
-    async def in_flight_profiles(self) -> set[str]:
-        rows = await self.db.fetch(f"SELECT DISTINCT profile_id FROM runs WHERE status IN {_IN_FLIGHT}")
-        return {row["profile_id"] for row in rows}
-
     async def active_run_for_session(self, session_id: str) -> Run | None:
         row = await self.db.fetchrow(
             f"SELECT * FROM runs WHERE session_id = ? AND status IN {_IN_FLIGHT} ORDER BY created_at LIMIT 1",

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import uuid
 
 import pytest
@@ -46,4 +47,13 @@ async def test_a_live_run_uses_the_terminal(store):
         assert json.loads(tool.text)["output"] == "keel-42"
     finally:
         await registry.aclose()
-        await backend.remove_orphans()
+        remove_deployment(backend.deployment)
+
+
+def remove_deployment(deployment: str) -> None:
+    """Test cleanup by exact ID: remove the containers labelled with this test's own deployment."""
+    listed = subprocess.run(["docker", "ps", "-a", "-q", "--no-trunc", "--filter", "label=keel.managed=1",
+                             "--filter", f"label=keel.deployment={deployment}"],
+                            capture_output=True, text=True, timeout=60)
+    if listed.returncode == 0 and listed.stdout.split():
+        subprocess.run(["docker", "rm", "-f", *listed.stdout.split()], capture_output=True, timeout=120)

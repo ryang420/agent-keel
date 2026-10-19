@@ -204,6 +204,31 @@ async def test_coordinated_execs_run_by_exact_id_through_the_installed_helper(si
     await finish(coordinator, store, claim)
 
 
+async def test_two_profiles_keep_private_files_and_env_separate(single, backend):
+    store, _ = single
+    coordinator = await opened(store, backend)
+    left = Path(profile_mount_root(backend.mount_root, "p1"))
+    right = Path(profile_mount_root(backend.mount_root, "p2"))
+    left.mkdir(parents=True)
+    right.mkdir(parents=True)
+    (left / "marker").write_text("from-left")
+    (right / "marker").write_text("from-right")
+    await seed(store, "p1", env={"KEEL_TOKEN": "value-left"},
+               mounts=[{"source": str(left), "target": "/private"}])
+    await seed(store, "p2", env={"KEEL_TOKEN": "value-right"},
+               mounts=[{"source": str(right), "target": "/private"}])
+    claim_a, bound_a = await claim_and_prepare(coordinator, store, "s1", profile_id="p1")
+    claim_b, bound_b = await claim_and_prepare(coordinator, store, "s2", profile_id="p2")
+    assert bound_a.binding.container_id != bound_b.binding.container_id
+    await coordinator.write_file(bound_a, "/work/only-a", b"marker-a")
+    result = await run(coordinator, bound_b, 'echo "$KEEL_TOKEN"; ls /work; cat /private/marker')
+    assert "value-right" in result.output and "value-left" not in result.output
+    assert "from-right" in result.output and "from-left" not in result.output
+    assert "only-a" not in result.output and "marker-a" not in result.output
+    await finish(coordinator, store, claim_a)
+    await finish(coordinator, store, claim_b)
+
+
 async def test_a_timeout_and_a_cancellation_end_the_whole_tree_through_the_supervisor(single, backend):
     store, _ = single
     coordinator = await opened(store, backend)
@@ -390,7 +415,11 @@ async def test_unknown_and_legacy_containers_block_only_their_profile_until_reso
     await seed(store, "p2")
     policy_p1 = (await store.get_profile("p1")).sandbox
     # A container left by the previous (uncoordinated) version: profile-derived name, no generation labels.
-    legacy = docker(*backend.run_args("p1", parse_policy(policy_p1, "/")))
+    legacy_policy = parse_policy(policy_p1, "/")
+    legacy = docker("run", "-d", "--init", "--name", backend.container_name("p1"),
+                    "--label", "keel.managed=1", "--label", f"keel.deployment={backend.deployment}",
+                    "--label", "keel.profile=p1", "--label", f"keel.policy={legacy_policy.digest()}",
+                    legacy_policy.image, "sleep", "infinity")
     coordinator = await opened(store, backend)
     await queue_run(store, "blocked", profile_id="p1")
     claim, healthy = await claim_and_prepare(coordinator, store, "healthy", profile_id="p2")

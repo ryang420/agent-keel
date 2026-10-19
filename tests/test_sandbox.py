@@ -277,26 +277,8 @@ async def test_a_cancelled_kill_tree_can_be_retried(local):
         os.killpg(pgid, 0)
 
 
-async def test_remove_orphans_spares_profiles_with_a_run_in_flight(tmp_path):
-    from keel.sandbox.docker import DockerSandbox
-
-    log = tmp_path / "log"
-    fake = tmp_path / "docker"
-    fake.write_text('#!/bin/sh\necho "$@" >> "' + str(log) + '"\n'
-                    'case "$1" in ps) printf "c1 p1\\nc2 p2\\nc3 p3\\n";; esac\nexit 0\n')
-    fake.chmod(0o755)
-    assert await DockerSandbox(docker=str(fake), deployment="t").remove_orphans({"p2"}) == 2
-    calls = log.read_text().splitlines()
-    assert calls[0].startswith("ps -a --filter label=keel.managed=1 --filter label=keel.deployment=t --format")
-    assert calls[1] == "rm -f c1 c3"
-
-
-def test_reference_names_the_sandbox_ensure_would_return_without_touching_anything(tmp_path):
-    from keel.sandbox.docker import DockerSandbox
-
+async def test_reference_names_the_local_sandbox_without_touching_anything(tmp_path):
     policy = parse_policy({"image": "local", "workdir": str(tmp_path / "w")})
     local = LocalSandbox().reference("p1", policy)
     assert (local.profile_id, local.name, local.policy) == ("p1", "local-p1", policy)
     assert not (tmp_path / "w").exists()
-    docker = DockerSandbox(docker="keel-no-such-docker", deployment="t")
-    assert docker.reference("p1", policy) == base.Sandbox("p1", docker.container_name("p1"), policy)

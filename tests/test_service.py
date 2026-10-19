@@ -166,7 +166,7 @@ def _labels(profile_id: str) -> tuple[tuple[str, str], ...]:
 
 
 class _ServiceDocker(LocalDocker):
-    """The service's coordinated backend in these tests; the legacy name-based sweeps must never run."""
+    """The service's coordinated backend in these tests; it has only exact-ID lifecycle operations."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(daemon_id=LOCAL_DAEMON)
@@ -177,12 +177,6 @@ class _ServiceDocker(LocalDocker):
     async def inventory(self):
         self.inventory_calls += 1
         return [*await super().inventory(), *self.extra_inventory]
-
-    async def remove_orphans(self, keep=frozenset()):
-        raise AssertionError("startup must not remove containers by an in-flight profile list")
-
-    async def reap_idle(self):
-        raise AssertionError("idle reaping is the coordinator's")
 
 
 async def test_build_wires_one_coordinator_into_the_executor_and_the_pool(tmp_path):
@@ -310,6 +304,50 @@ async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown
     assert calls.count(("reconcile", 100)) >= 2 and calls.count(("idle", 100)) >= 2
     assert set(calls) == {("reconcile", 100), ("idle", 100)}
     assert len(calls) == stopped  # nothing runs after shutdown
+
+
+async def test_maintenance_prunes_records_with_the_configured_retention_and_logs_failures(tmp_path, monkeypatch,
+                                                                                          caplog):
+    import logging
+
+    from keel import service
+    from keel.sandbox.coordinator import SandboxCoordinator
+    from keel.sandbox.records import RecoveryReport
+    from keel.store.sql import SqlStore
+
+    install_helper_assets(tmp_path / "helper", monkeypatch)
+    monkeypatch.setattr(service, "DockerSandbox", _ServiceDocker)
+    monkeypatch.setattr(service, "MAINTENANCE_SECONDS", 0.05)
+    monkeypatch.setattr(service, "ADMISSION_RETRY_SECONDS", 0.05)
+
+    async def reconcile_once(self, *, limit=100):
+        self._inventory_daemon, self._inventory_pending = self._daemon_id, 0
+        return RecoveryReport()
+
+    async def reap_idle_once(self, *, limit=100):
+        return RecoveryReport()
+
+    monkeypatch.setattr(SandboxCoordinator, "reconcile_once", reconcile_once)
+    monkeypatch.setattr(SandboxCoordinator, "reap_idle_once", reap_idle_once)
+    calls: list[tuple[float, int]] = []
+
+    async def prune(self, retention_seconds, *, limit=100):
+        calls.append((retention_seconds, limit))
+        if len(calls) == 1:
+            raise RuntimeError("the prune pass fails")
+        return 0
+
+    monkeypatch.setattr(SqlStore, "prune_sandbox_records", prune)
+    caplog.set_level(logging.WARNING, logger=service.log.name)
+    app = create_service(_docker_settings(tmp_path, event_retention_days=3))
+    async with app.router.lifespan_context(app):
+        for _ in range(100):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+    assert calls[0] == (3 * 86_400.0, 100)  # the configured event retention, one bounded batch
+    assert len(calls) >= 2, "a failed prune must be logged, never stop maintenance"
+    assert "pruning sandbox records failed" in caplog.text
 
 
 async def test_claims_never_wait_on_docker_and_admission_opens_after_a_full_inventory(tmp_path, monkeypatch, store):

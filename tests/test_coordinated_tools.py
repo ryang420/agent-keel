@@ -255,31 +255,14 @@ async def test_control_accepts_valid_cleaning_usage(managed):
     assert await facade.release(bound.use) is True
 
 
-@pytest.mark.parametrize('operation', ['exec', 'read_file', 'write_file', 'kill_tree'])
-async def test_bound_handles_cannot_bypass_facade_through_legacy_docker(managed, operation):
-    from keel.sandbox.base import SandboxError
+def test_the_docker_backend_has_no_legacy_method_that_could_bypass_the_facade():
+    # Bound execution must go through the coordinator facade. The name-based methods that once accepted a bound
+    # handle are not merely guarded: they no longer exist, so no caller can reach Docker without a ticket.
     from keel.sandbox.docker import DockerSandbox
 
-    _, _, _, _, bound, _ = managed
     backend = DockerSandbox(deployment='dep')
-    calls = []
-
-    async def legacy(*args, **kwargs):
-        calls.append(args)
-        raise AssertionError('legacy dispatch must not run')
-
-    backend._exec_once = legacy
-    backend._docker = legacy
-    with pytest.raises(SandboxError):
-        if operation == 'exec':
-            await backend.exec(bound, ['true'], cwd='/', timeout_s=1, exec_id='bypass')
-        elif operation == 'read_file':
-            await backend.read_file(bound, '/a', 10)
-        elif operation == 'write_file':
-            await backend.write_file(bound, '/a', b'body')
-        else:
-            await backend.kill_tree(bound, 'bypass')
-    assert calls == []
+    for name in ('exec', 'read_file', 'write_file', 'kill_tree', '_exec_once', '_docker'):
+        assert not hasattr(backend, name), name
 
 
 async def test_facade_rejects_an_unbound_local_handle(managed):

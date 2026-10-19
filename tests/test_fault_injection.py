@@ -261,7 +261,7 @@ async def test_a_container_removed_between_two_tool_calls_fails_the_run_and_reco
         async def stream(self, request):
             if len(self.requests) == 1:
                 row = await store.db.fetchrow("SELECT container_id FROM sandboxes WHERE profile_id = ?", "p1")
-                await backend._docker("rm", "-f", row["container_id"])
+                subprocess.run(["docker", "rm", "-f", row["container_id"]], capture_output=True, timeout=120)
             async for event in super().stream(request):
                 yield event
 

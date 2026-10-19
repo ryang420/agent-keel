@@ -222,14 +222,14 @@ class SandboxBackend(SandboxExecutor, Protocol):
 class CoordinatedSandboxBackend(Protocol):
     """The exact-ID operations the lifecycle coordinator drives.
 
-    Wider than `SandboxBackend`, which the agent loop uses: every method addresses a recorded full container ID,
-    never a reusable name, and an implementation never calls `ensure` or retries a payload. A definite failure is
-    kept apart from uncertainty: a timeout, killed client, transport loss or malformed output is never read as
-    "the container does not exist".
+    Wider than `SandboxBackend`, which `LocalSandbox` and test fakes implement: every method addresses a recorded
+    full container ID, never a reusable name, and an implementation never calls `ensure` or retries a payload. A
+    definite failure is kept apart from uncertainty: a timeout, killed client, transport loss or malformed output is
+    never read as "the container does not exist".
     """
 
     async def daemon_identity(self) -> tuple[str, str]:
-        """The Docker daemon ID and normalized architecture, cached once read."""
+        """The Docker daemon ID (read fresh on every call) and the cached normalized architecture."""
         ...
 
     async def inspect_id(self, container_id: str) -> DockerOutcome: ...

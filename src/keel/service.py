@@ -54,7 +54,7 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     closables = [registry, bus, store]
     if settings.sandbox == "docker":
         backend = DockerSandbox(docker=settings.docker, deployment=settings.deployment,
-                                idle_seconds=settings.sandbox_idle_seconds, mount_root=settings.sandbox_mount_root,
+                                mount_root=settings.sandbox_mount_root,
                                 reap_seconds=settings.sandbox_reap_seconds)
         # One coordinator per instance, shared by the executor and the workers. Its leases (usage and lifecycle
         # operations) use the same KEEL_LEASE_SECONDS as the run claims; terminal transitions notify the shared bus.
@@ -77,11 +77,14 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     return keel, pool, closables, coordinator
 
 
-async def _maintenance_pass(coordinator: SandboxCoordinator) -> None:
-    """One bounded recovery/inventory reconciliation and one bounded idle pass; failures are logged, never raised.
+async def _maintenance_pass(coordinator: SandboxCoordinator, retention_seconds: float) -> None:
+    """One bounded reconciliation, one bounded idle pass and one bounded evidence-pruning pass.
 
-    Neither pass deletes by name, age or a profile list: every removal is an exact-ID decision taken under the
-    coordination guard, and unknown or conflicting inventory only blocks the affected profile's admission.
+    Every pass handles at most `MAINTENANCE_BATCH` rows, and failures are logged, never raised. Reconciliation and
+    idle reaping never delete by name, age or a profile list: every removal is an exact-ID decision taken under the
+    coordination guard, and unknown or conflicting inventory only blocks the affected profile's admission. Pruning
+    only deletes resolved rows older than the configured retention; the store never selects an unresolved attempt,
+    an unreleased usage, an unresolved exec or a current reference.
     """
     for name, scan in (("reconciling", coordinator.reconcile_once), ("reaping idle", coordinator.reap_idle_once)):
         try:
@@ -93,6 +96,13 @@ async def _maintenance_pass(coordinator: SandboxCoordinator) -> None:
             log.info("%s sandboxes: removed=%d released=%d blocked=%d unresolved=%d diagnostics=%s", name,
                      report.removed, report.released, report.blocked, report.unresolved,
                      ",".join(sorted(set(report.diagnostics))))
+    try:
+        pruned = await coordinator.store.prune_sandbox_records(retention_seconds, limit=MAINTENANCE_BATCH)
+    except Exception:
+        log.warning("pruning sandbox records failed", exc_info=True)
+    else:
+        if pruned:
+            log.info("pruned %d resolved sandbox records", pruned)
 
 
 async def _open_admission(coordinator: SandboxCoordinator) -> bool:
@@ -110,14 +120,14 @@ async def _open_admission(coordinator: SandboxCoordinator) -> bool:
     return opened
 
 
-async def _maintain(coordinator: SandboxCoordinator) -> None:
+async def _maintain(coordinator: SandboxCoordinator, retention_seconds: float) -> None:
     while True:
         if not coordinator.admitting():
             await asyncio.sleep(ADMISSION_RETRY_SECONDS)
             await _open_admission(coordinator)
             continue
         await asyncio.sleep(MAINTENANCE_SECONDS)
-        await _maintenance_pass(coordinator)
+        await _maintenance_pass(coordinator, retention_seconds)
 
 
 def create_service(settings: Settings | None = None, *, providers: ProviderRegistry | None = None) -> FastAPI:
@@ -137,7 +147,9 @@ def create_service(settings: Settings | None = None, *, providers: ProviderRegis
                 await _open_admission(coordinator)
             await pool.start()
             if coordinator is not None:
-                maintenance = asyncio.create_task(_maintain(coordinator), name="keel-sandbox-maintenance")
+                maintenance = asyncio.create_task(
+                    _maintain(coordinator, settings.event_retention_days * 86_400.0),
+                    name="keel-sandbox-maintenance")
             yield
         finally:
             if maintenance is not None:
