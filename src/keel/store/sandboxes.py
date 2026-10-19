@@ -1498,6 +1498,13 @@ class SandboxStoreMixin:
         row = await self.db.fetchrow("SELECT * FROM sandbox_uses WHERE run_id = ?", run_id)
         return _usage(row) if row is not None else None
 
+    async def profile_sandbox_keys(self, profile_id: str, *, deployment: str) -> list[SandboxKey]:
+        """Every coordination identity recorded for one profile on this deployment."""
+        rows = await self.db.fetch(
+            "SELECT daemon_id FROM sandboxes WHERE deployment = ? AND profile_id = ? ORDER BY daemon_id, profile_id",
+            deployment, profile_id)
+        return [SandboxKey(deployment, profile_id, row["daemon_id"]) for row in rows]
+
     async def recovery_snapshot(self, key: SandboxKey) -> tuple[dict | None, list[SandboxUsage]]:
         """Observation only; all decisions re-read these identities under the guard."""
         row = await self.db.fetchrow(

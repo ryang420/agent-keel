@@ -121,6 +121,38 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         return (self._daemon_id is not None and self._artifact is not None and not self._daemon_changed
                 and self._inventory_daemon == self._daemon_id)
 
+    async def retire_profile(self, profile_id: str, *, timeout_seconds: float) -> None:
+        """Retire every sandbox generation of one profile, proving none remains.
+
+        Uses the existing recovery planning and exact-ID dispatch. An uncertain
+        removal, another daemon or unreleased usage keeps the deletion
+        incomplete: nothing is ever removed by name.
+        """
+        keys = await self.store.profile_sandbox_keys(profile_id, deployment=self.deployment)
+        if not keys:
+            return
+        await self._ready()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout_seconds))
+        while keys:
+            progressed = False
+            for key in list(keys):
+                if key.daemon_id != self._daemon_id:
+                    raise SandboxBusy("the profile's sandbox belongs to another daemon")
+                counts = await self._recover_key(key)
+                row, usages = await self.store.recovery_snapshot(key)
+                if (row is None or row["state"] == "absent") and not any(
+                        use.state != "released" for use in usages):
+                    keys.remove(key)
+                elif sum(counts) > 0:
+                    progressed = True
+            if not keys:
+                return
+            if loop.time() >= deadline:
+                raise SandboxBusy("the profile's sandbox is not quiescent")
+            if not progressed:
+                await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+
     async def open_admission(self) -> bool:
         """Initialize, then run bounded recovery passes until the whole inventory has been classified.
 

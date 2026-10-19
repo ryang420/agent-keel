@@ -72,6 +72,21 @@ class ProfileDeletionStoreMixin:
         if row is not None:
             raise ProfileDeletionBusy(profile_id)
 
+    async def assert_profile_admitted(self, profile_id: str) -> None:
+        """Refuse data writes while fenced, or after a completed reset left no profile.
+
+        A receipt blocks a late writer that still holds an old profile id even
+        after the fence is released. A newly provisioned profile row makes the
+        receipt historical, so the same deterministic id may be used again.
+        """
+        await self.assert_profile_writable(profile_id)
+        receipt = await self.db.fetchrow(
+            "SELECT 1 AS done FROM profile_deletion_receipts WHERE profile_id = ? LIMIT 1", profile_id)
+        if receipt is not None:
+            profile = await self.db.fetchrow("SELECT 1 AS ok FROM profiles WHERE id = ?", profile_id)
+            if profile is None:
+                raise ProfileDeletionBusy(profile_id)
+
     async def advance_profile_deletion(self, record: DeletionRecord, next_phase: str) -> DeletionRecord:
         """Compare-and-set one phase transition; only the owning operation may advance."""
         if next_phase not in PHASES or NEXT_PHASE.get(record.phase) != next_phase:
