@@ -46,6 +46,11 @@ All notable changes to this project are documented here. The format follows
   test/dev backend is unchanged.
 
 ### Fixed
+- Cross-instance background callbacks now carry a durable profile incarnation through memory, title and memory-review
+  writes, so work from a deleted profile cannot change a recreated profile that reuses its id or session ids. Old
+  deletion receipts cannot block or unblock another incarnation's background work.
+- Profile guards acquire PostgreSQL's shared profile advisory lock before the profile row lock, preventing the
+  profile update versus deletion purge deadlock while preserving nonblocking claim skips.
 - An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
   including on a profile that never had a coordinated sandbox. A block clears only when the container it records
   is proven absent by exact ID on the same daemon (or is still listed but stopped as of the fresh exact-ID

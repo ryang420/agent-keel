@@ -54,6 +54,22 @@ same transaction-scoped advisory lock for the profile, so a writer admitted
 before the fence either commits before the purge or observes the fence and
 fails. SQLite's `BEGIN IMMEDIATE` provides the equivalent serialization.
 
+PostgreSQL takes the profile advisory lock before any profile row lock. The
+profile guard uses a nonblocking advisory attempt when called with
+`skip_locked`, preserving claim fairness while keeping purge and update paths
+in one global mount-policy → profile order.
+
+Migration 7 adds a random incarnation token to each profile and copies it onto
+each newly created run. Existing profiles and runs receive their tokens during
+store startup. Background memory, title and memory-turn writes check the
+captured token in the same transaction as their final mutation. Purging removes
+the old token with the profile row; provisioning the same deterministic id
+creates a new token. Separate service instances therefore reject old callbacks
+even though their in-memory task trackers are independent. Local background
+blocks are scoped to both the deletion operation and captured incarnation, so
+a stale receipt cannot release a newer block and a completion on another
+instance cannot strand the new incarnation.
+
 ## Lifecycle
 
 1. **blocked** - the fence and its tenant are durable.
@@ -82,5 +98,7 @@ If any step fails, both the fence and the safest available evidence remain.
   be reopened by a late request carrying an older operation.
 - A completed reset leaves no background review that could write memory into a
   recreated profile.
+- A delayed memory or title callback from an older profile incarnation cannot
+  modify the recreated profile or a reused session id.
 - Completion requires durable proof that the owned-data purge committed.
 - Both SQLite and PostgreSQL use the same migration and store code.

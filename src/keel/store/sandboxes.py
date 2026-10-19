@@ -194,6 +194,16 @@ class SandboxStoreMixin:
         """
         async with self.db.transaction():
             if self.db.dialect == "postgres":
+                if skip_locked:
+                    locked = await self.db.fetchrow(
+                        "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
+                        profile_id)
+                    if not locked["locked"]:
+                        yield False
+                        return
+                else:
+                    await self.lock_profile(profile_id)
+            if self.db.dialect == "postgres":
                 lock = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
                 row = await self.db.fetchrow(f"SELECT id FROM profiles WHERE id = ?{lock}", profile_id)
             else:
@@ -214,6 +224,15 @@ class SandboxStoreMixin:
         """
         async with self.db.transaction():
             if self.db.dialect == "postgres":
+                if skip_locked:
+                    locked = await self.db.fetchrow(
+                        "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
+                        profile_id)
+                    if not locked["locked"]:
+                        yield False
+                        return
+                else:
+                    await self.lock_profile(profile_id)
                 suffix = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
                 row = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?" + suffix, profile_id)
                 if row is None and skip_locked:

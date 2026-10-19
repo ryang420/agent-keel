@@ -52,11 +52,15 @@ class ProfileDeletionService:
                      timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
         """Fence, drain, retire and purge; leave the fence for `complete`."""
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        profile = await self.store.get_profile(profile_id)
         record = await self.store.begin_profile_deletion(profile_id, tenant_id, operation_id)
+        if record.phase == "complete":
+            return
         # Block new background work before draining: a run that just committed
         # its terminal state must not spawn a review behind the drain's back.
-        if self.background is not None:
-            self.background.block_profile(profile_id)
+        if self.background is not None and not (profile is None and record.phase == "purged"):
+            self.background.block_profile(profile_id, operation_id,
+                                          profile.incarnation if profile is not None else None)
         if record.phase == "blocked":
             record = await self._advance(record, "draining")
         if record.phase == "draining":
@@ -80,7 +84,7 @@ class ProfileDeletionService:
         """Release only this operation's fence; a retry is idempotent."""
         await self.store.complete_profile_deletion(profile_id, tenant_id, operation_id)
         if self.background is not None:
-            self.background.unblock_profile(profile_id)
+            self.background.unblock_profile(profile_id, operation_id)
 
     async def _drain(self, profile_id: str, deadline: float) -> None:
         """Cancel queued runs and wait for active workers to end their runs."""

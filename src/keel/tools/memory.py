@@ -19,7 +19,8 @@ async def memory(args: dict, ctx: ToolContext) -> ToolOutcome:
         ops = [{key: args.get(key) for key in ("action", "content", "new_text", "old_text")}]
     if not isinstance(ops, list):
         return error_result("operations must be a list.")
-    result = await ctx.store.apply_memory(ctx.profile_id, target, limit, ops)
+    result = await ctx.store.apply_memory(ctx.profile_id, target, limit, ops,
+                                         profile_incarnation=ctx.profile_incarnation)
     if result.get("success") and ctx.session_id:
-        await ctx.store.reset_memory_turns(ctx.session_id)
+        await ctx.store.reset_memory_turns(ctx.session_id, profile_incarnation=ctx.profile_incarnation)
     return ToolOutcome(tool_json(result), error=not result.get("success"))

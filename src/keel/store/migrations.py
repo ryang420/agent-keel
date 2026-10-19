@@ -186,9 +186,14 @@ CREATE INDEX IF NOT EXISTS profile_deletion_receipts_operation
     ON profile_deletion_receipts (operation_id);
 """
 
+_V7 = """
+ALTER TABLE profiles ADD COLUMN incarnation TEXT;
+ALTER TABLE runs ADD COLUMN profile_incarnation TEXT;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6))
+    Migration(6, _V6), Migration(7, _V7))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

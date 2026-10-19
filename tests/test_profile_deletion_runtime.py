@@ -255,6 +255,48 @@ async def test_background_review_is_drained_before_a_reset(store):
     assert background.profile_tasks("p1") == []
 
 
+async def test_other_instance_cannot_resume_an_old_background_review_into_a_reused_session(store):
+    profile = await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
+                                         memory=True, tenant_id=1)
+    await store.ensure_session("p1", "reused-session")
+    await store.set_session_prompt("reused-session", "system prompt", "fake", "m")
+    run = await store.create_run(profile_id="p1", session_id="reused-session", provider="fake", model="m",
+                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                 instructions=None)
+    release = asyncio.Event()
+    provider = BlockingProvider(release)
+    registry = ProviderRegistry()
+    registry.register(provider)
+    background_a, background_b = Background(), Background()
+    executor = RunExecutor(store, InMemoryEventBus(), registry, background=background_a, memory_review_turns=1)
+    service_b = ProfileDeletionService(store, background=background_b)
+    try:
+        # Exercise the real post-completion scheduling path on instance A. Instance B has an
+        # independent in-memory tracker, so its DELETE cannot drain this task.
+        assert await store.finish_run(run.id, "completed") is not None
+        await executor._after_complete(run, profile)
+        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        await service_b.delete("p1", 1, OP_A, timeout_seconds=5)
+        await service_b.complete("p1", 1, OP_A)
+
+        current = await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
+                                             memory=True, tenant_id=1)
+        assert current.incarnation != run.profile_incarnation
+        await store.ensure_session("p1", "reused-session")
+        await store.set_session_prompt("reused-session", "new system prompt", "fake", "m")
+        release.set()
+        old_task = background_a.profile_tasks("p1")
+        assert len(old_task) == 1
+        await asyncio.wait_for(asyncio.gather(*old_task), timeout=5)
+
+        assert (await store.memory_entries("p1"))["user"] == []
+        assert await store.get_session("p1", "reused-session") is not None
+    finally:
+        release.set()
+        await background_a.close()
+        await background_b.close()
+
+
 async def test_a_failed_purge_does_not_authorize_completion(store, monkeypatch):
     await seeded(store)
     service = ProfileDeletionService(store)

@@ -15,21 +15,32 @@ class Background:
         self.limit = limit
         self.close_timeout_s = close_timeout_s
         self._tasks: dict[asyncio.Task, str | None] = {}
-        self._blocked: set[str] = set()
+        self._blocked: dict[str, tuple[str | None, str | None]] = {}
 
-    def block_profile(self, profile_id: str) -> None:
+    def block_profile(self, profile_id: str, operation_id: str | None = None,
+                      profile_incarnation: str | None = None) -> None:
         """Refuse new background work for a profile whose deletion has been claimed."""
-        self._blocked.add(profile_id)
+        self._blocked[profile_id] = (operation_id, profile_incarnation)
 
-    def unblock_profile(self, profile_id: str) -> None:
-        self._blocked.discard(profile_id)
+    def unblock_profile(self, profile_id: str, operation_id: str | None = None,
+                        profile_incarnation: str | None = None) -> None:
+        current = self._blocked.get(profile_id)
+        if (current is not None and current[0] == operation_id
+                and (profile_incarnation is None or current[1] == profile_incarnation)):
+            del self._blocked[profile_id]
 
-    def spawn(self, coro, name: str, *, profile_id: str | None = None) -> bool:
+    def spawn(self, coro, name: str, *, profile_id: str | None = None,
+              profile_incarnation: str | None = None) -> bool:
         """Start `coro`. At the limit, or for a blocked profile, it is dropped and this returns False."""
         if profile_id is not None and profile_id in self._blocked:
-            coro.close()
-            log.info("background task %s dropped: profile deletion is pending", name)
-            return False
+            blocked_incarnation = self._blocked[profile_id][1]
+            if (profile_incarnation is None or blocked_incarnation == profile_incarnation):
+                coro.close()
+                log.info("background task %s dropped: profile deletion is pending", name)
+                return False
+            # A different captured incarnation may belong to a stale callback or to a profile recreated after a
+            # different instance completed deletion. Let durable write checks decide; never let that callback
+            # erase this instance's newer operation block.
         if len([task for task in self._tasks if not task.done()]) >= self.limit:
             coro.close()
             log.warning("background task %s dropped: %d already running", name, self.limit)

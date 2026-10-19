@@ -1,8 +1,10 @@
 """Durable, tenant-owned profile deletion fences and completion receipts."""
 
+import asyncio
+
 import pytest
 
-from keel.store.base import ProfileDeletionBusy, ProfileDeletionConflict, ProfileTenantMismatch
+from keel.store.base import ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch, ProfileTenantMismatch
 
 MODELS = [{"provider": "fake", "model": "m"}]
 OP_A = "11111111-1111-4111-8111-111111111111"
@@ -114,6 +116,105 @@ async def test_completion_requires_purged_phase_and_matching_operation(store):
     with pytest.raises(ProfileTenantMismatch):
         await store.complete_profile_deletion("p1", 2, OP_A)
     assert (await store.get_profile_deletion("p1")).phase == "purged"
+
+
+async def test_old_run_authority_cannot_write_into_a_reprovisioned_profile(store):
+    await put_profile(store)
+    await store.ensure_session("p1", "reused-session")
+    old_run = await store.create_run(
+        profile_id="p1", session_id="reused-session", provider="fake", model="m",
+        reasoning_effort=None, input_parts=[{"type": "text", "text": "old"}], instructions=None)
+
+    old = await store.begin_profile_deletion("p1", 1, OP_A)
+    old = await store.advance_profile_deletion(old, "draining")
+    await store.purge_profile_data(old)
+    await store.complete_profile_deletion("p1", 1, OP_A)
+
+    new_profile = await put_profile(store)
+    await store.ensure_session("p1", "reused-session")
+    assert new_profile.incarnation != old_run.profile_incarnation
+
+    with pytest.raises(ProfileIncarnationMismatch):
+        await store.apply_memory("p1", "user", 2200, [{"action": "add", "content": "stale"}],
+                                 profile_incarnation=old_run.profile_incarnation)
+    with pytest.raises(ProfileIncarnationMismatch):
+        await store.set_title("p1", "reused-session", "stale", "llm",
+                              profile_incarnation=old_run.profile_incarnation)
+    with pytest.raises(ProfileIncarnationMismatch):
+        await store.note_memory_turn("reused-session", 1, profile_incarnation=old_run.profile_incarnation)
+
+    saved = await store.apply_memory("p1", "user", 2200, [{"action": "add", "content": "fresh"}],
+                                     profile_incarnation=new_profile.incarnation)
+    assert saved["success"]
+    assert (await store.set_title("p1", "reused-session", "fresh", "llm",
+                                  profile_incarnation=new_profile.incarnation)).title == "fresh"
+
+
+async def test_old_operation_retry_does_not_change_current_background_block(store):
+    from keel.background import Background
+    from keel.deletion import ProfileDeletionService
+
+    await put_profile(store)
+    background = Background()
+    service = ProfileDeletionService(store, background=background)
+    try:
+        await service.delete("p1", 1, OP_A)
+        await service.complete("p1", 1, OP_A)
+        new_profile = await put_profile(store)
+
+        # A retry of a completed receipt must not block the new incarnation.
+        await service.delete("p1", 1, OP_A)
+        accepted = background.spawn(asyncio.sleep(0), "new-incarnation", profile_id="p1",
+                                    profile_incarnation=new_profile.incarnation)
+        assert accepted
+        await asyncio.sleep(0)
+
+        # A newer deletion owns the local block; the old receipt cannot lift it.
+        await service.delete("p1", 1, OP_B, timeout_seconds=0)
+        await service.complete("p1", 1, OP_A)
+        assert not background.spawn(asyncio.sleep(0), "during-new-delete", profile_id="p1",
+                                    profile_incarnation=new_profile.incarnation)
+    finally:
+        await background.close()
+
+
+async def test_completion_on_another_instance_does_not_leave_old_tracker_blocking_new_profile(store):
+    from keel.background import Background
+    from keel.deletion import ProfileDeletionService
+
+    await put_profile(store)
+    background_a, background_b = Background(), Background()
+    service_a = ProfileDeletionService(store, background=background_a)
+    service_b = ProfileDeletionService(store, background=background_b)
+    try:
+        await service_a.delete("p1", 1, OP_A)
+        await service_b.complete("p1", 1, OP_A)
+
+        current = await put_profile(store)
+        accepted = background_a.spawn(asyncio.sleep(0), "new-incarnation", profile_id="p1",
+                                      profile_incarnation=current.incarnation)
+        assert accepted
+        await asyncio.sleep(0)
+    finally:
+        await background_a.close()
+        await background_b.close()
+
+
+async def test_mismatched_background_authority_cannot_clear_a_newer_local_block():
+    from keel.background import Background
+
+    background = Background()
+    background.block_profile("p1", OP_B, "incarnation-b")
+    try:
+        # A delayed callback carrying A may be admitted to reach its final durable check, but it cannot
+        # remove B's process-local block. Unknown authority remains denied outright.
+        assert background.spawn(asyncio.sleep(0), "stale", profile_id="p1", profile_incarnation="incarnation-a")
+        assert not background.spawn(asyncio.sleep(0), "unknown", profile_id="p1")
+        assert not background.spawn(asyncio.sleep(0), "current", profile_id="p1",
+                                    profile_incarnation="incarnation-b")
+        await asyncio.sleep(0)
+    finally:
+        await background.close()
 
 
 async def test_purge_removes_only_the_target_profiles_rows(store):

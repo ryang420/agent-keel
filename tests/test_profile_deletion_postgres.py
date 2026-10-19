@@ -114,3 +114,44 @@ async def test_guard_and_completion_serialize_across_instances():
     finally:
         await first.close()
         await second.close()
+
+
+async def test_profile_put_guard_takes_advisory_lock_before_the_profile_row():
+    from tests.sandbox_support import reset_postgres_schema
+
+    await reset_postgres_schema(DSN)
+    writer = await open_store(DSN)
+    deleter = await open_store(DSN)
+    row_held, resume_writer, delete_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    try:
+        await put(writer)
+
+        async def put_path():
+            async with writer.profile_guard("lock-order"):
+                row_held.set()
+                await resume_writer.wait()
+                await writer.upsert_profile("lock-order", models=MODELS, sandbox={}, soul="changed", skills=[],
+                                            tenant_id=1)
+
+        # The target is a second profile so the first setup call does not create it.
+        await writer.upsert_profile("lock-order", models=MODELS, sandbox={}, soul="s", skills=[], tenant_id=1)
+        put_task = asyncio.create_task(put_path())
+        await asyncio.wait_for(row_held.wait(), 5)
+        async def delete_path():
+            delete_started.set()
+            await ProfileDeletionService(deleter).delete("lock-order", 1, OP_A, timeout_seconds=5)
+
+        delete_task = asyncio.create_task(delete_path())
+        await asyncio.wait_for(delete_started.wait(), 5)
+        # Let PostgreSQL reach its lock acquisition while the writer owns the guard. Under the old row-first order,
+        # deletion can take the advisory lock and then deadlock as the writer resumes into upsert_profile.
+        await asyncio.sleep(0.1)
+        assert not delete_task.done()
+        resume_writer.set()
+        results = await asyncio.wait_for(asyncio.gather(put_task, delete_task, return_exceptions=True), 8)
+        assert results == [None, None]
+        assert await deleter.get_profile("lock-order") is None
+    finally:
+        resume_writer.set()
+        await writer.close()
+        await deleter.close()
