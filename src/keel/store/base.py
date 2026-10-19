@@ -41,6 +41,14 @@ class ProfileTenantMismatch(StoreError):
     pass
 
 
+class ProfileDeletionBusy(StoreError):
+    """The profile is being deleted; the caller's write must not proceed."""
+
+
+class ProfileDeletionConflict(StoreError):
+    """A deletion operation could not perform its expected transition."""
+
+
 class UniqueViolation(Exception):
     """Raised by a Db adapter when a unique constraint rejects a write."""
 

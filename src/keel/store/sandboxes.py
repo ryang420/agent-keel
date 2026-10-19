@@ -265,6 +265,10 @@ class SandboxStoreMixin:
             candidates = await self.db.fetch(
                 "SELECT id, profile_id FROM runs WHERE status = 'queued' ORDER BY created_at, id")
             for candidate in candidates:
+                if await self.db.fetchrow(
+                        "SELECT 1 AS fenced FROM profile_deletions WHERE profile_id = ? LIMIT 1",
+                        candidate["profile_id"]):
+                    continue
                 async with self.profile_guard(candidate["profile_id"], skip_locked=True) as available:
                     if not available:
                         continue

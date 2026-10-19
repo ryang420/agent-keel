@@ -166,8 +166,29 @@ CREATE INDEX sandbox_operations_create ON sandbox_operations (original_create_op
 CREATE INDEX sandbox_operations_target ON sandbox_operations (daemon_id, container_id);
 """
 
+_V6 = """
+CREATE TABLE IF NOT EXISTS profile_deletions (
+    profile_id TEXT PRIMARY KEY,
+    tenant_id INTEGER NOT NULL,
+    operation_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('blocked', 'draining', 'purged')),
+    created_at {real} NOT NULL,
+    updated_at {real} NOT NULL);
+CREATE INDEX IF NOT EXISTS profile_deletions_operation ON profile_deletions (operation_id);
+CREATE INDEX IF NOT EXISTS profile_deletions_tenant ON profile_deletions (tenant_id);
+CREATE TABLE IF NOT EXISTS profile_deletion_receipts (
+    profile_id TEXT NOT NULL,
+    tenant_id INTEGER NOT NULL,
+    operation_id TEXT NOT NULL,
+    completed_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, operation_id));
+CREATE INDEX IF NOT EXISTS profile_deletion_receipts_operation
+    ON profile_deletion_receipts (operation_id);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
-    Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5))
+    Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
+    Migration(6, _V6))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

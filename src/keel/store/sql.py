@@ -21,6 +21,7 @@ from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
 from keel.store.migrations import migrate
 from keel.store.sandboxes import SandboxStoreMixin
+from keel.store.deletions import ProfileDeletionStoreMixin
 
 _IN_FLIGHT = "('queued', 'running', 'stopping')"
 
@@ -73,7 +74,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(SandboxStoreMixin):
+class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
@@ -100,7 +101,9 @@ class SqlStore(SandboxStoreMixin):
 
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
                              skills: list[str], memory: bool = False, tenant_id: int | None = None) -> Profile:
-        await self.db.execute(
+        async with self.db.transaction():
+            await self.assert_profile_writable(profile_id)
+            await self.db.execute(
             "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET models = excluded.models, sandbox = excluded.sandbox, "
@@ -108,7 +111,7 @@ class SqlStore(SandboxStoreMixin):
             "memory = excluded.memory, tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id) "
             "WHERE excluded.tenant_id IS NULL OR profiles.tenant_id IS NULL "
             "OR profiles.tenant_id = excluded.tenant_id",
-            profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), tenant_id)
+                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), tenant_id)
         saved = await self.get_profile(profile_id)
         if tenant_id is not None and (saved is None or saved.tenant_id != tenant_id):
             raise ProfileTenantMismatch(profile_id)
@@ -174,6 +177,7 @@ class SqlStore(SandboxStoreMixin):
         if target not in ("memory", "user"):
             return {"success": False, "error": "target must be memory or user.", "entries": []}
         async with self.db.transaction():
+            await self.assert_profile_writable(profile_id)
             await self.db.execute(
                 "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, '[]', ?) "
                 "ON CONFLICT (profile_id, target) DO NOTHING",
@@ -209,16 +213,18 @@ class SqlStore(SandboxStoreMixin):
     # sessions
 
     async def ensure_session(self, profile_id: str, session_id: str) -> Session:
-        row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
-        if row is None:
-            now = self.clock()
-            try:
-                await self.db.execute(
-                    "INSERT INTO sessions (id, profile_id, created_at, last_active_at, message_count) "
-                    "VALUES (?, ?, ?, ?, 0)", session_id, profile_id, now, now)
-            except UniqueViolation:
-                pass  # created by a concurrent request
+        async with self.db.transaction():
+            await self.assert_profile_writable(profile_id)
             row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
+            if row is None:
+                now = self.clock()
+                try:
+                    await self.db.execute(
+                        "INSERT INTO sessions (id, profile_id, created_at, last_active_at, message_count) "
+                        "VALUES (?, ?, ?, ?, 0)", session_id, profile_id, now, now)
+                except UniqueViolation:
+                    pass  # created by a concurrent request
+                row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
         if row["profile_id"] != profile_id:
             raise SessionNotFound(session_id)
         return _session(row)
@@ -423,11 +429,13 @@ class SqlStore(SandboxStoreMixin):
 
     async def _insert_run(self, run_id, profile_id, session_id, provider, model, reasoning_effort,
                           input_parts, instructions) -> None:
-        await self.db.execute(
-            "INSERT INTO runs (id, profile_id, session_id, status, provider, model, reasoning_effort, input, "
-            "instructions, output, usage, created_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, '', '{}', ?)",
-            run_id, profile_id, session_id, provider, model, reasoning_effort, _j(input_parts), instructions,
-            self.clock())
+        async with self.db.transaction():
+            await self.assert_profile_writable(profile_id)
+            await self.db.execute(
+                "INSERT INTO runs (id, profile_id, session_id, status, provider, model, reasoning_effort, input, "
+                "instructions, output, usage, created_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, '', '{}', ?)",
+                run_id, profile_id, session_id, provider, model, reasoning_effort, _j(input_parts), instructions,
+                self.clock())
 
     async def get_run(self, profile_id: str, run_id: str) -> Run | None:
         row = await self.db.fetchrow("SELECT * FROM runs WHERE id = ? AND profile_id = ?", run_id, profile_id)
@@ -470,7 +478,9 @@ class SqlStore(SandboxStoreMixin):
         lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
         row = await self.db.fetchrow(
             "UPDATE runs SET status = 'running', lease_owner = ?, lease_expires_at = ?, started_at = ? "
-            "WHERE id = (SELECT id FROM runs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1"
+            "WHERE id = (SELECT id FROM runs WHERE status = 'queued' AND NOT EXISTS ("
+            "SELECT 1 FROM profile_deletions d WHERE d.profile_id = runs.profile_id) "
+            "ORDER BY created_at, id LIMIT 1"
             f"{lock}) RETURNING *",
             owner, lease_until, self.clock())
         return _run(row) if row else None
