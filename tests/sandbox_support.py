@@ -332,7 +332,8 @@ async def make_claim(store, session_id: str, *, profile_id: str = "p1", sandbox:
 
 # Every keel table, dependents first, so a disposable PostgreSQL database starts each test from a clean schema.
 KEEL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memories, run_events, "
-               "runs, messages, sessions, profiles, tenants, blobs")
+               "runs, messages, sessions, profiles, tenants, blobs, profile_deletions, "
+               "profile_deletion_receipts")
 
 
 async def reset_postgres_schema(dsn: str) -> None:
