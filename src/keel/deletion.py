@@ -3,11 +3,11 @@
 The service walks the durable phases from `keel.store.deletions`:
 
 1. the fence is claimed in the store (phase ``blocked``);
-2. queued and active runs are cancelled through the run state machine and the
-   profile's sandboxes are retired through the lifecycle coordinator
-   (phase ``draining``);
-3. every owned transcript, memory, blob and profile row is removed
-   (phase ``purged``).
+2. queued and active runs are cancelled through the run state machine, this
+   profile's background work is cancelled and awaited, and its sandboxes are
+   retired through the lifecycle coordinator (phase ``draining``);
+3. every owned transcript, memory, blob, lifecycle record and profile row is
+   removed, and the phase becomes ``purged`` in that same transaction.
 
 The fence is released only by `complete`, called by the consumer after it has
 removed its own data. Every step is idempotent and resumes from the persisted
@@ -40,10 +40,12 @@ class ProfileDeletionUnavailableError(RuntimeError):
 class ProfileDeletionService:
     """Drain, retire and purge one profile, then acknowledge its completion."""
 
-    def __init__(self, store, *, coordinator=None, bus=None, poll_seconds: float = POLL_SECONDS) -> None:
+    def __init__(self, store, *, coordinator=None, bus=None, background=None,
+                 poll_seconds: float = POLL_SECONDS) -> None:
         self.store = store
         self.coordinator = coordinator
         self.bus = bus
+        self.background = background
         self.poll_seconds = poll_seconds
 
     async def delete(self, profile_id: str, tenant_id: int, operation_id: str, *,
@@ -51,13 +53,17 @@ class ProfileDeletionService:
         """Fence, drain, retire and purge; leave the fence for `complete`."""
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         record = await self.store.begin_profile_deletion(profile_id, tenant_id, operation_id)
+        # Block new background work before draining: a run that just committed
+        # its terminal state must not spawn a review behind the drain's back.
+        if self.background is not None:
+            self.background.block_profile(profile_id)
         if record.phase == "blocked":
             record = await self._advance(record, "draining")
         if record.phase == "draining":
             await self._drain(profile_id, deadline)
+            await self._drain_background(profile_id, deadline)
             await self._retire(profile_id, deadline)
-            record = await self._advance(record, "purged")
-        if record.phase == "purged":
+            # This commits phase `purged` only with the deletes themselves.
             await self.store.purge_profile_data(record)
 
     async def _advance(self, record, next_phase: str):
@@ -73,6 +79,8 @@ class ProfileDeletionService:
     async def complete(self, profile_id: str, tenant_id: int, operation_id: str) -> None:
         """Release only this operation's fence; a retry is idempotent."""
         await self.store.complete_profile_deletion(profile_id, tenant_id, operation_id)
+        if self.background is not None:
+            self.background.unblock_profile(profile_id)
 
     async def _drain(self, profile_id: str, deadline: float) -> None:
         """Cancel queued runs and wait for active workers to end their runs."""
@@ -94,6 +102,19 @@ class ProfileDeletionService:
             if time.monotonic() >= deadline:
                 raise ProfileDeletionBusyError(profile_id)
             await asyncio.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
+
+    async def _drain_background(self, profile_id: str, deadline: float) -> None:
+        """Cancel and await this profile's reviews and titles before purging its rows."""
+        if self.background is None:
+            return
+        try:
+            drained = await self.background.drain_profile(
+                profile_id, timeout=max(0.0, deadline - time.monotonic()))
+        except Exception as exc:
+            log.warning("draining profile background work failed profile=%s", profile_id, exc_info=True)
+            raise ProfileDeletionUnavailableError(profile_id) from exc
+        if not drained:
+            raise ProfileDeletionBusyError(profile_id)
 
     async def _retire(self, profile_id: str, deadline: float) -> None:
         """Retire every sandbox generation, or keep the deletion incomplete."""

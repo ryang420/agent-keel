@@ -554,13 +554,20 @@ class RunExecutor:
                 continue
 
     async def _after_complete(self, run: Run, profile) -> None:
-        """A completed run may be renamed, and every memory_review_turns runs may start a memory review."""
+        """A completed run may be renamed, and every memory_review_turns runs may start a memory review.
+
+        A fenced profile starts no new background work: the deletion drains what
+        exists and must not race a review spawned by a just-finished run.
+        """
+        if await self.store.get_profile_deletion(run.profile_id) is not None:
+            return
         await self._maybe_title(run)
         if profile is not None and profile.memory and self.background is not None:
             if await self.store.note_memory_turn(run.session_id, self.memory_review_turns):
                 from keel.review import claim, release, run_review
                 if claim(run.profile_id):
-                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}"):
+                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}",
+                                           profile_id=run.profile_id):
                         release(run.profile_id)
 
     async def _maybe_title(self, run: Run) -> None:
@@ -581,7 +588,8 @@ class RunExecutor:
         text = "\n".join(users)[:TITLE_INPUT_CHARS]
         if not text.strip():
             return
-        self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}")
+        self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}",
+                             profile_id=run.profile_id)
 
     async def _title(self, run: Run, text: str) -> None:
         """One model call, no tools and no events. A bad reply or a provider error leaves the derived title."""

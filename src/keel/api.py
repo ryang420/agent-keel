@@ -181,7 +181,8 @@ async def _delete_profile(request: Request, profile_id: str):
     profile = await keel.store.get_profile(profile_id)
     if profile is not None and profile.tenant_id != request.state.tenant_id:
         raise ApiError(404, "profile_not_found", "No such profile.")
-    service = ProfileDeletionService(keel.store, coordinator=keel.coordinator, bus=keel.bus)
+    service = ProfileDeletionService(keel.store, coordinator=keel.coordinator, bus=keel.bus,
+                                     background=keel.background)
     try:
         await service.delete(profile_id, request.state.tenant_id, operation_id)
     except ProfileDeletionBusyError as exc:
@@ -541,8 +542,9 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         profile = await k(request).store.get_profile(profile_id)
         if profile is not None and profile.tenant_id != request.state.tenant_id:
             raise ApiError(404, "profile_not_found", "No such profile.")
-        service = ProfileDeletionService(k(request).store, coordinator=k(request).coordinator,
-                                         bus=k(request).bus)
+        service = ProfileDeletionService(
+            k(request).store, coordinator=k(request).coordinator, bus=k(request).bus,
+            background=k(request).background)
         try:
             await service.complete(profile_id, request.state.tenant_id, operation_id)
         except ProfileDeletionConflict as exc:

@@ -102,6 +102,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
                              skills: list[str], memory: bool = False, tenant_id: int | None = None) -> Profile:
         async with self.db.transaction():
+            await self.lock_profile(profile_id)
             await self.assert_profile_writable(profile_id)
             await self.db.execute(
             "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
@@ -177,6 +178,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         if target not in ("memory", "user"):
             return {"success": False, "error": "target must be memory or user.", "entries": []}
         async with self.db.transaction():
+            await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
             await self.db.execute(
                 "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, '[]', ?) "
@@ -214,6 +216,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
     async def ensure_session(self, profile_id: str, session_id: str) -> Session:
         async with self.db.transaction():
+            await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
             row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
             if row is None:
@@ -430,6 +433,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
     async def _insert_run(self, run_id, profile_id, session_id, provider, model, reasoning_effort,
                           input_parts, instructions) -> None:
         async with self.db.transaction():
+            await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
             await self.db.execute(
                 "INSERT INTO runs (id, profile_id, session_id, status, provider, model, reasoning_effort, input, "

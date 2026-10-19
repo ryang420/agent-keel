@@ -48,19 +48,25 @@ A migration adds two tables:
 
 The fence is claimed in the same transaction that reads tenant ownership. Every
 profile-owned write checks it inside its own transaction: profile updates,
-session creation, run creation, memory writes and worker claims. A deletion
-therefore cannot race a write admitted before it.
+session creation, run creation, memory writes and worker claims. On PostgreSQL
+the claim, the purge, completion and every profile-owned writer also take the
+same transaction-scoped advisory lock for the profile, so a writer admitted
+before the fence either commits before the purge or observes the fence and
+fails. SQLite's `BEGIN IMMEDIATE` provides the equivalent serialization.
 
 ## Lifecycle
 
 1. **blocked** - the fence and its tenant are durable.
 2. **draining** - queued and active runs are cancelled through the existing run
    state machine (one terminal transition and one terminal event per run);
-   workers drain; the profile's sandboxes are retired through the existing
-   lifecycle authority using verified exact container identities.
-3. **purged** - sessions, messages, runs, events, blobs, memory and the profile
-   row are removed in one store transaction. Sandbox lifecycle evidence is
-   retained until teardown is proven complete.
+   workers drain; the profile's background reviews and titles are cancelled and
+   awaited, and new ones are refused; the profile's sandboxes are retired
+   through the existing lifecycle authority using verified exact container
+   identities.
+3. **purged** - sessions, messages, runs, events, blobs, memory, the profile row
+   and resolved, unreferenced sandbox lifecycle rows are removed in the same
+   store transaction that writes this phase. Uncertain lifecycle evidence is
+   retained until it is settled.
 
 A request's total wait is bounded; a timeout is incomplete cleanup, never
 success. Each step is idempotent, so a retry continues from the persisted phase.
@@ -74,4 +80,7 @@ If any step fails, both the fence and the safest available evidence remain.
   incomplete.
 - A profile never becomes writable during cleanup, and a completed reset cannot
   be reopened by a late request carrying an older operation.
+- A completed reset leaves no background review that could write memory into a
+  recreated profile.
+- Completion requires durable proof that the owned-data purge committed.
 - Both SQLite and PostgreSQL use the same migration and store code.
