@@ -1,16 +1,23 @@
 """Drain, sandbox retirement and owned-data purge for one complete profile deletion."""
 
 import asyncio
+import json
 import uuid
 
 import pytest
 
+from keel.background import Background
 from keel.deletion import (
     ProfileDeletionBusyError,
     ProfileDeletionService,
     ProfileDeletionUnavailableError,
 )
-from keel.models import Message, TextPart
+from keel.events import InMemoryEventBus
+from keel.models import Message, TextPart, ToolCall
+from keel.providers.base import ProviderRegistry
+from keel.providers.fake import FakeProvider
+from keel.review import run_review
+from keel.runner import RunExecutor
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import ProfileDeletionBusy
 
@@ -197,6 +204,81 @@ async def test_a_completed_reset_rejects_a_late_memory_write(store):
     await put_profile(store)
     await store.apply_memory("p1", "memory", 2200, [{"action": "add", "content": "fresh"}])
     assert (await store.memory_entries("p1"))["memory"] == ["fresh"]
+
+
+class BlockingProvider(FakeProvider):
+    """A provider whose review call waits until the test releases it."""
+
+    def __init__(self, release):
+        call = ToolCall("c1", "memory", json.dumps(
+            {"target": "user", "action": "add", "content": "Deleted old profile likes tea"}))
+        from keel.models import ToolCallReady
+
+        super().__init__(script=[[ToolCallReady(call)]])
+        self.started = asyncio.Event()
+        self.release = release
+
+    async def stream(self, request):
+        self.started.set()
+        await self.release.wait()
+        async for event in super().stream(request):
+            yield event
+
+
+async def test_background_review_is_drained_before_a_reset(store):
+    await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
+                               memory=True, tenant_id=1)
+    await store.ensure_session("p1", "s1")
+    await store.set_session_prompt("s1", "system prompt", "fake", "m")
+    run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                 instructions=None)
+    release = asyncio.Event()
+    provider = BlockingProvider(release)
+    registry = ProviderRegistry()
+    registry.register(provider)
+    background = Background()
+    executor = RunExecutor(store, InMemoryEventBus(), registry, background=background)
+    assert background.spawn(run_review(executor, run), "keel-review-p1", profile_id="p1")
+    await asyncio.wait_for(provider.started.wait(), timeout=5)
+
+    service = ProfileDeletionService(store, background=background)
+    await service.delete("p1", 1, OP_A, timeout_seconds=5)
+    await service.complete("p1", 1, OP_A)
+    # The platform user is provisioned again, then the old review would resume.
+    await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
+                               memory=True, tenant_id=1)
+    release.set()
+    await asyncio.sleep(0.1)
+
+    assert (await store.memory_entries("p1"))["user"] == []
+    assert background.profile_tasks("p1") == []
+
+
+async def test_a_failed_purge_does_not_authorize_completion(store, monkeypatch):
+    await seeded(store)
+    service = ProfileDeletionService(store)
+
+    async def failing_purge(record):
+        raise OSError("storage failure during purge")
+
+    original = store.purge_profile_data
+    monkeypatch.setattr(store, "purge_profile_data", failing_purge)
+    with pytest.raises(OSError):
+        await service.delete("p1", 1, OP_A, timeout_seconds=5)
+    record = await store.get_profile_deletion("p1")
+    assert record is not None and record.phase == "draining"
+    with pytest.raises(Exception):
+        await service.complete("p1", 1, OP_A)
+    # The old data is still there, so the fence must remain in place.
+    assert (await store.memory_entries("p1"))["user"] == ["likes tea"]
+    assert await store.get_profile("p1") is not None
+
+    monkeypatch.setattr(store, "purge_profile_data", original)
+    await service.delete("p1", 1, OP_A, timeout_seconds=5)
+    assert (await store.get_profile_deletion("p1")).phase == "purged"
+    await service.complete("p1", 1, OP_A)
+    assert await store.get_profile_deletion("p1") is None
 
 
 async def test_workers_drain_without_guard_deadlock(store):

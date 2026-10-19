@@ -273,6 +273,10 @@ async def test_a_policy_update_racing_a_claim_never_admits_the_stale_policy(clus
         # to the enqueue race above plus the refusal, asserted below, to share the stale-policy generation).
         claim, update = await race(a.coordinator.claim, lambda: right.put(f"/v1/profiles/{profile}", json=body))
         assert update.status_code == 409 and update.json()["error"]["code"] == "sandbox_busy"  # a run exists
+        if claim is None:
+            # A claim that raced the profile row's lock is skipped by design, and
+            # a worker polls again; the update has already refused by now.
+            claim = await a.coordinator.claim()
         assert claim is not None and claim.use is not None
         bound = await a.coordinator.prepare(claim.use)
         assert bound.binding.container_id == old.binding.container_id

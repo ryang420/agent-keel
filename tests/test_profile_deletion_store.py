@@ -48,7 +48,6 @@ async def test_old_completion_does_not_release_new_operation(store):
     await put_profile(store)
     old = await store.begin_profile_deletion("p1", 1, OP_A)
     old = await store.advance_profile_deletion(old, "draining")
-    old = await store.advance_profile_deletion(old, "purged")
     await store.purge_profile_data(old)
     await store.complete_profile_deletion("p1", 1, OP_A)
 
@@ -78,7 +77,6 @@ async def test_unknown_profile_can_be_fenced(store):
 
     # No runtime data exists, so purging is a no-op and completion is allowed.
     record = await store.advance_profile_deletion(record, "draining")
-    record = await store.advance_profile_deletion(record, "purged")
     await store.purge_profile_data(record)
     await store.complete_profile_deletion("never-seen", 7, OP_A)
     assert await store.get_profile_deletion("never-seen") is None
@@ -94,7 +92,6 @@ async def test_duplicate_begin_and_completion_are_idempotent(store):
         await store.begin_profile_deletion("p1", 1, OP_B)
 
     first = await store.advance_profile_deletion(first, "draining")
-    first = await store.advance_profile_deletion(first, "purged")
     await store.purge_profile_data(first)
     await store.complete_profile_deletion("p1", 1, OP_A)
     # A lost response may retry completion: the receipt acknowledges it.
@@ -108,7 +105,10 @@ async def test_completion_requires_purged_phase_and_matching_operation(store):
     with pytest.raises(ProfileDeletionConflict):
         await store.complete_profile_deletion("p1", 1, OP_A)
     record = await store.advance_profile_deletion(record, "draining")
-    record = await store.advance_profile_deletion(record, "purged")
+    # The purge has not committed yet: completion must not release the fence.
+    with pytest.raises(ProfileDeletionConflict):
+        await store.complete_profile_deletion("p1", 1, OP_A)
+    await store.purge_profile_data(record)
     with pytest.raises(ProfileDeletionConflict):
         await store.complete_profile_deletion("p1", 1, OP_B)
     with pytest.raises(ProfileTenantMismatch):
@@ -130,7 +130,6 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
 
     record = await store.begin_profile_deletion("p1", 1, OP_A)
     record = await store.advance_profile_deletion(record, "draining")
-    record = await store.advance_profile_deletion(record, "purged")
     await store.purge_profile_data(record)
 
     assert await store.get_profile("p1") is None

@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+from keel.deletion import ProfileDeletionService
 from keel.store import open_store
 from keel.store.base import ProfileDeletionBusy
 
@@ -48,6 +49,50 @@ async def test_competing_deletion_claims_have_one_winner():
         await second.close()
 
 
+async def test_a_paused_writer_is_serialized_with_the_deletion_fence():
+    from tests.sandbox_support import reset_postgres_schema
+
+    await reset_postgres_schema(DSN)
+    writer_store = await open_store(DSN)
+    deleter_store = await open_store(DSN)
+    try:
+        await put(writer_store)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def paused_apply_memory(profile_id, target, limit, ops):
+            async with writer_store.db.transaction():
+                await writer_store.lock_profile(profile_id)
+                await writer_store.assert_profile_admitted(profile_id)
+                entered.set()  # admitted, but not yet written
+                await release.wait()
+                await writer_store.db.execute(
+                    "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (profile_id, target) DO UPDATE SET entries = excluded.entries, "
+                    "updated_at = excluded.updated_at",
+                    profile_id, target, '["old writer committed after purge"]', 1.0)
+                return {"success": True, "entries": []}
+
+        writer_store.apply_memory = paused_apply_memory
+        writer = asyncio.create_task(
+            writer_store.apply_memory("p1", "user", 2200, [{"action": "add", "content": "old writer"}]))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        service = ProfileDeletionService(deleter_store)
+        deletion = asyncio.create_task(service.delete("p1", 1, OP_A, timeout_seconds=5))
+        await asyncio.sleep(0.2)
+        assert not deletion.done(), "the fence must wait for an admitted writer to commit"
+
+        release.set()
+        await writer
+        await deletion
+        assert await deleter_store.get_profile("p1") is None
+        assert (await deleter_store.memory_entries("p1"))["user"] == []
+        assert (await deleter_store.get_profile_deletion("p1")).phase == "purged"
+    finally:
+        await writer_store.close()
+        await deleter_store.close()
+
+
 async def test_guard_and_completion_serialize_across_instances():
     from tests.sandbox_support import reset_postgres_schema
 
@@ -58,7 +103,6 @@ async def test_guard_and_completion_serialize_across_instances():
         await put(first)
         record = await first.begin_profile_deletion("p1", 1, OP_A)
         record = await first.advance_profile_deletion(record, "draining")
-        record = await first.advance_profile_deletion(record, "purged")
         await first.purge_profile_data(record)
         await first.complete_profile_deletion("p1", 1, OP_A)
 

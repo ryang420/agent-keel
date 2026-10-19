@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from keel.deletion import ProfileDeletionService
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.sandbox.records import ContainerObservation, DockerOutcome
 from keel.sandbox.recovery import SandboxRecoveryMixin
@@ -801,6 +802,32 @@ async def test_a_block_stays_while_a_recorded_container_of_the_profile_still_con
     claim = await coordinator.claim()
     assert claim is not None and claim.run.session_id == "waits"
 
+
+async def test_profile_deletion_purges_resolved_sandbox_evidence(recovery):
+    coordinator, backend, store, _ = recovery
+    target = await make_claim(store, "gone")
+    target_container = (await coordinator.prepare(target.use)).binding.container_id
+    await store.finish_run(target.run.id, "completed", output="ok")
+    assert await coordinator.release(target.use)
+
+    kept = await make_claim(store, "kept", profile_id="p2")
+    kept_container = (await coordinator.prepare(kept.use)).binding.container_id
+    await store.finish_run(kept.run.id, "completed", output="ok")
+    assert await coordinator.release(kept.use)
+    assert target_container != kept_container
+
+    service = ProfileDeletionService(store, coordinator=coordinator)
+    await service.delete("p1", 1, "11111111-1111-4111-8111-111111111111", timeout_seconds=10)
+    await service.complete("p1", 1, "11111111-1111-4111-8111-111111111111")
+
+    for table in ("sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"):
+        assert await store.db.fetchrow(
+            f"SELECT 1 AS present FROM {table} WHERE profile_id = 'p1'") is None, table
+    # Another profile's lifecycle evidence survives the reset.
+    assert await store.db.fetchrow("SELECT 1 AS present FROM sandboxes WHERE profile_id = 'p2'") is not None
+    assert await store.db.fetchrow(
+        "SELECT 1 AS present FROM sandbox_operations WHERE profile_id = 'p2'") is not None
+    assert await current_container_id(store, kept.use.key) == kept_container
 
 async def test_a_published_clear_is_bound_to_the_recorded_offender(recovery):
     coordinator, backend, store, _ = recovery

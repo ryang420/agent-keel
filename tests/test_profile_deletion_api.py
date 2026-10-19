@@ -126,6 +126,19 @@ async def test_unknown_profile_is_fenced_then_cleaned(api):
     assert (await client.post(f"/v1/profiles/never-seen/deletion/{OP_A}/complete")).status_code == 200
 
 
+async def test_a_purged_foreign_fence_is_not_found(api):
+    client, store = api
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    assert (await client.request("DELETE", "/v1/profiles/p1",
+                                 json={"operation_id": OP_A})).status_code == 200
+    assert (await store.get_profile_deletion("p1")).phase == "purged"
+
+    foreign = await client.other.request("DELETE", "/v1/profiles/p1",
+                                         json={"operation_id": OP_B})
+    assert foreign.status_code == 404
+    assert foreign.json()["error"]["code"] == "profile_not_found"
+
+
 async def test_conflicting_operation_is_rejected(api):
     client, store = api
     await client.put("/v1/profiles/p1", json=PROFILE)
