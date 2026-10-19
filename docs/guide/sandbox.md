@@ -80,7 +80,7 @@ One published generation serves a profile and is reused across runs and sessions
 the profile has no run in progress and no sandbox usage left (otherwise `PUT` returns 409 `sandbox_busy`); the next
 run waits until every usage of the old generation is released, then recovery removes that exact container and a new
 generation is created. A container idle for `KEEL_SANDBOX_IDLE_SECONDS` is removed by exact ID. Passes rotate
-through 100 profile records at a time, so replacement or idle removal can lag by about one minute per 200 sandbox
+through 100 profile records at a time, so replacement or idle removal can lag by about two minutes per 200 sandbox
 records. The container's writable layer (including `workdir`) belongs to that generation and is discarded with it;
 bind mounts persist across generations.
 
