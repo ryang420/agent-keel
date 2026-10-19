@@ -319,6 +319,14 @@ class DockerSandbox:
             await self._kill(proc)
             return _DockerBinaryResult(None, b"", f"docker {args[0]} did not answer within {timeout:.0f}s.",
                                        timed_out=True)
+        # EOF on both pipes does not mean the child has been reaped: returncode may still be None. Wait for the
+        # exit, or a successful operation is reported as an unknown outcome.
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except TimeoutError:
+            await self._kill(proc)
+            return _DockerBinaryResult(None, b"", f"docker {args[0]} closed its output but did not exit.",
+                                       timed_out=True)
         return _DockerBinaryResult(proc.returncode, out, err.decode("utf-8", errors="replace"))
 
     @staticmethod

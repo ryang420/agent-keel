@@ -1338,3 +1338,14 @@ async def test_a_failed_create_keeps_its_stderr_as_a_bounded_diagnostic(tmp_path
     backend = DockerSandbox(docker=str(cli), deployment=DEPLOYMENT, mount_root=str(tmp_path))
     created = await backend.create_generation(make_attempt("create", intended_name="keel-sbx-x"), policy())
     assert created.state == "definite_failure" and "conflict" in created.diagnostic
+
+
+async def test_binary_docker_read_waits_for_the_child_before_reporting_its_exit(tmp_path):
+    # A child can close its pipes while it is still alive, so reading EOF alone is not an exit. The binary path
+    # must reap the child before reporting a status, or a successful helper readback is recorded as uncertain.
+    cli = tmp_path / "docker"
+    cli.write_text("#!/bin/sh\nexec 1>&- 2>&-\nsleep 0.2\nexit 0\n")
+    cli.chmod(0o755)
+    backend = DockerSandbox(docker=str(cli), deployment=DEPLOYMENT)
+    result = await backend._docker_bytes("cp", "container:/path", "-")
+    assert result.code == 0
