@@ -106,5 +106,5 @@ Verification after cutover:
   any bounded diagnostics; unresolved create tombstones are reported with their oldest age.
 - A sandbox run starts, runs a tool and stops; changing its policy while it has work in progress returns 409
   `sandbox_busy`.
-- The daemon ID reported by `docker info` matches the one recorded on the service's containers and sandbox rows;
+- The daemon ID reported by `docker info` matches the one recorded in the sandbox and operation rows;
   changing it closes admission until the recorded daemon is restored and the service restarted.

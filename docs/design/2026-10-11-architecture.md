@@ -272,8 +272,8 @@ read_file(handle, path, max_bytes) / write_file(handle, path, data)
 kill_tree(handle, exec_id)
 ```
 
-`LocalSandbox` (`KEEL_SANDBOX=none`) implements this surface directly for development. The Docker
-backend does not: the agent loop reaches it through the coordinator facade, which admits a durable
+`LocalSandbox`, the test/dev host-process backend, implements this surface directly; the service does
+not wire it. The Docker backend does not: the agent loop reaches it through the coordinator facade, which admits a durable
 usage and an exact-ID execution ticket before any payload is dispatched. The wider lifecycle interface
 (`daemon_identity`, `inventory`, `inspect_id`, `create_generation`, `install_helper`, `start_id`,
 `remove_id`, `exec_bound`, `control_exec`) is described in

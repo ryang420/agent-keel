@@ -156,8 +156,8 @@ Consumers' prompts are tuned against these texts.
 > "orphaned" containers. The coordinated exact-ID lifecycle in
 > [2026-10-18-sandbox-lifecycle-coordination.md](2026-10-18-sandbox-lifecycle-coordination.md) replaced
 > all four, so several instances can share a Docker daemon safely. The current Docker backend has no
-> name-based entry point; `LocalSandbox` (`KEEL_SANDBOX=none`) still implements the M2-shaped surface
-> below for development.
+> name-based entry point; `LocalSandbox`, the test/dev backend, still implements the M2-shaped surface
+> below.
 
 ### Interface
 

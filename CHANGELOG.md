@@ -37,8 +37,8 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - The Docker backend exposes only exact-ID coordinated operations. The name-based `ensure`/`reference`/`exec`,
   PID-file `kill_tree`, process-local idle reaper and startup `remove_orphans` paths (and their process-local
-  state) are gone, so no caller can reach a container without a recorded attempt or ticket. `LocalSandbox`
-  (`KEEL_SANDBOX=none` development mode) is unchanged.
+  state) are gone, so no caller can reach a container without a recorded attempt or ticket. The `LocalSandbox`
+  test/dev backend is unchanged.
 
 ### Fixed
 - An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
