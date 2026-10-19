@@ -34,7 +34,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: keel
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: keel_test
         ports:
           - 5432:5432
@@ -63,7 +63,7 @@ jobs:
           tests/test_docker_operations.py tests/test_api.py tests/test_agent_loop.py tests/test_models_verify.py
           tests/test_long_session.py tests/test_store_import.py tests/test_admin_import.py tests/test_review.py
         env:
-          KEEL_TEST_POSTGRES_DSN: postgresql://keel:postgres@localhost:5432/keel_test
+          KEEL_TEST_POSTGRES_DSN: postgresql://keel@localhost:5432/keel_test
 
   docker:
     name: docker
@@ -74,7 +74,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: keel
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: keel_test
         ports:
           - 5432:5432
@@ -105,7 +105,7 @@ jobs:
         timeout-minutes: 30
         env:
           KEEL_TEST_DOCKER: "1"
-          KEEL_TEST_POSTGRES_DSN: postgresql://keel:postgres@localhost:5432/keel_test
+          KEEL_TEST_POSTGRES_DSN: postgresql://keel@localhost:5432/keel_test
 
   native:
     name: native (${{ matrix.arch }})
