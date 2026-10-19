@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Complete profile deletion: authenticated `DELETE /v1/profiles/{profile_id}` fences a tenant-owned profile,
+  cancels its queued and active runs, retires its sandboxes through verified exact container identities, and purges
+  its sessions, messages, runs, events, blobs, memory and profile configuration. A same-operation retry resumes
+  persisted progress, and `POST /v1/profiles/{profile_id}/deletion/{operation_id}/complete` releases only that
+  operation's fence, with an idempotent completion receipt.
 - Coordinator recovery APIs reconcile orphaned usage, stopped and delayed retired creates, and idle generations by
   exact container ID. Recovery preserves valid users and their execution authority, retains unresolved create
   evidence, blocks conflicting inventory until the recorded conflict is resolved, and safely replaces incompatible

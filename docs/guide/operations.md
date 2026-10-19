@@ -108,3 +108,27 @@ Verification after cutover:
   `sandbox_busy`.
 - The daemon ID reported by `docker info` matches the one recorded in the sandbox and operation rows;
   changing it closes admission until the recorded daemon is restored and the service restarted.
+
+## Complete profile deletion
+
+A consumer may ask the service to remove one profile completely through the delete/complete contract in
+`docs/guide/api.md`. Operate it as follows:
+
+1. Deploy this release before the consumer release that calls it. A consumer that requires profile deletion must
+   not report success against an older runtime that lacks the endpoints; it keeps its own operation pending and
+   reports that a compatible runtime is required. The minimum compatible release is the first release whose
+   changelog lists complete profile deletion.
+2. Call `DELETE /v1/profiles/{profile_id}` with a new UUID operation id. On `409` (work still draining, or another
+   operation owns the profile) or `503` (store or sandbox dependency unavailable), retry the same operation id; do
+   not start a second operation. A retry resumes persisted progress and never purges twice.
+3. After the consumer has removed its own data, call
+   `POST /v1/profiles/{profile_id}/deletion/{operation_id}/complete`. Retry with the same id after a lost response;
+   the receipt makes the retry harmless.
+4. If teardown cannot be proven (a container removal is uncertain, another Docker daemon owns the recorded
+   sandbox, data is being written by an unresolved generation), deletion stays incomplete and the fence remains.
+   Resolve the sandbox problem with the recovery procedure above, then retry the same operation.
+5. Do not delete rows from `profile_deletions`, `profile_deletion_receipts` or the sandbox ledger by hand: they
+   are the evidence a retry relies on. A receipt may be retained after completion; it contains no conversation,
+   file, memory or user email.
+6. On both SQLite and PostgreSQL the same migration and store code apply. A newer schema is refused by an older
+   keel, so roll back by restoring the database backup, as with any migration.
