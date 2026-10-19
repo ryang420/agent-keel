@@ -863,7 +863,7 @@ async def test_dependent_operations_prune_only_with_their_referrer(store, clock)
     assert (await store.get_operation("op_create")) is not None
 
     await store.db.execute(
-        "UPDATE sandbox_operations SET resolved_at = 1_050.0 WHERE id = 'op_install'")
+        "UPDATE sandbox_operations SET resolved_at = 1050.0 WHERE id = 'op_install'")
     clock.now = 1_200.0
     assert await store.prune_sandbox_records(0.0) == 1
     assert (await store.get_operation("op_install")) is None
