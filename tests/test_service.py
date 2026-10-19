@@ -322,7 +322,7 @@ async def test_maintenance_prunes_records_with_the_configured_retention_and_logs
 
     async def reconcile_once(self, *, limit=100):
         self._inventory_daemon, self._inventory_pending = self._daemon_id, 0
-        return RecoveryReport()
+        return RecoveryReport(unresolved=2, oldest_age_s=90.0)
 
     async def reap_idle_once(self, *, limit=100):
         return RecoveryReport()
@@ -338,7 +338,7 @@ async def test_maintenance_prunes_records_with_the_configured_retention_and_logs
         return 0
 
     monkeypatch.setattr(SqlStore, "prune_sandbox_records", prune)
-    caplog.set_level(logging.WARNING, logger=service.log.name)
+    caplog.set_level(logging.INFO, logger=service.log.name)
     app = create_service(_docker_settings(tmp_path, event_retention_days=3))
     async with app.router.lifespan_context(app):
         for _ in range(100):
@@ -348,6 +348,8 @@ async def test_maintenance_prunes_records_with_the_configured_retention_and_logs
     assert calls[0] == (3 * 86_400.0, 100)  # the configured event retention, one bounded batch
     assert len(calls) >= 2, "a failed prune must be logged, never stop maintenance"
     assert "pruning sandbox records failed" in caplog.text
+    # Unresolved tombstones alone are logged, with the age design section 14 asks to expose.
+    assert "unresolved=2 oldest_age_s=90.0" in caplog.text
 
 
 async def test_claims_never_wait_on_docker_and_admission_opens_after_a_full_inventory(tmp_path, monkeypatch, store):

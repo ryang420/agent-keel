@@ -92,10 +92,11 @@ async def _maintenance_pass(coordinator: SandboxCoordinator, retention_seconds: 
         except Exception:
             log.warning("%s sandboxes failed", name, exc_info=True)
             continue
-        if report.blocked or report.removed or report.released:
-            log.info("%s sandboxes: removed=%d released=%d blocked=%d unresolved=%d diagnostics=%s", name,
-                     report.removed, report.released, report.blocked, report.unresolved,
-                     ",".join(sorted(set(report.diagnostics))))
+        if report.blocked or report.removed or report.released or report.unresolved or report.diagnostics:
+            oldest = "none" if report.oldest_age_s is None else f"{report.oldest_age_s:.1f}"
+            log.info("%s sandboxes: removed=%d released=%d blocked=%d unresolved=%d oldest_age_s=%s "
+                     "diagnostics=%s", name, report.removed, report.released, report.blocked, report.unresolved,
+                     oldest, ",".join(sorted(set(report.diagnostics))))
     try:
         pruned = await coordinator.store.prune_sandbox_records(retention_seconds, limit=MAINTENANCE_BATCH)
     except Exception:
