@@ -5,7 +5,8 @@ import asyncio
 import pytest
 
 from keel.sandbox.coordinator import SandboxCoordinator
-from keel.sandbox.records import DockerOutcome
+from keel.sandbox.records import ContainerObservation, DockerOutcome
+from keel.sandbox.recovery import SandboxRecoveryMixin
 from tests.sandbox_support import (FakeDocker, current_container_id, make_claim, queue_run, seed_profile)
 from tests.test_sandbox_coordinator import helper_assets  # shared synthetic helper fixture
 
@@ -662,6 +663,17 @@ async def test_an_unpublished_block_stays_when_the_absence_is_not_authoritative(
     assert (row["state"], row["error_message"]) == ("blocked", unknown)
     await queue_run(store, "waits")
     assert await coordinator.claim() is None
+
+
+def test_a_present_offender_that_started_running_is_not_settled():
+    """The fresh exact-ID inspect is the newest evidence: a container started since the listing keeps the block."""
+    container = "a" * 64
+    stopped = ContainerObservation("daemon-1", container, "keel-sbx", (), running=False, policy_digest="0" * 16)
+    running = ContainerObservation("daemon-1", container, "keel-sbx", (), running=True, policy_digest="0" * 16)
+    assert SandboxRecoveryMixin._offender_settled(
+        DockerOutcome("succeeded", observation=stopped), container, [stopped])
+    assert not SandboxRecoveryMixin._offender_settled(
+        DockerOutcome("succeeded", observation=running), container, [running])
 
 
 def _unknown(backend, container: str, profile_id: str = "p1") -> None:

@@ -230,8 +230,9 @@ class SandboxRecoveryMixin:
     async def _resolve_unpublished_block(self, key: SandboxKey) -> int:
         """Clear a conflict on a profile with no published generation once its exact ID is proven absent.
 
-        Returns 1 while the block stays. Only the daemon's explicit missing-container answer for the recorded ID,
-        confirmed on the same daemon, counts; a failed inspection or a still-present container keeps the block.
+        Returns 1 while the block stays. The recorded ID settles only when the daemon explicitly reports it absent,
+        confirmed on the same daemon, or when a fresh exact-ID inspection shows it present but stopped and a
+        complete listing no longer classifies it as conflicting; a failed inspection keeps the block.
         """
         offending = await self.store.unpublished_inventory_block(key)
         if offending is None:
@@ -257,13 +258,15 @@ class SandboxRecoveryMixin:
 
     @staticmethod
     def _offender_settled(outcome: DockerOutcome, offending: str, listing) -> bool:
-        """The recorded offender is proven absent by exact ID, or it is still present but in the complete listing,
-        where `_listing_keeps_block` has just classified it as no longer conflicting (for example a running retired
-        create that was stopped). A present offender missing from the deployment's listing (its deployment label
-        was changed) is never settled."""
+        """The recorded offender is proven absent by exact ID, or it is still present but stopped and in the
+        complete listing, where `_listing_keeps_block` has just classified it as no longer conflicting. The
+        exact-ID observation is newer than the listing: a container started since then still keeps the block. A
+        present offender missing from the deployment's listing (its deployment label was changed) is never
+        settled."""
         if confirmed_absent(outcome):
             return True
-        return outcome.observation is not None and any(item.container_id == offending for item in listing)
+        return (outcome.observation is not None and not outcome.observation.running
+                and any(item.container_id == offending for item in listing))
 
     async def _listing_keeps_block(self, key: SandboxKey, observations) -> bool:
         """True while a complete, unbatched listing holds a container of this profile that must keep its block.
