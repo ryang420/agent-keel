@@ -1,0 +1,8 @@
+include Dockerfile
+include MANIFEST.in
+include CHANGELOG.md
+include THIRD_PARTY_NOTICES.md
+include docker-compose.dev.yml
+recursive-include native/supervisor *.c *.h Makefile Dockerfile
+recursive-include scripts *.py
+recursive-include tests/native *.c

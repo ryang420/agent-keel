@@ -8,4 +8,6 @@ __pycache__
 *.egg-info
 tests
 docs
+build
+src/keel/sandbox/bin
 *.sqlite3

@@ -58,3 +58,53 @@ To cut over, stop admitting new runs, let in-flight runs drain, and stop the old
 version. A run left in flight when its worker stops is failed as `worker_lost` by the new version's lease sweep. Total
 downtime can be as short as the drain window. Rolling back is safe — the new version writes ordinary rows — but the
 atomicity guarantee ends while old writers run.
+
+## Upgrading to the coordinated sandbox lifecycle
+
+This version replaces the name-based sandbox lifecycle (recreate-on-use, PID-file cancellation, startup orphan
+removal) with coordinated exact-ID generations. Migration 5 adds the `sandboxes`, `sandbox_uses`, `sandbox_execs` and
+`sandbox_operations` tables; it runs automatically at start and is not reversible in place.
+
+Requirements:
+
+- Every instance of one deployment uses the same PostgreSQL database, the same Docker daemon and the same
+  `KEEL_DEPLOYMENT` label. SQLite supports one instance.
+- The installed package carries the sandbox supervisor for amd64 and arm64 (the wheel, the source distribution and
+  the container image do). Building from a source tree needs `scripts/build_supervisor.py --arch all` once; it is
+  never downloaded at run time.
+- All instances run this version. An older instance and this one must not coordinate the same deployment: the older
+  one creates and removes containers by profile-derived name, outside the ledger.
+
+Procedure:
+
+1. Back up the database.
+2. Stop admitting runs, let in-flight runs finish (or let their leases lapse), and stop every old instance. Confirm
+   no old process can still create or remove sandbox containers.
+3. Start this version and wait for the log line that sandbox admission is open. Startup classifies every container
+   of the deployment in bounded batches, spending up to 30 seconds before workers start and retrying every 15
+   seconds; sandbox runs stay queued meanwhile, and chat-only runs proceed.
+4. Inspect the sandbox containers by exact ID:
+   `docker ps -a --no-trunc --filter label=keel.managed=1 --filter label=keel.deployment=<deployment>`.
+   A container without a `keel.generation` label (or whose labels disagree with the ledger) is a legacy leftover.
+   It is kept as evidence and blocks new sandbox runs for its profile (`sandbox_inventory_conflict`); it is never
+   removed automatically. After step 2 is complete, remove the ones you intend to retire with
+   `docker rm -f <exact-id>`. The next reconciliation pass proves that exact ID absent and clears the block; the
+   removed container's writable layer is lost, so copy anything needed out first. A legacy container you keep is
+   not adopted.
+5. Policies still describe the same bind sources; the profile-specific mount rules are unchanged. A generation
+   carrying an incompatible policy or helper is replaced by recovery once its users finish.
+6. No manual row maintenance is needed. Resolved coordination records older than `KEEL_EVENT_RETENTION_DAYS` are
+   pruned in bounded batches; unresolved creates, unreleased usage, unresolved execs and current references are
+   retained. Do not delete coordination rows by hand: they are the evidence recovery relies on.
+7. To roll back, stop this version and restore the database backup taken in step 1, then start the older version.
+   A newer schema is refused by an older keel, and the older name-based lifecycle must not run beside this one.
+
+Verification after cutover:
+
+- `schema_version` is at least 5, and every profile has an explicit tenant owner (see the tenant cutover above).
+- The service log reports sandbox admission open and, in each maintenance pass, removed/released/blocked counts and
+  any bounded diagnostics; unresolved create tombstones are reported with their oldest age.
+- A sandbox run starts, runs a tool and stops; changing its policy while it has work in progress returns 409
+  `sandbox_busy`.
+- The daemon ID reported by `docker info` matches the one recorded in the sandbox and operation rows;
+  changing it closes admission until the recorded daemon is restored and the service restarted.

@@ -17,7 +17,10 @@ from keel.store.base import (
     Run, RunTransition, Session, SessionBusy, SessionNotFound, StoredMessage, TerminalEventType, TitleInUse,
     UniqueViolation, UnknownRun,
 )
+from keel.sandbox.base import SandboxPolicy
+from keel.sandbox.records import SandboxBusy
 from keel.store.migrations import migrate
+from keel.store.sandboxes import SandboxStoreMixin
 
 _IN_FLIGHT = "('queued', 'running', 'stopping')"
 
@@ -70,10 +73,12 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore:
-    def __init__(self, db, clock: Callable[[], float] = time.time) -> None:
+class SqlStore(SandboxStoreMixin):
+    def __init__(self, db, clock: Callable[[], float] = time.time,
+                 coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
-        self.clock = clock
+        self.clock = clock  # legacy transcript time
+        self.coordination_clock = coordination_clock  # test-only override for database coordination time
 
     async def init(self) -> None:
         await migrate(self.db)
@@ -81,6 +86,12 @@ class SqlStore:
     async def ping(self) -> bool:
         row = await self.db.fetchrow("SELECT 1 AS ok")
         return row is not None and row["ok"] == 1
+
+    async def coordination_now(self) -> float:
+        """Database time for coordination deadlines, or the injected test clock when supplied."""
+        if self.coordination_clock is not None:
+            return self.coordination_clock()
+        return await self.db.database_now()
 
     async def close(self) -> None:
         await self.db.close()
@@ -110,6 +121,51 @@ class SqlStore:
     async def profile_sandboxes(self) -> list[tuple[str, dict]]:
         rows = await self.db.fetch("SELECT id, sandbox FROM profiles")
         return [(row["id"], json.loads(row["sandbox"])) for row in rows]
+
+    async def assert_sandbox_policy_change_allowed(self, profile_id: str, *, previous: SandboxPolicy | None,
+                                                   proposed: SandboxPolicy | None) -> None:
+        """Raise SandboxBusy when an effective sandbox policy change could race work on this profile.
+
+        The caller holds the profile guard (after the global mount-policy lock when it takes one). An equivalent
+        canonical policy is always allowed; enabling or clearing a sandbox is a change. A change is busy while a run
+        is queued/running/stopping, a usage is unreleased (including an orphan awaiting recovery), an execution is
+        unresolved, or a lifecycle operation that can still affect an executable generation is unresolved. A retired
+        create that was never started is stopped-only: neither its tombstone nor its exact-ID cleanup is busy.
+        """
+        if (previous.digest() if previous else None) == (proposed.digest() if proposed else None):
+            return
+        if await self.db.fetchrow(
+                f"SELECT id FROM runs WHERE profile_id = ? AND status IN {_IN_FLIGHT} LIMIT 1", profile_id):
+            raise SandboxBusy("the profile has runs in progress")
+        if await self.db.fetchrow(
+                "SELECT id FROM sandbox_uses WHERE profile_id = ? AND state <> 'released' LIMIT 1", profile_id):
+            raise SandboxBusy("the profile has unreleased sandbox usage")
+        if await self.db.fetchrow(
+                "SELECT id FROM sandbox_execs WHERE profile_id = ? AND state IN ('pending', 'running', 'uncertain') "
+                "LIMIT 1", profile_id):
+            raise SandboxBusy("the profile has unresolved sandbox executions")
+        operations = await self.db.fetch(
+            "SELECT id, kind, authority, outcome, original_create_operation_id, cleanup_operation_id, "
+            "confirmed_absent_at FROM sandbox_operations WHERE profile_id = ?", profile_id)
+        by_id = {row["id"]: row for row in operations}
+
+        def stopped_only(create: dict | None) -> bool:
+            if create is None or create["kind"] != "create" or create["authority"] != "retired":
+                return False
+            return not any(row["kind"] == "start" and row["original_create_operation_id"] == create["id"]
+                           and row["outcome"] != "definite_failure" and row["confirmed_absent_at"] is None
+                           for row in operations)
+
+        for row in operations:
+            if row["outcome"] not in ("planned", "dispatched", "uncertain") or row["confirmed_absent_at"] is not None:
+                continue
+            if row["kind"] == "create" and stopped_only(row):
+                continue
+            create = by_id.get(row["original_create_operation_id"])
+            if (row["kind"] == "remove" and stopped_only(create)
+                    and create["cleanup_operation_id"] == row["id"]):
+                continue
+            raise SandboxBusy("the profile has unresolved sandbox lifecycle work")
 
     # memory
 
@@ -400,10 +456,6 @@ class SqlStore:
             session_id, except_id)
         return int(row["n"])
 
-    async def in_flight_profiles(self) -> set[str]:
-        rows = await self.db.fetch(f"SELECT DISTINCT profile_id FROM runs WHERE status IN {_IN_FLIGHT}")
-        return {row["profile_id"] for row in rows}
-
     async def active_run_for_session(self, session_id: str) -> Run | None:
         row = await self.db.fetchrow(
             f"SELECT * FROM runs WHERE session_id = ? AND status IN {_IN_FLIGHT} ORDER BY created_at LIMIT 1",
@@ -411,6 +463,10 @@ class SqlStore:
         return _run(row) if row else None
 
     async def claim_run(self, owner: str, lease_until: float) -> Run | None:
+        """The legacy claim for chat-only workers; `lease_until` must be on the database coordination clock.
+
+        It reserves no sandbox usage, so a sandbox-enabled executor refuses to run what it returns.
+        """
         lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
         row = await self.db.fetchrow(
             "UPDATE runs SET status = 'running', lease_owner = ?, lease_expires_at = ?, started_at = ? "
@@ -505,20 +561,22 @@ class SqlStore:
 
         Postgres locks the selected rows with SKIP LOCKED, so a sweep, a renewal and a finish serialise on the run
         row. SQLite serialises writers with BEGIN IMMEDIATE. A failure rolls the whole batch back; the next pass
-        selects the same runs again.
+        selects the same runs again. Deadlines are compared with database coordination time, the basis claims and
+        renewals use; the finish time stays transcript time.
         """
         now = self.clock()
         async with self.db.transaction():
+            deadline = await self.coordination_now()
             lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
             rows = await self.db.fetch(
                 "SELECT * FROM runs WHERE status IN ('running', 'stopping') AND lease_expires_at < ? "
-                f"ORDER BY id LIMIT ?{lock}", now, batch)
+                f"ORDER BY id LIMIT ?{lock}", deadline, batch)
             transitions = []
             for row in rows:
                 updated = await self.db.fetchrow(
                     "UPDATE runs SET status = 'failed', error_code = 'worker_lost', error = ?, finished_at = ?, "
                     "lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN ('running', 'stopping') "
-                    "AND lease_expires_at < ? RETURNING *", WORKER_LOST_MESSAGE, now, row["id"], now)
+                    "AND lease_expires_at < ? RETURNING *", WORKER_LOST_MESSAGE, now, row["id"], deadline)
                 if updated is None:  # renewed or finished despite the lock (defense in depth)
                     continue
                 event = await self._insert_event_locked(

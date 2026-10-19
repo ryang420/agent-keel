@@ -6,6 +6,52 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Coordinator recovery APIs reconcile orphaned usage, stopped and delayed retired creates, and idle generations by
+  exact container ID. Recovery preserves valid users and their execution authority, retains unresolved create
+  evidence, blocks conflicting inventory until the recorded conflict is resolved, and safely replaces incompatible
+  policy/helper generations after their users finish.
+- The sandbox coordinator records commands, file/skill helpers and cleanup before dispatch, verifies supervisor
+  receipts before finishing executions, and gates cancellation on the original execution and current usage lease.
+- Sandboxed runs execute only under a coordinated claim's usage. The worker renews the run lease until the run is
+  terminal and the usage lease until the executor's cleanup (including release) returns, both on database time,
+  and cancels a run by its last confirmed usage deadline. A failed sandbox use ends the run as
+  `sandbox_unavailable` after its tool result is stored, instead of recreating the container mid-run; recovery
+  replaces the generation before the next run. Cancellation sends one bounded supervisor control request, with no
+  hard-kill retry, and the lease sweeper hands lost runs to coordinator recovery instead of signalling a command.
+- The service runs one sandbox coordinator per instance for claims, startup inventory reconciliation and
+  minute-by-minute bounded recovery/idle passes, replacing the startup removal of containers by in-flight profile
+  list and the process-local idle reaper. `PUT /v1/profiles/{id}` returns 409 `sandbox_busy` when the effective
+  sandbox policy would change while the profile has runs in progress or unreleased sandbox work; run enqueue and
+  policy updates serialize on the profile row. When Docker or the sandbox helper is unavailable, sandbox runs stay
+  queued and chat-only runs proceed. Sandbox admission opens only after the instance has classified every
+  container of the deployment (bounded at startup, retried in the background), claims never wait on Docker, and
+  the Docker daemon ID is read afresh for every ownership or absence decision: a changed daemon closes admission
+  instead of making recorded containers look absent.
+- Migration 5 adds the `sandboxes`, `sandbox_uses`, `sandbox_execs` and `sandbox_operations` tables. The maintenance
+  pass prunes resolved, unreferenced coordination records older than `KEEL_EVENT_RETENTION_DAYS` in batches of 100;
+  unresolved creates, unreleased usages, unresolved execs and current references are retained, and an uncertain
+  create is kept as a tombstone indefinitely. The stopped-service cutover, including legacy containers, is in
+  [the operations guide](docs/guide/operations.md#upgrading-to-the-coordinated-sandbox-lifecycle).
+
+### Changed
+- The Docker backend exposes only exact-ID coordinated operations. The name-based `ensure`/`reference`/`exec`,
+  PID-file `kill_tree`, process-local idle reaper and startup `remove_orphans` paths (and their process-local
+  state) are gone, so no caller can reach a container without a recorded attempt or ticket. The `LocalSandbox`
+  test/dev backend is unchanged.
+
+### Fixed
+- An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
+  including on a profile that never had a coordinated sandbox. A block clears only when the container it records
+  is proven absent by exact ID on the same daemon (or is still listed but stopped as of the fresh exact-ID
+  inspection, where it classified as non-conflicting), and a complete, unbatched listing of the deployment's
+  containers, each container of that profile classified again, finds none that conflicts: no unknown container, no
+  recorded container whose labels or policy disagree, and no running retired create. A failed listing or
+  inspection keeps the block; a container that starts running between the listing and the inspection keeps it too.
+- A Docker warning printed on stderr (for example a platform mismatch or missing swap accounting) no longer makes a
+  successful container creation, inspection, inventory or daemon identity read uncertain: results are parsed from
+  stdout only, and stderr is kept as a bounded diagnostic.
+
 ## [0.3.0-rc.2] - 2026-10-18
 
 ### Added

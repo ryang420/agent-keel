@@ -277,53 +277,8 @@ async def test_a_cancelled_kill_tree_can_be_retried(local):
         os.killpg(pgid, 0)
 
 
-async def test_remove_orphans_spares_profiles_with_a_run_in_flight(tmp_path):
-    from keel.sandbox.docker import DockerSandbox
-
-    log = tmp_path / "log"
-    fake = tmp_path / "docker"
-    fake.write_text('#!/bin/sh\necho "$@" >> "' + str(log) + '"\n'
-                    'case "$1" in ps) printf "c1 p1\\nc2 p2\\nc3 p3\\n";; esac\nexit 0\n')
-    fake.chmod(0o755)
-    assert await DockerSandbox(docker=str(fake), deployment="t").remove_orphans({"p2"}) == 2
-    calls = log.read_text().splitlines()
-    assert calls[0].startswith("ps -a --filter label=keel.managed=1 --filter label=keel.deployment=t --format")
-    assert calls[1] == "rm -f c1 c3"
-
-
-def test_reference_names_the_sandbox_ensure_would_return_without_touching_anything(tmp_path):
-    from keel.sandbox.docker import DockerSandbox
-
+async def test_reference_names_the_local_sandbox_without_touching_anything(tmp_path):
     policy = parse_policy({"image": "local", "workdir": str(tmp_path / "w")})
     local = LocalSandbox().reference("p1", policy)
     assert (local.profile_id, local.name, local.policy) == ("p1", "local-p1", policy)
     assert not (tmp_path / "w").exists()
-    docker = DockerSandbox(docker="keel-no-such-docker", deployment="t")
-    assert docker.reference("p1", policy) == base.Sandbox("p1", docker.container_name("p1"), policy)
-
-
-async def test_killing_a_lost_command_in_a_missing_container_creates_nothing(store, tmp_path):
-    from keel.events import InMemoryEventBus
-    from keel.providers.base import ProviderRegistry
-    from keel.runner import RunExecutor
-    from keel.sandbox.docker import DockerSandbox
-
-    log = tmp_path / "log"
-    fake = tmp_path / "docker"
-    fake.write_text('#!/bin/sh\necho "$@" >> "' + str(log) + '"\n'
-                    'case "$1" in exec) echo "Error response from daemon: No such container: c" >&2; exit 1;; esac\n'
-                    'exit 0\n')
-    fake.chmod(0o755)
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
-                               sandbox={"image": "img", "workdir": "/w"})
-    await store.ensure_session("p1", "s1")
-    run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
-                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
-                                 instructions=None)
-    await store.set_current_exec(run.id, "x1")
-    backend = DockerSandbox(docker=str(fake), deployment="t", kill_grace_s=0.5)
-    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry(), sandbox=backend)
-    await executor.kill_orphaned_command(await store.get_run_by_id(run.id))
-    calls = log.read_text().splitlines()
-    assert calls and all(call.startswith(f"exec {backend.container_name('p1')} sh -c ") for call in calls), calls
-    assert (await store.get_run_by_id(run.id)).current_exec_id is None

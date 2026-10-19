@@ -64,12 +64,18 @@ turn repairs any tool call left without a result. M3 does not redesign this; it 
 - **Lease versus database timeout.** The Postgres command timeout (30 s) equals the default lease (30 s), so one
   stalled query can use up a whole lease and get a live run swept. The command timeout is derived from the lease
   (a third of it, minimum 5 s) and documented in `docs/guide/configuration.md`.
-- **Orphan removal at start.** `remove_orphans` removes every container carrying this deployment's label, whether or
+- **Orphan removal at start.** *(Superseded by the coordinated sandbox lifecycle,
+  [2026-10-18](2026-10-18-sandbox-lifecycle-coordination.md), which replaces name-based removal with exact-ID
+  inventory classification and a per-profile admission block.)* `remove_orphans` removes every container carrying
+  this deployment's label, whether or
   not a run uses it. M3 asks the store for profiles with an in-flight run and leaves those containers alone. With the
   reconnect, this removes the single-instance caveat from the README. A race is accepted: a run claimed on another
   instance between the in-flight query and `docker rm` can lose its container, and the exec path already recreates a
   vanished container once; removing an idle profile's container is harmless (it is recreated on next use).
-- **A dead worker's command.** `runs.current_exec_id` is written and never read. When the sweeper marks a run
+- **A dead worker's command.** *(Superseded by the coordinated sandbox lifecycle,
+  [2026-10-18](2026-10-18-sandbox-lifecycle-coordination.md): the sweeper hands a lost run to coordinator recovery,
+  and cancellation goes to the original supervisor by execution ticket, never by `reference` or a numeric PID.)*
+  `runs.current_exec_id` is written and never read. When the sweeper marks a run
   `worker_lost`, it makes a best-effort `kill_tree` on that exec (on the handle from `reference`, which creates
   nothing), so a command started by a dead worker does not run on. The kill reaches the command only when the
   sweeping instance shares the lost worker's Docker daemon (or host, for the local sandbox); otherwise the command

@@ -52,7 +52,9 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 - Agent loop with eight tools: `terminal`, `execute_code`, `read_file`, `write_file`, `patch`, `search_files`,
   `skills_list`, `skill_view`.
 - Docker sandbox per profile: dropped capabilities, `no-new-privileges`, optional CPU, memory and PID limits,
-  mounts, a network, and the `runsc` or `kata` runtime.
+  mounts, a network, and the `runsc` or `kata` runtime. Generations are created, started and removed by exact
+  container ID through a coordination ledger, so several instances can share one daemon without removing each
+  other's work; cancellation goes through the in-container supervisor it started.
 - Skills: directories with a `SKILL.md`, indexed into the prompt and loaded on demand.
 - Sessions with stored messages, titles, and a persistent working directory.
 - Image input (PNG, JPEG, GIF, WebP) for vision-capable models.
@@ -75,7 +77,9 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 ## Status
 
 Pre-1.0 (0.3.0-rc.2). The API and the database schema may change between releases. A database is upgraded in place at
-start (numbered migrations); a database written by a newer keel is refused. Back up the database before upgrading.
+start (numbered migrations; the coordinated sandbox lifecycle is migration 5); a database written by a newer keel is
+refused. Back up the database before upgrading. Sandbox coordination across more than one instance needs PostgreSQL
+and the stopped-service cutover in [the operations guide](docs/guide/operations.md#upgrading-to-the-coordinated-sandbox-lifecycle).
 
 ## Development
 
@@ -86,7 +90,10 @@ python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 Opt-in suites: `KEEL_TEST_DOCKER=1` (Docker sandbox, image from `KEEL_TEST_DOCKER_IMAGE`, default
 `python:3.12-slim`), `KEEL_TEST_POSTGRES_DSN=postgresql://…` (drops and recreates keel's tables),
-`KEEL_LIVE_BEDROCK=1` and `KEEL_LIVE_OPENAI=1` (call a real model).
+`KEEL_LIVE_BEDROCK=1` and `KEEL_LIVE_OPENAI=1` (call a real model). The Docker suites need the sandbox supervisor
+for the daemon's architecture; build it once with `python scripts/build_supervisor.py --arch all` (the artifacts
+are gitignored and also packaged into wheels and images). Native supervisor tests run with
+`python3 scripts/run_native_tests.py --arch amd64` (or `arm64`) in a throwaway container.
 
 ## Relationship to hermes-agent
 

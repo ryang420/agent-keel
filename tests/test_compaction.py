@@ -9,7 +9,7 @@ from keel.models import Completed, Message, TextDelta, TextPart, ToolCall, ToolC
 from keel.providers.base import Capabilities, ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
-from keel.sandbox.local import LocalSandbox
+from tests.sandbox_support import ClaimedExecutor, local_coordinator
 
 BIG = "a" * 16_000  # 4,000 tokens
 SUMMARY_USAGE = Usage(100, 20, 0, 0)
@@ -76,11 +76,18 @@ async def seed(store, pairs, text=BIG, session="s1"):
         await store.append_message(session, None, Message("assistant", (TextPart(text),)))
 
 
-async def start(store, text="next", session="s1"):
+async def start(store, text="next", session="s1", executor=None):
     await store.ensure_session("p1", session)
     await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m", reasoning_effort=None,
                            input_parts=[{"type": "text", "text": text}], instructions=None)
+    if executor is not None:
+        return await executor.claim_next()  # a sandboxed run is claimed with its usage
     return await store.claim_run("w1", 9_999_999)
+
+
+async def sandboxed(store, tmp_path, monkeypatch, registry, **options):
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
+    return ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, **options)
 
 
 def answer(text="done", usage=Usage(None, 5, None, None)):
@@ -138,14 +145,13 @@ async def test_long_tool_results_are_replaced_without_a_summary_when_that_is_eno
     assert not [e for e in await store.events_after(run.id, 0) if e.type == "context.compacted"]
 
 
-async def test_a_run_compacts_between_two_tool_calls(store, tmp_path):
+async def test_a_run_compacts_between_two_tool_calls(store, tmp_path, monkeypatch):
     model = Model(200_000)
     registry = ProviderRegistry()
     registry.register(model)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "work")})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
-                           sleep=no_sleep, now=Ticking())
+    executor = await sandboxed(store, tmp_path, monkeypatch, registry, sleep=no_sleep, now=Ticking())
     await seed(store, 1, text="earlier")
     await store.set_session_prompt("s1", "AN EARLIER PROMPT", "fake", "m")
     model.script = [
@@ -155,7 +161,7 @@ async def test_a_run_compacts_between_two_tool_calls(store, tmp_path):
          Completed(Usage())],
         answer("finished"),
     ]
-    run = await start(store, "go")
+    run = await start(store, "go", executor=executor)
     await executor.execute(run)
     assert (await store.get_run("p1", run.id)).status == "completed"
     assert len(model.requests) == 3 and len(model.summaries) == 1
@@ -213,14 +219,13 @@ async def test_a_failed_summary_pauses_summaries_for_ten_minutes(parts):
     assert len(model.summaries) == 2 and session.summary == "SUMMARY" and session.compaction_failed_at is None
 
 
-async def test_a_call_whose_newest_round_was_cut_records_no_anchor(store, tmp_path):
+async def test_a_call_whose_newest_round_was_cut_records_no_anchor(store, tmp_path, monkeypatch):
     model = Model(40_000)
     registry = ProviderRegistry()
     registry.register(model)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "work")})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
-                           sleep=no_sleep)
+    executor = await sandboxed(store, tmp_path, monkeypatch, registry, sleep=no_sleep)
     anchors = []
     record = store.set_context_anchor
 
@@ -237,26 +242,25 @@ async def test_a_call_whose_newest_round_was_cut_records_no_anchor(store, tmp_pa
         [ToolCallReady(ToolCall("c2", "terminal", '{"command": "echo two"}')), Completed(Usage(28_600, 5, 0, 0))],
         answer("finished", usage=Usage(2_000, 5, 0, 0)),
     ]
-    await executor.execute(await start(store, "go"))
+    await executor.execute(await start(store, "go", executor=executor))
     assert len(model.requests) == 3 and model.summaries == []
     assert anchors == [18_500, 2_000]
     sent = {m.tool_call_id: m.text for m in model.requests[2].messages if m.role == "tool"}
     assert sent["c1"].startswith("[terminal result omitted from context:")
 
 
-async def test_the_final_call_without_tools_records_no_anchor(store, tmp_path):
+async def test_the_final_call_without_tools_records_no_anchor(store, tmp_path, monkeypatch):
     model = Model(40_000)
     registry = ProviderRegistry()
     registry.register(model)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[],
                                sandbox={"image": "local", "workdir": str(tmp_path / "work")})
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
-                           sleep=no_sleep, max_iterations=1)
+    executor = await sandboxed(store, tmp_path, monkeypatch, registry, sleep=no_sleep, max_iterations=1)
     model.script = [
         [ToolCallReady(ToolCall("c1", "terminal", '{"command": "echo one"}')), Completed(Usage(3_000, 5, 0, 0))],
         answer("summing up", usage=Usage(1_000, 5, 0, 0)),
     ]
-    await executor.execute(await start(store, "go"))
+    await executor.execute(await start(store, "go", executor=executor))
     assert model.requests[1].tools == ()
     session = await store.get_session("p1", "s1")
     assert (session.context_tokens, session.context_message_id) == (3_000, (await store.messages("s1"))[0].id)

@@ -127,6 +127,7 @@ async def test_stopping_a_queued_run_cancels_it(store):
 
 
 async def test_expired_leases_fail_their_runs(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     run = await make_run(store)
     await store.claim_run("w1", clock.now + 30)
     assert await store.expire_leases() == []
@@ -147,7 +148,7 @@ async def test_finish_run_commits_the_canonical_event_with_the_state(store, cloc
     assert transition.event.type == "run.completed"
     assert transition.event.data == {"output": "done", "usage": usage.to_dict(), "incomplete": True}
     saved = await store.get_run("p1", completed.id)
-    assert saved.current_exec_id == "x1"  # the sweeper still needs it to kill a leftover command
+    assert saved.current_exec_id == "x1"  # a convenience pointer, kept as evidence
     assert saved.lease_owner is None and saved.lease_expires_at is None
 
     failed = await make_run(store, "failed")
@@ -184,6 +185,7 @@ async def test_finish_run_validates_its_arguments_before_reading_the_run(store):
 
 
 async def test_expire_leases_handles_a_bounded_batch(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     runs = []
     for index in range(5):
         run = await make_run(store, f"s{index}")
@@ -202,6 +204,7 @@ async def test_expire_leases_handles_a_bounded_batch(store, clock):
 
 
 async def test_a_failure_while_writing_events_rolls_the_whole_expiry_batch_back(store, clock):
+    store.coordination_clock = clock  # lease deadlines on the fake clock, injected explicitly
     runs = []
     for index in range(3):
         runs.append(await make_run(store, f"s{index}"))
@@ -433,23 +436,6 @@ async def test_compaction_state_is_stored_and_cleared(store):
     session = await store.get_session("p1", "s1")
     assert (session.summary, session.summary_head_id, session.summary_tail_id, session.pruned_id) == ("SUM", 3, 12, 12)
     assert (session.system_prompt, session.context_tokens, session.compaction_failed_at) == ("NEW", None, None)
-
-
-async def test_in_flight_profiles_are_those_with_a_queued_or_running_run(store):
-    for profile in ("p1", "p2", "p3", "p4"):
-        await store.upsert_profile(profile, models=[], sandbox={}, soul="", skills=[])
-        await store.ensure_session(profile, "s-" + profile)
-    runs = {}
-    for profile in ("p1", "p2", "p3", "p4"):
-        runs[profile] = await store.create_run(profile_id=profile, session_id="s-" + profile, provider="fake",
-                                               model="m", reasoning_effort=None,
-                                               input_parts=[{"type": "text", "text": "hi"}], instructions=None)
-    await store.claim_run("w1", 9_999_999)  # one of them is now running, which is still in flight
-    await store.finish_run(runs["p3"].id, "completed")
-    while (await store.get_run("p4", runs["p4"].id)).status != "running":
-        assert await store.claim_run("w1", 9_999_999) is not None
-    assert (await store.request_stop("p4", runs["p4"].id)).run.status == "stopping"
-    assert await store.in_flight_profiles() == {"p1", "p2", "p4"}
 
 
 async def test_pruning_deletes_only_events_of_runs_finished_before_the_cutoff(store, clock):

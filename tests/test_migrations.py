@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import time
 
 import pytest
 
@@ -11,11 +12,14 @@ from keel.config import ServiceCredential, Settings
 from keel.service import build
 from keel.sandbox.base import parse_policy, profile_mount_root
 from keel.store import migrations, open_store
-from keel.store.base import OwnershipError
+from keel.store.base import OwnershipError, UniqueViolation
 from keel.store.db import SqliteDb
 from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
+from keel.store.ownership import require_tenant_ownership
 
-ALL_TABLES = "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, blobs"
+COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
+ALL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memories, run_events, "
+              "runs, messages, sessions, profiles, tenants, blobs")
 BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("KEEL_TEST_POSTGRES_DSN") else [])
 needs_postgres = pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"),
                                     reason="needs KEEL_TEST_POSTGRES_DSN")
@@ -107,6 +111,54 @@ async def empty_database(url: str) -> str:
     return url
 
 
+async def database_table_names(db) -> set[str]:
+    """Every table in this database, read through the dialect's own catalog."""
+    if db.dialect == "sqlite":
+        rows = await db.fetch(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        return {row["name"] for row in rows}
+    rows = await db.fetch(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()")
+    return {row["table_name"] for row in rows}
+
+
+async def insert_sandbox(db, deployment="keel", profile_id="p1", daemon_id="daemon-1", token="gen-token-1",
+                         container_id=None):
+    await db.execute(
+        "INSERT INTO sandboxes (deployment, profile_id, daemon_id, generation, generation_token, container_id, "
+        "state, transitioned_at) VALUES (?, ?, ?, 1, ?, ?, 'creating', 1)",
+        deployment, profile_id, daemon_id, token, container_id)
+
+
+async def insert_usage(db, usage_id="u1", token="token-1", run_id="run_1", session_id="s1"):
+    await db.execute(
+        "INSERT INTO sandbox_uses (id, token, deployment, profile_id, daemon_id, run_id, session_id, owner, "
+        "state, heartbeat_at, lease_expires_at) "
+        "VALUES (?, ?, 'keel', 'p1', 'daemon-1', ?, ?, 'w1', 'preparing', 1, 2)",
+        usage_id, token, run_id, session_id)
+
+
+async def insert_exec(db, exec_id="e1", control_token="control-1", usage_id="u1", usage_token="token-1",
+                      run_id="run_1", session_id="s1"):
+    await db.execute(
+        "INSERT INTO sandbox_execs (id, control_token, usage_id, usage_token, deployment, profile_id, daemon_id, "
+        "run_id, session_id, generation, generation_token, container_id, state, created_at) "
+        "VALUES (?, ?, ?, ?, 'keel', 'p1', 'daemon-1', ?, ?, 1, 'gen-1', 'c1', 'pending', 1)",
+        exec_id, control_token, usage_id, usage_token, run_id, session_id)
+
+
+async def insert_operation(db, operation_id="op1", kind="create", intended_name="name-1", authority="current",
+                           outcome="planned", container_id=None, daemon_id="daemon-1", run_id="run_1",
+                           session_id="s1", retired_at=None):
+    await db.execute(
+        "INSERT INTO sandbox_operations (id, kind, deployment, profile_id, daemon_id, run_id, session_id, "
+        "generation, generation_token, intended_name, container_id, owner, owner_token, authority, retired_at, "
+        "outcome, created_at, updated_at) "
+        "VALUES (?, ?, 'keel', 'p1', ?, ?, ?, 1, 'gen-1', ?, ?, 'w1', ?, ?, ?, ?, 1, 1)",
+        operation_id, kind, daemon_id, run_id, session_id, intended_name, container_id,
+        "owner-" + operation_id, authority, retired_at, outcome)
+
+
 async def schema_shape(db) -> dict:
     """Every table's columns and every index, in a form that compares equal for equal schemas."""
     if db.dialect == "sqlite":
@@ -150,6 +202,7 @@ async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_
     store = await open_store(db_url)
     try:
         assert await schema_version(store.db) == LATEST_VERSION
+        assert await database_table_names(store.db) >= COORDINATION_TABLES
         stamped = await store.db.fetch("SELECT version FROM schema_version")
         assert [row["version"] for row in stamped] == [LATEST_VERSION]
         assert (await store.get_profile("p1")).soul == "You help."
@@ -381,10 +434,13 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     # SQLite refuses DROP COLUMN while profiles_tenant still indexes tenant_id.
     await store.db.execute("DROP INDEX IF EXISTS profiles_tenant")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN tenant_id")
+    # A v3 database predates migration 5; drop its tables so the reopen exercises both migrations.
+    for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
+        await store.db.execute(f"DROP TABLE IF EXISTS {table}")
     await store.close()
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == 4
+        assert await schema_version(upgraded.db) == LATEST_VERSION
         profile = await upgraded.get_profile("p1")
         assert profile.soul == "kept" and profile.tenant_id is None
         assert await upgraded.db.fetchrow("SELECT id FROM tenants") is None
@@ -407,3 +463,153 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
             assert tenant_type["data_type"] == owner_type["data_type"] == "integer"
     finally:
         await upgraded.close()
+
+
+async def test_a_v4_database_gains_the_coordination_tables(db_url):
+    store = await open_store(db_url)
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="kept-v4", skills=[])
+    for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
+        await store.db.execute(f"DROP TABLE {table}")
+    await store.db.execute("UPDATE schema_version SET version = 4")
+    await store.close()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        assert await database_table_names(upgraded.db) >= COORDINATION_TABLES
+        assert (await upgraded.get_profile("p1")).soul == "kept-v4"
+        await insert_usage(upgraded.db, "u1", "token-1", "run_1")
+        with pytest.raises(UniqueViolation):
+            await insert_usage(upgraded.db, "u2", "token-2", "run_1")
+    finally:
+        await upgraded.close()
+
+
+async def test_coordination_identities_are_unique(db_url):
+    store = await open_store(db_url)
+    try:
+        db = store.db
+        await insert_usage(db, "u1", "token-1", "run_1")
+        with pytest.raises(UniqueViolation):
+            await insert_usage(db, "u2", "token-2", "run_1")  # one usage per run
+        with pytest.raises(UniqueViolation):
+            await insert_usage(db, "u3", "token-1", "run_3")  # unique usage token
+        await insert_exec(db, "e1", "control-1")
+        with pytest.raises(UniqueViolation):
+            await insert_exec(db, "e2", "control-1", usage_id="u2", usage_token="token-2")  # unique control token
+        await insert_operation(db, "op1", intended_name="create-name-1")
+        with pytest.raises(UniqueViolation):
+            await insert_operation(db, "op1", intended_name="create-name-2")  # unique operation id
+        with pytest.raises(UniqueViolation):
+            await insert_operation(db, "op2", intended_name="create-name-1")  # unique create name per daemon
+        await insert_operation(db, "op3", kind="install", intended_name="create-name-1")  # linked steps share it
+        await insert_operation(db, "op4", intended_name="create-name-1", daemon_id="daemon-2")
+        await insert_operation(db, "remove-1", kind="remove", intended_name=None, container_id="c9")
+        with pytest.raises(UniqueViolation):
+            await insert_operation(db, "remove-2", kind="remove", intended_name=None, container_id="c9")
+        await insert_operation(db, "remove-3", kind="remove", intended_name=None, container_id="c9",
+                               authority="retired", outcome="uncertain", retired_at=3)
+    finally:
+        await store.close()
+
+
+async def test_operation_authority_and_outcome_are_independent(db_url):
+    store = await open_store(db_url)
+    try:
+        await insert_operation(store.db, "op-retired-uncertain", authority="retired", outcome="uncertain",
+                               retired_at=2)
+        await insert_operation(store.db, "op-current-succeeded", intended_name="name-2", outcome="succeeded")
+        saved = await store.db.fetchrow(
+            "SELECT authority, outcome FROM sandbox_operations WHERE id = ?", "op-retired-uncertain")
+        assert (saved["authority"], saved["outcome"]) == ("retired", "uncertain")
+        saved = await store.db.fetchrow(
+            "SELECT authority, outcome FROM sandbox_operations WHERE id = ?", "op-current-succeeded")
+        assert (saved["authority"], saved["outcome"]) == ("current", "succeeded")
+        with pytest.raises(Exception):
+            await insert_operation(store.db, "op-bad-authority", intended_name="name-3", authority="revoked")
+        with pytest.raises(Exception):
+            await insert_operation(store.db, "op-bad-outcome", intended_name="name-4", outcome="failed")
+    finally:
+        await store.close()
+
+
+async def test_coordination_constraints_survive_tenant_ownership_enforcement(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await insert_sandbox(store.db, token="gen-token-before", container_id="c-before")
+        await require_tenant_ownership(store.db, (1,), {"p1": 1})
+        assert await database_table_names(store.db) >= COORDINATION_TABLES
+        if store.db.dialect == "sqlite":
+            row = await store.db.fetchrow(
+                "SELECT \"notnull\" AS nn FROM pragma_table_info('profiles') WHERE name = 'tenant_id'")
+            assert row["nn"] == 1
+        survivor = await store.db.fetchrow(
+            "SELECT generation_token, container_id FROM sandboxes WHERE profile_id = ?", "p1")
+        assert (survivor["generation_token"], survivor["container_id"]) == ("gen-token-before", "c-before")
+        with pytest.raises(UniqueViolation):
+            await insert_sandbox(store.db, deployment="other", token="gen-token-before")
+        with pytest.raises(UniqueViolation):
+            await insert_sandbox(store.db, deployment="other", token="gen-token-2", container_id="c-before")
+        await insert_usage(store.db, "u1", "token-1", "run_1")
+        with pytest.raises(UniqueViolation):
+            await insert_usage(store.db, "u2", "token-2", "run_1")
+        await insert_operation(store.db, "op1", intended_name="name-1")
+        with pytest.raises(UniqueViolation):
+            await insert_operation(store.db, "op2", intended_name="name-1")
+    finally:
+        await store.close()
+
+
+async def test_coordination_evidence_survives_terminal_session_deletion(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.ensure_session("p1", "s1")
+        run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                     reasoning_effort=None, input_parts=[], instructions=None)
+        await store.finish_run(run.id, "completed", output="done")
+        await insert_usage(store.db, "u1", "token-1", run.id, "s1")
+        await insert_exec(store.db, "e1", "control-1", run_id=run.id, session_id="s1")
+        await insert_operation(store.db, "op1", run_id=run.id, session_id="s1")
+
+        assert await store.delete_session("p1", "s1") is True
+        assert await store.get_session("p1", "s1") is None
+        assert await store.get_run_by_id(run.id) is None
+        assert await store.db.fetchrow("SELECT id FROM sandbox_uses WHERE id = ?", "u1") is not None
+        assert await store.db.fetchrow("SELECT id FROM sandbox_execs WHERE id = ?", "e1") is not None
+        assert await store.db.fetchrow("SELECT id FROM sandbox_operations WHERE id = ?", "op1") is not None
+    finally:
+        await store.close()
+
+
+async def test_coordination_time_is_database_time_unless_injected(db_url):
+    store = await open_store(db_url)
+    try:
+        first = await store.coordination_now()
+        second = await store.coordination_now()
+        assert isinstance(first, float) and isinstance(second, float)
+        assert 0 <= second - first < 60
+    finally:
+        await store.close()
+    injected = await open_store(db_url, coordination_clock=lambda: 1234.5)
+    try:
+        assert await injected.coordination_now() == 1234.5
+    finally:
+        await injected.close()
+
+
+async def test_coordination_time_is_read_at_call_time_inside_a_transaction(db_url):
+    store = await open_store(db_url)
+    try:
+        async with store.db.transaction():
+            before = await store.coordination_now()
+            started = time.monotonic()
+            await asyncio.sleep(0.06)
+            after = await store.coordination_now()
+            elapsed = time.monotonic() - started
+        # Transaction-start timestamps (not transaction_timestamp/now()) would show no advance at all.
+        assert elapsed >= 0.05
+        assert after - before >= 0.03
+    finally:
+        await store.close()

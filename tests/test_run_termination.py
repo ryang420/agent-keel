@@ -21,8 +21,8 @@ async def stores():
     import asyncpg
 
     conn = await asyncpg.connect(DSN)
-    await conn.execute("DROP TABLE IF EXISTS schema_version, memories, run_events, runs, messages, sessions, "
-                       "profiles, tenants, blobs")
+    await conn.execute("DROP TABLE IF EXISTS sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, "
+                       "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, blobs")
     await conn.close()
     first = await open_store(DSN)
     second = await open_store(DSN)

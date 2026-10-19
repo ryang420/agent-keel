@@ -15,8 +15,8 @@ from keel.models import Completed, ImagePart, Message, TextDelta, TextPart, Tool
 from keel.providers.base import Capabilities, ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
-from keel.sandbox.local import LocalSandbox
 from keel.worker import WorkerPool
+from tests.sandbox_support import local_coordinator
 
 AUTH = {"Authorization": "Bearer test-key"}
 PROFILE = {"models": [{"provider": "fake", "model": "m"}], "sandbox": {}, "soul": "", "skills": []}
@@ -95,13 +95,14 @@ def assistant(text):
 
 
 @pytest.fixture
-async def service(store, tmp_path):
+async def service(store, tmp_path, monkeypatch):
     model = Counting(40_000)
     registry = ProviderRegistry()
     registry.register(model)
     bus = InMemoryEventBus()
-    executor = RunExecutor(store, bus, registry, sandbox=LocalSandbox(kill_grace_s=0.5))
-    pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01)
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch, bus=bus)
+    executor = RunExecutor(store, bus, registry, coordinator=coordinator)
+    pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01, coordinator=coordinator)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
                 credentials=(ServiceCredential(1, "test-key"),), max_running=2)
     await pool.start()

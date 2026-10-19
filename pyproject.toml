@@ -40,7 +40,7 @@ dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-keel = ["prompts/*.md", "prompts/tools/*.json"]
+keel = ["prompts/*.md", "prompts/tools/*.json", "sandbox/bin/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

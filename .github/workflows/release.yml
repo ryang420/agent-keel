@@ -11,6 +11,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,10 +20,19 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - run: pytest -q
+      - uses: docker/setup-qemu-action@v3
+      - name: Wheel and sdist carry the helper for both architectures
+        run: |
+          python scripts/build_supervisor.py --arch all
+          python -m pip install build
+          python -m build -o dist .
+          python scripts/verify_distribution.py wheel dist/*.whl --require amd64,arm64
+          python scripts/verify_distribution.py sdist dist/*.tar.gz
 
   image:
     name: image
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: test
     permissions:
       contents: read
@@ -53,6 +63,13 @@ jobs:
             if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$NAME:latest"; fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+      - name: Each platform image carries its own helper
+        run: |
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load -t "agent-keel:release-$arch" .
+            docker run --rm -i --platform "linux/$arch" "agent-keel:release-$arch" \
+              python - installed --require "$arch" < scripts/verify_distribution.py
+          done
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -65,6 +82,7 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: [test, image]
     permissions:
       contents: write

@@ -29,12 +29,9 @@ async def store(request, tmp_path, clock):
         url = f"sqlite:///{tmp_path / 'keel.sqlite3'}"
     else:
         url = os.environ["KEEL_TEST_POSTGRES_DSN"]
-        import asyncpg
+        from tests.sandbox_support import reset_postgres_schema
 
-        conn = await asyncpg.connect(url)
-        await conn.execute("DROP TABLE IF EXISTS schema_version, memories, run_events, runs, messages, sessions, "
-                           "profiles, tenants, blobs")
-        await conn.close()
+        await reset_postgres_schema(url)
     opened = await open_store(url, clock=clock)
     yield opened
     await opened.close()

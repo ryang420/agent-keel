@@ -62,6 +62,11 @@ class PostgresDb:
         async with self._pool.acquire() as conn:
             await conn.execute(script)
 
+    async def database_now(self) -> float:
+        """Unix epoch seconds from the database server, unaffected by host clock skew."""
+        row = await self.fetchrow("SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision AS now")
+        return float(row["now"])
+
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
         if self._conn.get() is not None:

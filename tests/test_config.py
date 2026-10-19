@@ -188,3 +188,12 @@ def test_model_stall_limits_have_defaults_and_must_be_positive():
     for name in ("KEEL_MODEL_FIRST_EVENT_SECONDS", "KEEL_MODEL_STALL_SECONDS", "KEEL_MODEL_HIGH_EFFORT_STALL_SECONDS"):
         with pytest.raises(ValueError, match=name):
             Settings.from_env({**BASE, name: "0"})
+
+
+def test_sandbox_reap_timeout_has_finite_positive_default_and_override():
+    assert Settings.from_env(BASE).sandbox_reap_seconds == 5.0
+    assert Settings.from_env({**BASE, "KEEL_SANDBOX_REAP_SECONDS": "8.5"}).sandbox_reap_seconds == 8.5
+    assert Settings.from_env({**BASE, "KEEL_SANDBOX_REAP_SECONDS": "86400"}).sandbox_reap_seconds == 86400.0
+    for bad in ("0", "-1", "nan", "inf", "86400.5", "1e300"):
+        with pytest.raises(ValueError, match="KEEL_SANDBOX_REAP_SECONDS"):
+            Settings.from_env({**BASE, "KEEL_SANDBOX_REAP_SECONDS": bad})

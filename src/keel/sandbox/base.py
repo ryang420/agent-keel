@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -11,7 +12,14 @@ import math
 import os
 import posixpath
 import re
-from typing import Awaitable, Callable, Protocol
+import uuid
+from typing import Awaitable, Callable, Protocol, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from keel.sandbox.records import (
+        CleanupReceipt, ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt,
+    )
+    from keel.sandbox.runtime import HelperArtifact
 
 RUNTIMES = ("runc", "runsc", "kata")
 TIMEOUT_EXIT_CODE = 124
@@ -186,12 +194,8 @@ class ExecResult:
     duration_s: float
 
 
-class SandboxBackend(Protocol):
-    async def ensure(self, profile_id: str, policy: SandboxPolicy) -> Sandbox: ...
-
-    def reference(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
-        """The handle `ensure` would return, without creating or starting anything."""
-        ...
+class SandboxExecutor(Protocol):
+    """The I/O surface tools use, implemented by the bound facade and the local development backend."""
 
     async def exec(self, sandbox: Sandbox, argv: list[str], *, cwd: str, timeout_s: float, exec_id: str,
                    env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult: ...
@@ -202,9 +206,86 @@ class SandboxBackend(Protocol):
 
     async def kill_tree(self, sandbox: Sandbox, exec_id: str) -> None: ...
 
+
+class SandboxBackend(SandboxExecutor, Protocol):
+    async def ensure(self, profile_id: str, policy: SandboxPolicy) -> Sandbox: ...
+
+    def reference(self, profile_id: str, policy: SandboxPolicy) -> Sandbox:
+        """The handle `ensure` would return, without creating or starting anything."""
+        ...
+
     async def destroy(self, sandbox: Sandbox) -> None: ...
 
     async def aclose(self) -> None: ...
+
+
+class CoordinatedSandboxBackend(Protocol):
+    """The exact-ID operations the lifecycle coordinator drives.
+
+    Wider than `SandboxBackend`, which `LocalSandbox` and test fakes implement: every method addresses a recorded
+    full container ID, never a reusable name, and an implementation never calls `ensure` or retries a payload. A
+    definite failure is kept apart from uncertainty: a timeout, killed client, transport loss or malformed output is
+    never read as "the container does not exist".
+    """
+
+    async def daemon_identity(self) -> tuple[str, str]:
+        """The Docker daemon ID (read fresh on every call) and the cached normalized architecture."""
+        ...
+
+    async def inspect_id(self, container_id: str) -> DockerOutcome: ...
+
+    async def inventory(self) -> list[ContainerObservation]: ...
+
+    async def create_generation(self, attempt: LifecycleAttempt, policy: SandboxPolicy) -> DockerOutcome: ...
+
+    async def install_helper(self, attempt: LifecycleAttempt, artifact: HelperArtifact) -> DockerOutcome: ...
+
+    async def start_id(self, attempt: LifecycleAttempt) -> DockerOutcome: ...
+
+    async def remove_id(self, attempt: LifecycleAttempt) -> DockerOutcome: ...
+
+    async def exec_bound(self, ticket: ExecTicket, argv: list[str], *, cwd: str, timeout_s: float,
+                         env: dict[str, str] | None = None, stdin: bytes | None = None,
+                         authorize_control: Callable[[], Awaitable[None]] | None = None
+                         ) -> tuple[ExecResult, CleanupReceipt]: ...
+
+    async def control_exec(self, ticket: ExecTicket, *, cancel: bool) -> CleanupReceipt: ...
+
+    async def aclose(self) -> None: ...
+
+
+class ExecFileIO:
+    """File helpers dispatch through the facade's exec, giving each helper exactly one durable ticket."""
+
+    async def _helper(self, sandbox: Sandbox, script: str, *args: str,
+                      stdin: bytes | None = None) -> ExecResult:
+        return await self.exec(sandbox, ["sh", "-c", script, "keel-helper", *args], cwd="/", timeout_s=60,
+                               exec_id="h" + uuid.uuid4().hex, stdin=stdin)
+
+    async def read_file(self, sandbox: Sandbox, path: str, max_bytes: int) -> bytes:
+        # Base64 keeps arbitrary bytes separate from the UTF-8 stdout transport. Leave room for its expansion.
+        cap = (MAX_OUTPUT_BYTES // 4) * 3 - 4096
+        script = ('[ -d "$1" ] && exit 3; [ -e "$1" ] || exit 4; [ -r "$1" ] || exit 5; '
+                  'head -c "$2" "$1" 2>/dev/null | base64 | tr -d "\\n"')
+        result = await self._helper(sandbox, script, path, str(min(max_bytes, cap)))
+        if result.exit_code == 3:
+            raise IsADirectoryError(path)
+        if result.exit_code == 4:
+            raise FileNotFoundError(path)
+        if result.exit_code == 5:
+            raise PermissionError(path)
+        if result.exit_code != 0:
+            raise OSError(f"could not read {path}: {result.output.strip()[:300]}")
+        try:
+            return base64.b64decode(result.output, validate=True)
+        except ValueError as exc:
+            raise OSError(f"could not read {path}") from exc
+
+    async def write_file(self, sandbox: Sandbox, path: str, data: bytes) -> None:
+        result = await self._helper(sandbox, 'mkdir -p "$(dirname "$1")" && base64 -d > "$1"',
+                                    path, stdin=base64.b64encode(data))
+        if result.exit_code != 0:
+            raise PermissionError(result.output.strip()[:300] or path)
 
 
 async def _exited(proc: asyncio.subprocess.Process) -> None:

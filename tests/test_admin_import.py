@@ -8,8 +8,7 @@ from keel.events import InMemoryEventBus
 from keel.models import Completed, TextDelta, Usage
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
-from keel.runner import RunExecutor
-from keel.sandbox.local import LocalSandbox
+from tests.sandbox_support import ClaimedExecutor, local_coordinator
 
 
 def line(**overrides):
@@ -70,7 +69,7 @@ async def test_a_profile_of_another_tenant_is_invalid(store):
     assert (result["status"], result["reason"]) == ("invalid", "profile belongs to another tenant")
 
 
-async def test_an_imported_conversation_is_replayed_to_the_model_on_the_next_run(store, tmp_path):
+async def test_an_imported_conversation_is_replayed_to_the_model_on_the_next_run(store, tmp_path, monkeypatch):
     """Continuable: the next turn's model call carries the imported turns, tool call and result paired."""
     await import_lines(store, [line()], dry_run=False)
     provider = FakeProvider()
@@ -82,13 +81,14 @@ async def test_an_imported_conversation_is_replayed_to_the_model_on_the_next_run
     await store.create_run(profile_id="p1", session_id="console-a1", provider="fake", model="m",
                            reasoning_effort=None, input_parts=[{"type": "text", "text": "And now?"}],
                            instructions=None)
-    run = await store.claim_run("w1", 9_999_999)
 
     async def no_sleep(_):
         pass
 
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sandbox=LocalSandbox(kill_grace_s=0.5),
-                           sleep=no_sleep, max_iterations=3, now=lambda: datetime(2026, 10, 16, tzinfo=UTC))
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator,
+                               sleep=no_sleep, max_iterations=3, now=lambda: datetime(2026, 10, 16, tzinfo=UTC))
+    run = await executor.claim_next()
     await executor.execute(run)
     sent = provider.requests[0].messages
     assert [m.role for m in sent] == ["user", "assistant", "tool", "assistant", "user"]
