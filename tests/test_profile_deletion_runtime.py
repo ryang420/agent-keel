@@ -19,7 +19,11 @@ from keel.providers.fake import FakeProvider
 from keel.review import run_review
 from keel.runner import RunExecutor
 from keel.sandbox.records import SandboxBusy
-from keel.store.base import ProfileDeletionBusy
+from keel.store.base import ProfileDeletionBusy, ProfileDeletionConflict
+from keel.store import open_store
+from keel.sandbox.coordinator import SandboxCoordinator
+from tests.sandbox_support import FakeDocker, make_claim
+from tests.test_sandbox_coordinator import helper_assets
 
 MODELS = [{"provider": "fake", "model": "m"}]
 OP_A = "11111111-1111-4111-8111-111111111111"
@@ -76,7 +80,7 @@ class CheckingCoordinator:
         self.run_ids = run_ids
         self.called = False
 
-    async def retire_profile(self, profile_id, *, timeout_seconds):
+    async def retire_profile(self, profile_id, *, timeout_seconds, deletion_authority=None):
         self.called = True
         assert timeout_seconds > 0
         assert await self.store.list_runs(profile_id, ("queued", "running", "stopping")) == []
@@ -88,12 +92,12 @@ class CheckingCoordinator:
 
 
 class UncertainCoordinator:
-    async def retire_profile(self, profile_id, *, timeout_seconds):
+    async def retire_profile(self, profile_id, *, timeout_seconds, deletion_authority=None):
         raise SandboxBusy("an uncertain container removal")
 
 
 class BrokenCoordinator:
-    async def retire_profile(self, profile_id, *, timeout_seconds):
+    async def retire_profile(self, profile_id, *, timeout_seconds, deletion_authority=None):
         raise RuntimeError("docker unavailable")
 
 
@@ -295,6 +299,215 @@ async def test_other_instance_cannot_resume_an_old_background_review_into_a_reus
         release.set()
         await background_a.close()
         await background_b.close()
+
+
+async def test_an_inflight_delete_cannot_cancel_a_recreated_incarnations_queued_run(tmp_path):
+    dsn = f"sqlite:///{tmp_path / 'inflight-delete.sqlite3'}"
+    store_a, store_b = await open_store(dsn), await open_store(dsn)
+    background_a, background_b = Background(), Background()
+    try:
+        await put_profile(store_a)
+        service_a = ProfileDeletionService(store_a, background=background_a)
+        service_b = ProfileDeletionService(store_b, background=background_b)
+        entered, resume = asyncio.Event(), asyncio.Event()
+        original_drain = service_a._drain
+
+        async def paused_drain(profile_id, deadline, authority):
+            entered.set()
+            await resume.wait()
+            return await original_drain(profile_id, deadline, authority)
+
+        service_a._drain = paused_drain
+        old_request = asyncio.create_task(service_a.delete("p1", 1, OP_A, timeout_seconds=2))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        await service_b.delete("p1", 1, OP_A, timeout_seconds=2)
+        await service_b.complete("p1", 1, OP_A)
+        await put_profile(store_b)
+        await store_b.ensure_session("p1", "new-session")
+        new_run = await add_run(store_b, session_id="new-session")
+
+        resume.set()
+        result = (await asyncio.gather(old_request, return_exceptions=True))[0]
+
+        assert isinstance(result, ProfileDeletionConflict)
+        current = await store_b.get_run("p1", new_run.id)
+        assert current.status == "queued"
+    finally:
+        resume.set()
+        await background_a.close()
+        await background_b.close()
+        await store_a.close()
+        await store_b.close()
+
+
+async def test_late_old_delete_cannot_replace_a_newer_local_background_block(tmp_path):
+    dsn = f"sqlite:///{tmp_path / 'late-background-block.sqlite3'}"
+    store_a, store_b = await open_store(dsn), await open_store(dsn)
+    background_a, background_b = Background(), Background()
+    service_a = ProfileDeletionService(store_a, background=background_a)
+    service_b = ProfileDeletionService(store_b, background=background_b)
+    entered, resume = asyncio.Event(), asyncio.Event()
+    original_begin = store_a.begin_profile_deletion
+
+    async def paused_begin(*args, **kwargs):
+        record = await original_begin(*args, **kwargs)
+        entered.set()
+        await resume.wait()
+        return record
+
+    store_a.begin_profile_deletion = paused_begin
+    old_request = None
+    try:
+        await put_profile(store_a)
+        old_request = asyncio.create_task(service_a.delete("p1", 1, OP_A, timeout_seconds=2))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        await service_b.delete("p1", 1, OP_A, timeout_seconds=2)
+        await service_b.complete("p1", 1, OP_A)
+        new_profile = await put_profile(store_b)
+        await ProfileDeletionService(store_b, background=background_a).delete(
+            "p1", 1, OP_B, timeout_seconds=2)
+
+        resume.set()
+        result = (await asyncio.gather(old_request, return_exceptions=True))[0]
+        assert isinstance(result, ProfileDeletionConflict)
+        assert background_a._blocked["p1"] == (OP_B, new_profile.incarnation)
+        probe = background_a.spawn(
+            asyncio.sleep(0), "new-incarnation probe", profile_id="p1",
+            profile_incarnation=new_profile.incarnation)
+        assert not probe
+    finally:
+        resume.set()
+        if old_request is not None:
+            await asyncio.gather(old_request, return_exceptions=True)
+        await background_a.close()
+        await background_b.close()
+        await store_a.close()
+        await store_b.close()
+
+
+async def test_late_old_background_drain_leaves_new_incarnation_tasks_running(tmp_path):
+    dsn = f"sqlite:///{tmp_path / 'late-background-drain.sqlite3'}"
+    store_a, store_b = await open_store(dsn), await open_store(dsn)
+    background_a, background_b = Background(), Background()
+    service_a = ProfileDeletionService(store_a, background=background_a)
+    service_b = ProfileDeletionService(store_b, background=background_b)
+    entered, resume, started, finish = (asyncio.Event() for _ in range(4))
+    original_drain = service_a._drain_background
+
+    async def paused_drain(*args, **kwargs):
+        entered.set()
+        await resume.wait()
+        return await original_drain(*args, **kwargs)
+
+    service_a._drain_background = paused_drain
+    old_request = None
+    try:
+        await put_profile(store_a)
+        old_request = asyncio.create_task(service_a.delete("p1", 1, OP_A, timeout_seconds=2))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        await service_b.delete("p1", 1, OP_A, timeout_seconds=2)
+        await service_b.complete("p1", 1, OP_A)
+        new_profile = await put_profile(store_b)
+
+        async def new_work():
+            started.set()
+            await finish.wait()
+
+        assert background_a.spawn(
+            new_work(), "new-incarnation task", profile_id="p1",
+            profile_incarnation=new_profile.incarnation)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        [new_task] = background_a.profile_tasks("p1")
+
+        resume.set()
+        result = (await asyncio.gather(old_request, return_exceptions=True))[0]
+        assert isinstance(result, ProfileDeletionConflict)
+        assert not new_task.done()
+    finally:
+        resume.set()
+        finish.set()
+        if old_request is not None:
+            await asyncio.gather(old_request, return_exceptions=True)
+        await background_a.close()
+        await background_b.close()
+        await store_a.close()
+        await store_b.close()
+
+
+@pytest.mark.parametrize("pause_point", ["service", "planner"])
+async def test_an_inflight_delete_cannot_retire_a_recreated_incarnations_sandbox(
+        store, clock, helper_assets, pause_point):
+    clock.now = await store.db.database_now()
+    store.coordination_clock = clock
+    backend = FakeDocker()
+    coordinator = SandboxCoordinator(store, backend, deployment="dep", owner="w1", lease_seconds=30,
+                                     idle_seconds=10, reap_seconds=1)
+    assert await coordinator.open_admission()
+    if store.db.dialect == "postgres":
+        import os
+
+        dsn = os.environ["KEEL_TEST_POSTGRES_DSN"]
+    else:
+        [dbrow] = await store.db.fetch("PRAGMA database_list")
+        dsn = "sqlite:///" + dbrow["file"]
+    other = await open_store(dsn)
+    other.coordination_clock = clock
+    newer_coordinator = SandboxCoordinator(
+        other, backend, deployment="dep", owner="other", lease_seconds=30, idle_seconds=10, reap_seconds=1)
+    service_a = ProfileDeletionService(store, coordinator=coordinator)
+    service_b = ProfileDeletionService(other, coordinator=newer_coordinator)
+    entered, resume = asyncio.Event(), asyncio.Event()
+    if pause_point == "service":
+        original_retire = service_a._retire
+
+        async def paused_retire(*args, **kwargs):
+            entered.set()
+            await resume.wait()
+            return await original_retire(*args, **kwargs)
+
+        service_a._retire = paused_retire
+    else:
+        original_plan = store.plan_idle_removal
+
+        async def paused_plan(*args, **kwargs):
+            if kwargs.get("deletion_authority") is not None and kwargs.get("idle_seconds") == 0.0:
+                entered.set()
+                await resume.wait()
+            return await original_plan(*args, **kwargs)
+
+        store.plan_idle_removal = paused_plan
+    old_request = None
+    try:
+        old_claim = await make_claim(store, "old-session")
+        await store.db.execute("UPDATE profiles SET tenant_id = 1 WHERE id = 'p1'")
+        await coordinator.prepare(old_claim.use)
+        await store.finish_run(old_claim.run.id, "completed")
+        assert await coordinator.release(old_claim.use)
+
+        old_request = asyncio.create_task(service_a.delete("p1", 1, OP_A, timeout_seconds=5))
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        await service_b.delete("p1", 1, OP_A, timeout_seconds=5)
+        await service_b.complete("p1", 1, OP_A)
+
+        new_claim = await make_claim(other, "new-session", owner="other")
+        await other.db.execute("UPDATE profiles SET tenant_id = 1 WHERE id = 'p1'")
+        new_bound = await newer_coordinator.prepare(new_claim.use)
+        await other.finish_run(new_claim.run.id, "completed")
+        assert await newer_coordinator.release(new_claim.use)
+        assert new_bound.name in backend._created
+
+        resume.set()
+        result = (await asyncio.wait_for(asyncio.gather(old_request, return_exceptions=True), timeout=8))[0]
+        assert isinstance(result, ProfileDeletionConflict)
+        assert new_bound.name in backend._created
+    finally:
+        resume.set()
+        if old_request is not None:
+            await asyncio.gather(old_request, return_exceptions=True)
+        await other.close()
 
 
 async def test_a_failed_purge_does_not_authorize_completion(store, monkeypatch):

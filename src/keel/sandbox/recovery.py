@@ -7,8 +7,14 @@ import logging
 
 from keel.sandbox.base import SandboxError
 from keel.sandbox.records import DockerOutcome, RecoveryAction, RecoveryReport, SandboxKey
+from keel.store.base import ProfileDeletionConflict
+from keel.store.deletions import ProfileDeletionAuthority
 
 log = logging.getLogger(__name__)
+
+
+def _deletion_kwargs(authority: ProfileDeletionAuthority | None) -> dict[str, ProfileDeletionAuthority]:
+    return {} if authority is None else {"deletion_authority": authority}
 
 
 def confirmed_absent(outcome: DockerOutcome) -> bool:
@@ -154,7 +160,12 @@ class SandboxRecoveryMixin:
                       "recorded daemon is restored and the service restarted", self._daemon_id, observed)
         self._daemon_changed = True
 
-    async def _recover_key(self, key: SandboxKey) -> tuple[int, int, int, int]:
+    async def _recover_key(self, key: SandboxKey, *,
+                           deletion_authority: ProfileDeletionAuthority | None = None
+                           ) -> tuple[int, int, int, int]:
+        if deletion_authority is not None:
+            async with self.store.profile_deletion_guard(key.profile_id, deletion_authority):
+                pass
         row, before = await self.store.recovery_snapshot(key)
         inspected = removed = blocked = 0
         # Match the configured daemon afresh before interpreting a missing ID. Cached initialization does not
@@ -173,32 +184,35 @@ class SandboxRecoveryMixin:
             if confirmed_absent(outcome):
                 observed_daemon, _ = await self.backend.daemon_identity()
                 if observed_daemon == key.daemon_id:
-                    await self.store.confirm_generation_missing(key, row["container_id"])
+                    await self.store.confirm_generation_missing(
+                        key, row["container_id"], **_deletion_kwargs(deletion_authority))
                 else:
                     available = False
                     blocked += 1
             elif outcome.observation is not None:
                 action = await self.store.classify_inventory(
-                    outcome.observation, owner=self.owner, lease_seconds=self.lease_seconds)
+                    outcome.observation, owner=self.owner, lease_seconds=self.lease_seconds,
+                    **_deletion_kwargs(deletion_authority))
                 if action is not None and action.action == "blocked":
                     blocked += 1
                 elif action is not None and action.action == "remove":
-                    removed += await self._recover_action(action)
+                    removed += await self._recover_action(action, deletion_authority=deletion_authority)
             else:
                 blocked += 1
         if available and row is not None and row["container_id"] is None:
-            blocked += await self._resolve_unpublished_block(key)
-        actions = await self.store.plan_recovery(key, owner=self.owner, lease_seconds=self.lease_seconds)
+            blocked += await self._resolve_unpublished_block(key, deletion_authority=deletion_authority)
+        actions = await self.store.plan_recovery(
+            key, owner=self.owner, lease_seconds=self.lease_seconds, **_deletion_kwargs(deletion_authority))
         _, orphaned = await self.store.recovery_snapshot(key)
         for use in orphaned:
             if use.state in ("orphaned", "released"):
                 try:
-                    await self._finish_unavailable(use.run_id)
+                    await self._finish_unavailable(use.run_id, deletion_authority=deletion_authority)
                 except Exception:
                     blocked += 1  # released recovery usages retain the unfinished run for a later retry
         for action in actions:
             if action.action != "remove" or available:
-                removed += await self._recover_action(action)
+                removed += await self._recover_action(action, deletion_authority=deletion_authority)
         # The guarded planner marks orphans before returning. Terminal transitions happen afterwards, in their
         # own transactions, preserving profile-before-run lock ordering and the existing single terminal event.
         _, after = await self.store.recovery_snapshot(key)
@@ -208,7 +222,7 @@ class SandboxRecoveryMixin:
             if current is None or current.state not in ("orphaned", "released"):
                 continue
             try:
-                await self._finish_unavailable(use.run_id)
+                await self._finish_unavailable(use.run_id, deletion_authority=deletion_authority)
             except Exception:
                 blocked += 1  # the finished usage keeps its unfinished run for a later retry
             released += current.state == "released" and use.state != "released"
@@ -221,13 +235,17 @@ class SandboxRecoveryMixin:
                 _, artifact = await self._ready()
                 for action in await self.store.plan_idle_removal(
                         key, owner=self.owner, lease_seconds=self.lease_seconds,
-                        idle_seconds=float("inf"), helper_digest=artifact.sha256):
-                    removed += await self._recover_action(action)
+                        idle_seconds=float("inf"), helper_digest=artifact.sha256,
+                        **_deletion_kwargs(deletion_authority)):
+                    removed += await self._recover_action(action, deletion_authority=deletion_authority)
+            except ProfileDeletionConflict:
+                raise
             except Exception:
                 blocked += 1
         return inspected, removed, released, blocked
 
-    async def _resolve_unpublished_block(self, key: SandboxKey) -> int:
+    async def _resolve_unpublished_block(self, key: SandboxKey, *,
+                                         deletion_authority: ProfileDeletionAuthority | None = None) -> int:
         """Clear a conflict on a profile with no published generation once its exact ID is proven absent.
 
         Returns 1 while the block stays. The recorded ID settles only when the daemon explicitly reports it absent,
@@ -241,7 +259,7 @@ class SandboxRecoveryMixin:
             # The block names one offender; others of this profile may sit outside any bounded scan batch (or
             # this may be the sweep's path, which scans nothing). A complete fresh listing must show none.
             listing = await self.backend.inventory()
-            if await self._listing_keeps_block(key, listing):
+            if await self._listing_keeps_block(key, listing, deletion_authority=deletion_authority):
                 return 1
             outcome = await self.backend.inspect_id(offending)
             if not self._offender_settled(outcome, offending, listing):
@@ -249,12 +267,15 @@ class SandboxRecoveryMixin:
             daemon, _ = await self.backend.daemon_identity()
         except asyncio.CancelledError:
             raise
+        except ProfileDeletionConflict:
+            raise
         except Exception:
             return 1
         if daemon != key.daemon_id or any(item.daemon_id != daemon for item in listing):
             return 1
         return 0 if await self.store.clear_resolved_inventory_block(
-            key, daemon_id=daemon, offending=offending) else 1
+            key, daemon_id=daemon, offending=offending,
+            **_deletion_kwargs(deletion_authority)) else 1
 
     @staticmethod
     def _offender_settled(outcome: DockerOutcome, offending: str, listing) -> bool:
@@ -268,7 +289,8 @@ class SandboxRecoveryMixin:
         return (outcome.observation is not None and not outcome.observation.running
                 and any(item.container_id == offending for item in listing))
 
-    async def _listing_keeps_block(self, key: SandboxKey, observations) -> bool:
+    async def _listing_keeps_block(self, key: SandboxKey, observations, *,
+                                   deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         """True while a complete, unbatched listing holds a container of this profile that must keep its block.
 
         Every listed container that names the profile, or whose exact ID the ledger records for it, is classified
@@ -284,27 +306,33 @@ class SandboxRecoveryMixin:
             labels = dict(item.labels)
             if item.container_id not in recorded and labels.get("keel.profile") != key.profile_id:
                 continue
-            action = await self.store.classify_inventory(item, owner=self.owner, lease_seconds=self.lease_seconds)
+            action = await self.store.classify_inventory(
+                item, owner=self.owner, lease_seconds=self.lease_seconds,
+                **_deletion_kwargs(deletion_authority))
             if action is None or action.action == "skipped":
                 return True
             if action.action == "blocked" and action.container_id is not None:
                 return True
             if action.action == "remove":
-                await self._recover_action(action)
+                await self._recover_action(action, deletion_authority=deletion_authority)
         return False
 
-    async def _finish_unavailable(self, run_id: str) -> None:
+    async def _finish_unavailable(self, run_id: str, *,
+                                  deletion_authority: ProfileDeletionAuthority | None = None) -> None:
         transition = await self.store.finish_run(
-            run_id, "failed", error_code="sandbox_unavailable", error="The sandbox generation is unavailable.")
+            run_id, "failed", error_code="sandbox_unavailable", error="The sandbox generation is unavailable.",
+            **_deletion_kwargs(deletion_authority))
         if transition is not None and transition.event is not None and self.bus is not None:
             try:
                 await self.bus.notify(run_id)
             except Exception:
                 pass  # persisted terminal evidence remains authoritative if notification fails
 
-    async def _recover_action(self, action: RecoveryAction) -> int:
+    async def _recover_action(self, action: RecoveryAction, *,
+                              deletion_authority: ProfileDeletionAuthority | None = None) -> int:
         if action.action != "remove":
-            await self.store.commit_recovery(action, DockerOutcome("succeeded"))
+            await self.store.commit_recovery(
+                action, DockerOutcome("succeeded"), **_deletion_kwargs(deletion_authority))
             return 0
         # Never replay an uncertain remove. Its exact target is inspected first, and only a new ledger attempt
         # may dispatch a further remove if the old request still has a live result.
@@ -315,10 +343,13 @@ class SandboxRecoveryMixin:
         if outcome.observation is not None:
             observation = outcome.observation
             if observation.container_id != action.container_id or observation.daemon_id != action.key.daemon_id:
-                await self.store.classify_inventory(observation, owner=self.owner, lease_seconds=self.lease_seconds)
+                await self.store.classify_inventory(
+                    observation, owner=self.owner, lease_seconds=self.lease_seconds,
+                    **_deletion_kwargs(deletion_authority))
                 return 0
             classified = await self.store.classify_inventory(
-                observation, owner=self.owner, lease_seconds=self.lease_seconds)
+                observation, owner=self.owner, lease_seconds=self.lease_seconds,
+                **_deletion_kwargs(deletion_authority))
             if classified is not None and classified.action == "blocked":
                 return 0
         elif not confirmed_absent(outcome):
@@ -330,14 +361,16 @@ class SandboxRecoveryMixin:
         if original is None or original.owner_token != action.owner_token:
             return 0
         if not confirmed_absent(outcome) and original.outcome in ("dispatched", "uncertain"):
-            action = await self.store.rearm_recovery_remove(action)
+            action = await self.store.rearm_recovery_remove(
+                action, **_deletion_kwargs(deletion_authority))
             if action is None:
                 return 0
-        if not await self.store.authorize_recovery_remove(action):
+        if not await self.store.authorize_recovery_remove(action, **_deletion_kwargs(deletion_authority)):
             return 0
         attempt = await self.store.get_operation(action.operation_id)
         if confirmed_absent(outcome):
-            return int(await self.store.commit_recovery(action, DockerOutcome("succeeded")))
+            return int(await self.store.commit_recovery(
+                action, DockerOutcome("succeeded"), **_deletion_kwargs(deletion_authority)))
         async def heartbeat():
             while True:
                 await asyncio.sleep(max(0.01, self.lease_seconds / 3))
@@ -362,4 +395,4 @@ class SandboxRecoveryMixin:
             result = DockerOutcome("succeeded")
         elif result.state == "succeeded":
             result = DockerOutcome("uncertain", diagnostic="sandbox_absence_unconfirmed")
-        return int(await self.store.commit_recovery(action, result))
+        return int(await self.store.commit_recovery(action, result, **_deletion_kwargs(deletion_authority)))

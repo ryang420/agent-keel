@@ -24,6 +24,8 @@ from keel.sandbox.records import (
     RunClaim, SandboxBinding,
     SandboxBusy, SandboxLeaseLost, SandboxUncertain, UseHandle,
 )
+from keel.store.deletions import ProfileDeletionAuthority
+from keel.store.base import ProfileDeletionConflict
 from keel.sandbox.recovery import SandboxRecoveryMixin
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION, HelperArtifact, helper_artifact
 from keel.store.sql import SqlStore
@@ -121,13 +123,17 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         return (self._daemon_id is not None and self._artifact is not None and not self._daemon_changed
                 and self._inventory_daemon == self._daemon_id)
 
-    async def retire_profile(self, profile_id: str, *, timeout_seconds: float) -> None:
+    async def retire_profile(self, profile_id: str, *, timeout_seconds: float,
+                             deletion_authority: ProfileDeletionAuthority | None = None) -> None:
         """Retire every sandbox generation of one profile, proving none remains.
 
         Uses the existing recovery planning and exact-ID dispatch. An uncertain
         removal, another daemon or unreleased usage keeps the deletion
         incomplete: nothing is ever removed by name.
         """
+        if deletion_authority is not None:
+            async with self.store.profile_deletion_guard(profile_id, deletion_authority):
+                pass
         keys = await self.store.profile_sandbox_keys(profile_id, deployment=self.deployment)
         if not keys:
             return
@@ -139,7 +145,7 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
             for key in list(keys):
                 if key.daemon_id != self._daemon_id:
                     raise SandboxBusy("the profile's sandbox belongs to another daemon")
-                counts = await self._recover_key(key)
+                counts = await self._recover_key(key, deletion_authority=deletion_authority)
                 # `_recover_key`'s final idle pass only replaces incompatible
                 # generations. A retirement must also remove a ready generation
                 # whose policy still matches, so plan that removal explicitly
@@ -148,9 +154,11 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
                     _, artifact = await self._ready()
                     for action in await self.store.plan_idle_removal(
                             key, owner=self.owner, lease_seconds=self.lease_seconds, idle_seconds=0.0,
-                            helper_digest=artifact.sha256):
-                        await self._recover_action(action)
+                            helper_digest=artifact.sha256, deletion_authority=deletion_authority):
+                        await self._recover_action(action, deletion_authority=deletion_authority)
                         counts = (counts[0], counts[1] + 1, counts[2], counts[3])
+                except ProfileDeletionConflict:
+                    raise
                 except SandboxBusy:
                     raise
                 except Exception:

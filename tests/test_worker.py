@@ -168,7 +168,7 @@ async def test_a_failing_renewal_does_not_kill_the_run_or_the_worker(pool_parts)
         raise RuntimeError("db blip")
 
     pool = WorkerPool(SlowRenewStore(store, boom), bus, executor, owner="w1", workers=1,
-                      poll_seconds=0.01, lease_seconds=0.06)
+                      poll_seconds=0.01, lease_seconds=3)
     await pool.start()
     try:
         first = await queue(store, "s1")

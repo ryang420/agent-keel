@@ -22,7 +22,7 @@ from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
 from keel.store.migrations import migrate
 from keel.store.sandboxes import SandboxStoreMixin
-from keel.store.deletions import ProfileDeletionStoreMixin
+from keel.store.deletions import ProfileDeletionAuthority, ProfileDeletionStoreMixin
 
 _IN_FLIGHT = "('queued', 'running', 'stopping')"
 
@@ -558,13 +558,18 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ? AND profile_id = ?{lock}",
                                       run_id, profile_id)
 
-    async def request_stop(self, profile_id: str, run_id: str) -> RunTransition | None:
+    async def request_stop(self, profile_id: str, run_id: str, *,
+                           deletion_authority: ProfileDeletionAuthority | None = None) -> RunTransition | None:
         """Move a run toward cancellation, committing the queued-run transition and its event together.
 
         A queued run becomes cancelled with its `run.cancelled` event; a running run becomes stopping with no event
         yet; a stopping or terminal run is returned as it is. Exactly one caller can commit the cancellation.
         """
         async with self.db.transaction():
+            if deletion_authority is not None:
+                # Keep the shared advisory/profile guard before the run row lock, matching the store-wide lock order.
+                await self.lock_profile(profile_id)
+                await self._assert_deletion_authority(profile_id, deletion_authority)
             row = await self._locked_run(run_id, profile_id)
             if row is None:
                 return None
@@ -588,7 +593,8 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
     async def finish_run(self, run_id: str, status: str, *, output: str = "", usage: Usage = Usage(),
                          error_code: str | None = None, error: str | None = None,
-                         incomplete: bool = False) -> RunTransition | None:
+                         incomplete: bool = False,
+                         deletion_authority: ProfileDeletionAuthority | None = None) -> RunTransition | None:
         """Finish an active run and insert its terminal event in one transaction.
 
         A missing run returns None. An already-terminal run is returned unchanged with no event, so retrying a
@@ -601,6 +607,12 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         if incomplete and status != "completed":
             raise ValueError("only a completed run can be incomplete")
         async with self.db.transaction():
+            if deletion_authority is not None:
+                profile_id = await self.db.fetchrow("SELECT profile_id FROM runs WHERE id = ?", run_id)
+                if profile_id is None:
+                    return None
+                await self.lock_profile(profile_id["profile_id"])
+                await self._assert_deletion_authority(profile_id["profile_id"], deletion_authority)
             row = await self._locked_run(run_id)
             if row is None:
                 return None

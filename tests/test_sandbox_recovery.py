@@ -1,6 +1,7 @@
 """Restart, orphan and idle recovery through exact container identities (task 9)."""
 
 import asyncio
+import os
 
 import pytest
 
@@ -10,6 +11,7 @@ from keel.sandbox.records import ContainerObservation, DockerOutcome
 from keel.sandbox.recovery import SandboxRecoveryMixin
 from tests.sandbox_support import (FakeDocker, current_container_id, make_claim, queue_run, seed_profile)
 from tests.test_sandbox_coordinator import helper_assets  # shared synthetic helper fixture
+from keel.store import open_store
 
 
 @pytest.fixture
@@ -21,6 +23,43 @@ async def recovery(store, clock, helper_assets):
                                      idle_seconds=10, reap_seconds=1)
     assert await coordinator.open_admission()
     return coordinator, backend, store, clock
+
+
+async def test_owned_remove_authorization_waits_for_competing_short_guard(recovery):
+    coordinator, backend, store, clock = recovery
+    if store.db.dialect != "postgres":
+        pytest.skip("PostgreSQL guard-contention regression")
+    claim = await make_claim(store, "idle")
+    bound = await coordinator.prepare(claim.use)
+    assert await coordinator.release(claim.use)
+    clock.now += 11
+    _, artifact = await coordinator._ready()
+    [action] = await store.plan_idle_removal(
+        claim.use.key, owner=coordinator.owner, lease_seconds=30, idle_seconds=10,
+        helper_digest=artifact.sha256)
+
+    blocker = await open_store(os.environ["KEEL_TEST_POSTGRES_DSN"])
+    reached = asyncio.Event()
+    original = store.authorize_recovery_remove
+
+    async def observed(action, **kwargs):
+        reached.set()
+        return await original(action, **kwargs)
+
+    store.authorize_recovery_remove = observed
+    work = None
+    try:
+        async with blocker.coordination_guard("p1"):
+            work = asyncio.create_task(coordinator._recover_action(action))
+            await asyncio.wait_for(reached.wait(), timeout=3)
+            done, _ = await asyncio.wait([work], timeout=0.1)
+            assert not done, "owned removal was abandoned while its short authorization guard was busy"
+        assert await asyncio.wait_for(work, timeout=3) == 1
+        assert backend.removed_ids == [bound.name]
+    finally:
+        if work is not None:
+            await asyncio.gather(work, return_exceptions=True)
+        await blocker.close()
 
 
 async def test_restart_retired_creates_reverse_arrival_preserves_current_user(recovery):

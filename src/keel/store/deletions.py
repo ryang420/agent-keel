@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 
 from keel.store.base import (
     ProfileDeletionBusy,
@@ -25,6 +26,14 @@ class DeletionRecord:
     phase: str
 
 
+@dataclass(frozen=True)
+class ProfileDeletionAuthority:
+    """The operation and profile incarnation allowed to perform destructive cleanup."""
+
+    operation_id: str
+    expected_incarnation: str | None
+
+
 class ProfileDeletionStoreMixin:
     """Durable fence, progress and completion receipts for one profile deletion."""
 
@@ -39,6 +48,29 @@ class ProfileDeletionStoreMixin:
             await self.db.execute(
                 "SELECT pg_advisory_xact_lock(hashtext('keel.profile'), hashtext(?))",
                 profile_id)
+
+    async def _assert_deletion_authority(self, profile_id: str, authority: ProfileDeletionAuthority,
+                                         *, phases: tuple[str, ...] = ("draining",)) -> None:
+        """Require this operation and exact profile incarnation inside the caller's transaction/guard."""
+        record = await self.db.fetchrow(
+            "SELECT operation_id, phase FROM profile_deletions WHERE profile_id = ?", profile_id)
+        if record is None or record["operation_id"] != authority.operation_id or record["phase"] not in phases:
+            raise ProfileDeletionConflict(profile_id)
+        profile = await self.db.fetchrow("SELECT incarnation FROM profiles WHERE id = ?", profile_id)
+        if authority.expected_incarnation is None:
+            if profile is not None:
+                raise ProfileDeletionConflict(profile_id)
+        elif profile is None or profile["incarnation"] != authority.expected_incarnation:
+            raise ProfileDeletionConflict(profile_id)
+
+    @asynccontextmanager
+    async def profile_deletion_guard(self, profile_id: str, authority: ProfileDeletionAuthority,
+                                    *, phases: tuple[str, ...] = ("draining",)):
+        """Hold the profile authority lock for a short synchronous local state change."""
+        async with self.db.transaction():
+            await self.lock_profile(profile_id)
+            await self._assert_deletion_authority(profile_id, authority, phases=phases)
+            yield
 
     async def begin_profile_deletion(self, profile_id: str, tenant_id: int,
                                      operation_id: str) -> DeletionRecord:

@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 log = logging.getLogger(__name__)
+_ALL_INCARNATIONS = object()
 
 
 class Background:
@@ -14,7 +15,7 @@ class Background:
     def __init__(self, limit: int = 4, close_timeout_s: float = 5.0) -> None:
         self.limit = limit
         self.close_timeout_s = close_timeout_s
-        self._tasks: dict[asyncio.Task, str | None] = {}
+        self._tasks: dict[asyncio.Task, tuple[str | None, str | None]] = {}
         self._blocked: dict[str, tuple[str | None, str | None]] = {}
 
     def block_profile(self, profile_id: str, operation_id: str | None = None,
@@ -46,17 +47,20 @@ class Background:
             log.warning("background task %s dropped: %d already running", name, self.limit)
             return False
         task = asyncio.create_task(self._run(coro), name=name)
-        self._tasks[task] = profile_id
+        self._tasks[task] = (profile_id, profile_incarnation)
         task.add_done_callback(self._tasks.pop)
         return True
 
-    def profile_tasks(self, profile_id: str) -> list[asyncio.Task]:
-        return [task for task, owner in self._tasks.items()
-                if owner == profile_id and not task.done()]
+    def profile_tasks(self, profile_id: str, *, profile_incarnation=_ALL_INCARNATIONS) -> list[asyncio.Task]:
+        return [task for task, (owner, incarnation) in self._tasks.items()
+                if owner == profile_id and not task.done()
+                and (profile_incarnation is _ALL_INCARNATIONS or incarnation is None
+                     or incarnation == profile_incarnation)]
 
-    async def drain_profile(self, profile_id: str, *, timeout: float) -> bool:
+    async def drain_profile(self, profile_id: str, *, timeout: float,
+                            profile_incarnation=_ALL_INCARNATIONS) -> bool:
         """Cancel and await this profile's background work; False if any task outlives `timeout`."""
-        tasks = self.profile_tasks(profile_id)
+        tasks = self.profile_tasks(profile_id, profile_incarnation=profile_incarnation)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -64,7 +68,7 @@ class Background:
             if pending:
                 log.warning("profile %s still has %d background tasks after drain", profile_id, len(pending))
                 return False
-        return not self.profile_tasks(profile_id)
+        return not self.profile_tasks(profile_id, profile_incarnation=profile_incarnation)
 
     async def _run(self, coro) -> None:
         try:

@@ -22,6 +22,7 @@ import time
 
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import ProfileDeletionConflict
+from keel.store.deletions import ProfileDeletionAuthority
 
 log = logging.getLogger(__name__)
 
@@ -56,17 +57,21 @@ class ProfileDeletionService:
         record = await self.store.begin_profile_deletion(profile_id, tenant_id, operation_id)
         if record.phase == "complete":
             return
+        authority = ProfileDeletionAuthority(
+            operation_id=record.operation_id,
+            expected_incarnation=profile.incarnation if profile is not None else None)
         # Block new background work before draining: a run that just committed
         # its terminal state must not spawn a review behind the drain's back.
         if self.background is not None and not (profile is None and record.phase == "purged"):
-            self.background.block_profile(profile_id, operation_id,
-                                          profile.incarnation if profile is not None else None)
+            async with self.store.profile_deletion_guard(
+                    profile_id, authority, phases=("blocked", "draining")):
+                self.background.block_profile(profile_id, operation_id, authority.expected_incarnation)
         if record.phase == "blocked":
             record = await self._advance(record, "draining")
         if record.phase == "draining":
-            await self._drain(profile_id, deadline)
-            await self._drain_background(profile_id, deadline)
-            await self._retire(profile_id, deadline)
+            await self._drain(profile_id, deadline, authority)
+            await self._drain_background(profile_id, deadline, authority)
+            await self._retire(profile_id, deadline, authority)
             # This commits phase `purged` only with the deletes themselves.
             await self.store.purge_profile_data(record)
 
@@ -86,7 +91,7 @@ class ProfileDeletionService:
         if self.background is not None:
             self.background.unblock_profile(profile_id, operation_id)
 
-    async def _drain(self, profile_id: str, deadline: float) -> None:
+    async def _drain(self, profile_id: str, deadline: float, authority: ProfileDeletionAuthority) -> None:
         """Cancel queued runs and wait for active workers to end their runs."""
         notified: set[tuple[str, str]] = set()
         while True:
@@ -94,7 +99,8 @@ class ProfileDeletionService:
             if not active:
                 return
             for run in active:
-                transition = await self.store.request_stop(profile_id, run.id)
+                transition = await self.store.request_stop(
+                    profile_id, run.id, deletion_authority=authority)
                 if transition is None:
                     continue
                 key = (run.id, transition.run.status)
@@ -107,29 +113,34 @@ class ProfileDeletionService:
                 raise ProfileDeletionBusyError(profile_id)
             await asyncio.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
 
-    async def _drain_background(self, profile_id: str, deadline: float) -> None:
+    async def _drain_background(self, profile_id: str, deadline: float,
+                                authority: ProfileDeletionAuthority) -> None:
         """Cancel and await this profile's reviews and titles before purging its rows."""
         if self.background is None:
             return
         try:
             drained = await self.background.drain_profile(
-                profile_id, timeout=max(0.0, deadline - time.monotonic()))
+                profile_id, timeout=max(0.0, deadline - time.monotonic()),
+                profile_incarnation=authority.expected_incarnation)
         except Exception as exc:
             log.warning("draining profile background work failed profile=%s", profile_id, exc_info=True)
             raise ProfileDeletionUnavailableError(profile_id) from exc
         if not drained:
             raise ProfileDeletionBusyError(profile_id)
 
-    async def _retire(self, profile_id: str, deadline: float) -> None:
+    async def _retire(self, profile_id: str, deadline: float, authority: ProfileDeletionAuthority) -> None:
         """Retire every sandbox generation, or keep the deletion incomplete."""
         if self.coordinator is None:
             return
         remaining = max(0.0, deadline - time.monotonic())
         try:
-            await self.coordinator.retire_profile(profile_id, timeout_seconds=remaining)
+            await self.coordinator.retire_profile(
+                profile_id, timeout_seconds=remaining, deletion_authority=authority)
         except SandboxBusy as exc:
             raise ProfileDeletionBusyError(profile_id) from exc
         except ProfileDeletionBusyError:
+            raise
+        except ProfileDeletionConflict:
             raise
         except Exception as exc:  # a broken dependency is retryable, never success
             log.warning("retiring profile sandboxes failed profile=%s", profile_id, exc_info=True)
