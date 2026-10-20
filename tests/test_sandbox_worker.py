@@ -211,6 +211,19 @@ async def test_a_stop_during_a_file_or_skill_helper_cancels_through_its_register
 async def test_repeated_worker_cancellation_keeps_renewing_until_executor_cleanup_returns(rig):
     rig.provider.script = [[call("c1", command="echo one"), Completed(Usage(1, 1, 0, 0))], answer("done")]
     entered, gate = hold(rig.store, "release_usage")
+    renewed = asyncio.Event()
+    renewal_count = 0
+    renew_usage = rig.coordinator.renew_usage
+
+    async def observed_renewal(use):
+        nonlocal renewal_count
+        stamp = await renew_usage(use)
+        if stamp is not None:
+            renewal_count += 1
+            renewed.set()
+        return stamp
+
+    rig.coordinator.renew_usage = observed_renewal
     pool = rig.pool()
     await pool.start()
     try:
@@ -219,8 +232,11 @@ async def test_repeated_worker_cancellation_keeps_renewing_until_executor_cleanu
         [worker] = [task for task in pool._tasks if task.get_name() == "keel-worker-0"]
         usage = await rig.store.get_run_usage(run.id)
         for _ in range(3):
+            before = renewal_count
             worker.cancel()
-            await asyncio.sleep(LEASE / 2)
+            while renewal_count <= before:
+                renewed.clear()
+                await asyncio.wait_for(renewed.wait(), 5)
         assert not worker.done()
         later = await rig.store.get_usage(usage.id)
         assert later.state == "cleaning" and later.lease_expires_at > usage.lease_expires_at

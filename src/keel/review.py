@@ -32,6 +32,12 @@ async def run_review(executor, run) -> None:
 
 
 async def _review(executor, run) -> None:
+    if run.profile_incarnation is None:
+        return
+    profile = await executor.store.get_profile(run.profile_id)
+    if profile is None or (run.profile_incarnation is not None
+                           and profile.incarnation != run.profile_incarnation):
+        return
     session = await executor.store.get_session(run.profile_id, run.session_id)
     if session is None or not session.system_prompt:
         return
@@ -42,7 +48,8 @@ async def _review(executor, run) -> None:
     messages = await executor._with_images([item.message for item in items], {},
                                            profile_id=run.profile_id, session_id=run.session_id)
     messages.append(Message("user", (TextPart(prompts.text("memory_review")),)))
-    ctx = ToolContext(store=executor.store, profile_id=run.profile_id, session_id=run.session_id,
+    ctx = ToolContext(store=executor.store, profile_id=run.profile_id,
+                      profile_incarnation=run.profile_incarnation, session_id=run.session_id,
                       memory_chars=executor.memory_chars, user_chars=executor.user_chars)
     tools = prompts.tool_definitions(("memory",))
     for _ in range(REVIEW_ITERATIONS):

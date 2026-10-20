@@ -24,6 +24,8 @@ from keel.sandbox.records import (
     RunClaim, SandboxBinding,
     SandboxBusy, SandboxLeaseLost, SandboxUncertain, UseHandle,
 )
+from keel.store.deletions import ProfileDeletionAuthority
+from keel.store.base import ProfileDeletionConflict
 from keel.sandbox.recovery import SandboxRecoveryMixin
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION, HelperArtifact, helper_artifact
 from keel.store.sql import SqlStore
@@ -120,6 +122,59 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         """True once sandbox admission is open for the initialized daemon (no Docker call)."""
         return (self._daemon_id is not None and self._artifact is not None and not self._daemon_changed
                 and self._inventory_daemon == self._daemon_id)
+
+    async def retire_profile(self, profile_id: str, *, timeout_seconds: float,
+                             deletion_authority: ProfileDeletionAuthority | None = None) -> None:
+        """Retire every sandbox generation of one profile, proving none remains.
+
+        Uses the existing recovery planning and exact-ID dispatch. An uncertain
+        removal, another daemon or unreleased usage keeps the deletion
+        incomplete: nothing is ever removed by name.
+        """
+        if deletion_authority is not None:
+            async with self.store.profile_deletion_guard(profile_id, deletion_authority):
+                pass
+        keys = await self.store.profile_sandbox_keys(profile_id, deployment=self.deployment)
+        if not keys:
+            return
+        await self._ready()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout_seconds))
+        while keys:
+            progressed = False
+            for key in list(keys):
+                if key.daemon_id != self._daemon_id:
+                    raise SandboxBusy("the profile's sandbox belongs to another daemon")
+                counts = await self._recover_key(key, deletion_authority=deletion_authority)
+                # `_recover_key`'s final idle pass only replaces incompatible
+                # generations. A retirement must also remove a ready generation
+                # whose policy still matches, so plan that removal explicitly
+                # with a zero idle threshold.
+                try:
+                    _, artifact = await self._ready()
+                    for action in await self.store.plan_idle_removal(
+                            key, owner=self.owner, lease_seconds=self.lease_seconds, idle_seconds=0.0,
+                            helper_digest=artifact.sha256, deletion_authority=deletion_authority):
+                        await self._recover_action(action, deletion_authority=deletion_authority)
+                        counts = (counts[0], counts[1] + 1, counts[2], counts[3])
+                except ProfileDeletionConflict:
+                    raise
+                except SandboxBusy:
+                    raise
+                except Exception:
+                    pass  # the next pass retries; a bounded wait decides the outcome
+                row, usages = await self.store.recovery_snapshot(key)
+                if (row is None or row["state"] == "absent") and not any(
+                        use.state != "released" for use in usages):
+                    keys.remove(key)
+                elif sum(counts) > 0:
+                    progressed = True
+            if not keys:
+                return
+            if loop.time() >= deadline:
+                raise SandboxBusy("the profile's sandbox is not quiescent")
+            if not progressed:
+                await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
 
     async def open_admission(self) -> bool:
         """Initialize, then run bounded recovery passes until the whole inventory has been classified.

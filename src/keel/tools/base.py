@@ -62,6 +62,7 @@ class ToolContext:
     on_exec: Callable[[str | None], Awaitable[None]] | None = None
     store: object | None = None
     profile_id: str = ""
+    profile_incarnation: str | None = None
     session_id: str = ""
     memory_chars: int = 2200
     user_chars: int = 1375

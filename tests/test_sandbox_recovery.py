@@ -1,14 +1,17 @@
 """Restart, orphan and idle recovery through exact container identities (task 9)."""
 
 import asyncio
+import os
 
 import pytest
 
+from keel.deletion import ProfileDeletionService
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.sandbox.records import ContainerObservation, DockerOutcome
 from keel.sandbox.recovery import SandboxRecoveryMixin
 from tests.sandbox_support import (FakeDocker, current_container_id, make_claim, queue_run, seed_profile)
 from tests.test_sandbox_coordinator import helper_assets  # shared synthetic helper fixture
+from keel.store import open_store
 
 
 @pytest.fixture
@@ -20,6 +23,43 @@ async def recovery(store, clock, helper_assets):
                                      idle_seconds=10, reap_seconds=1)
     assert await coordinator.open_admission()
     return coordinator, backend, store, clock
+
+
+async def test_owned_remove_authorization_waits_for_competing_short_guard(recovery):
+    coordinator, backend, store, clock = recovery
+    if store.db.dialect != "postgres":
+        pytest.skip("PostgreSQL guard-contention regression")
+    claim = await make_claim(store, "idle")
+    bound = await coordinator.prepare(claim.use)
+    assert await coordinator.release(claim.use)
+    clock.now += 11
+    _, artifact = await coordinator._ready()
+    [action] = await store.plan_idle_removal(
+        claim.use.key, owner=coordinator.owner, lease_seconds=30, idle_seconds=10,
+        helper_digest=artifact.sha256)
+
+    blocker = await open_store(os.environ["KEEL_TEST_POSTGRES_DSN"])
+    reached = asyncio.Event()
+    original = store.authorize_recovery_remove
+
+    async def observed(action, **kwargs):
+        reached.set()
+        return await original(action, **kwargs)
+
+    store.authorize_recovery_remove = observed
+    work = None
+    try:
+        async with blocker.coordination_guard("p1"):
+            work = asyncio.create_task(coordinator._recover_action(action))
+            await asyncio.wait_for(reached.wait(), timeout=3)
+            done, _ = await asyncio.wait([work], timeout=0.1)
+            assert not done, "owned removal was abandoned while its short authorization guard was busy"
+        assert await asyncio.wait_for(work, timeout=3) == 1
+        assert backend.removed_ids == [bound.name]
+    finally:
+        if work is not None:
+            await asyncio.gather(work, return_exceptions=True)
+        await blocker.close()
 
 
 async def test_restart_retired_creates_reverse_arrival_preserves_current_user(recovery):
@@ -801,6 +841,32 @@ async def test_a_block_stays_while_a_recorded_container_of_the_profile_still_con
     claim = await coordinator.claim()
     assert claim is not None and claim.run.session_id == "waits"
 
+
+async def test_profile_deletion_purges_resolved_sandbox_evidence(recovery):
+    coordinator, backend, store, _ = recovery
+    target = await make_claim(store, "gone")
+    target_container = (await coordinator.prepare(target.use)).binding.container_id
+    await store.finish_run(target.run.id, "completed", output="ok")
+    assert await coordinator.release(target.use)
+
+    kept = await make_claim(store, "kept", profile_id="p2")
+    kept_container = (await coordinator.prepare(kept.use)).binding.container_id
+    await store.finish_run(kept.run.id, "completed", output="ok")
+    assert await coordinator.release(kept.use)
+    assert target_container != kept_container
+
+    service = ProfileDeletionService(store, coordinator=coordinator)
+    await service.delete("p1", 1, "11111111-1111-4111-8111-111111111111", timeout_seconds=10)
+    await service.complete("p1", 1, "11111111-1111-4111-8111-111111111111")
+
+    for table in ("sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"):
+        assert await store.db.fetchrow(
+            f"SELECT 1 AS present FROM {table} WHERE profile_id = 'p1'") is None, table
+    # Another profile's lifecycle evidence survives the reset.
+    assert await store.db.fetchrow("SELECT 1 AS present FROM sandboxes WHERE profile_id = 'p2'") is not None
+    assert await store.db.fetchrow(
+        "SELECT 1 AS present FROM sandbox_operations WHERE profile_id = 'p2'") is not None
+    assert await current_container_id(store, kept.use.key) == kept_container
 
 async def test_a_published_clear_is_bound_to_the_recorded_offender(recovery):
     coordinator, backend, store, _ = recovery

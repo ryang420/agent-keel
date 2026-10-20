@@ -206,10 +206,12 @@ async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_
         stamped = await store.db.fetch("SELECT version FROM schema_version")
         assert [row["version"] for row in stamped] == [LATEST_VERSION]
         assert (await store.get_profile("p1")).soul == "You help."
+        assert (await store.get_profile("p1")).incarnation
         session = await store.get_session("p1", "s1")
         assert (session.title, session.title_source, session.system_prompt) == ("Old chat", "derived", "sys")
         assert [stored.message.text for stored in await store.messages("s1")] == ["hello"]
         assert (await store.get_run_by_id("run_1")).status == "completed"
+        assert (await store.get_run_by_id("run_1")).profile_incarnation == (await store.get_profile("p1")).incarnation
         assert [event.type for event in await store.events_after("run_1", 0)] == ["run.completed"]
         upgraded = await schema_shape(store.db)
     finally:
@@ -431,6 +433,8 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
+    await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
     # SQLite refuses DROP COLUMN while profiles_tenant still indexes tenant_id.
     await store.db.execute("DROP INDEX IF EXISTS profiles_tenant")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN tenant_id")
@@ -465,12 +469,35 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
         await upgraded.close()
 
 
+async def test_open_backfills_v7_incarnation_tokens_for_existing_profiles_and_runs(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'backfill.sqlite3'}"
+    store = await open_store(db_url)
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="old", skills=[], tenant_id=1)
+    await store.ensure_session("p1", "s1")
+    run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                 reasoning_effort=None, input_parts=[], instructions=None)
+    await store.db.execute("UPDATE profiles SET incarnation = NULL WHERE id = ?", "p1")
+    await store.db.execute("UPDATE runs SET profile_incarnation = NULL WHERE id = ?", run.id)
+    await store.close()
+
+    upgraded = await open_store(db_url)
+    try:
+        profile = await upgraded.get_profile("p1")
+        saved_run = await upgraded.get_run_by_id(run.id)
+        assert profile.incarnation
+        assert saved_run.profile_incarnation == profile.incarnation
+    finally:
+        await upgraded.close()
+
+
 async def test_a_v4_database_gains_the_coordination_tables(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept-v4", skills=[])
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
+    await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
     await store.close()
 
     upgraded = await open_store(db_url)

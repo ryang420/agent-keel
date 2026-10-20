@@ -16,11 +16,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from keel.config import tenant_id_for
+from keel.deletion import (
+    ProfileDeletionBusyError, ProfileDeletionService, ProfileDeletionUnavailableError,
+)
 from keel.models import part_to_dict, ImagePart, TextPart
 from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict, profile_mount_root
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
-    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileTenantMismatch, SessionBusy, SessionNotFound, TitleInUse,
+    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileTenantMismatch,
+    SessionBusy, SessionNotFound, TitleInUse,
 )
 from keel.titles import sanitize_title
 from keel.verify import VerifyError, verify_model
@@ -46,6 +50,7 @@ class Keel:
     max_running: int
     sandbox_mount_root: str | None = None
     background: object = None
+    coordinator: object = None
 
 
 class ApiError(Exception):
@@ -159,6 +164,40 @@ def _input_parts(body: dict) -> list[dict]:
     return out
 
 
+def _operation_id(value: str) -> str:
+    """A profile-deletion operation is a UUID, validated before any mutation."""
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ApiError(400, "invalid_input", "operation_id must be a UUID.") from exc
+
+
+async def _delete_profile(request: Request, profile_id: str):
+    """Shared DELETE body: validate id and ownership, then run the resumable deletion."""
+    body = await _json_body(request)
+    operation_id = _operation_id(body.get("operation_id"))
+    _check_id(profile_id, "profile")
+    keel = request.app.state.keel
+    profile = await keel.store.get_profile(profile_id)
+    if profile is not None and profile.tenant_id != request.state.tenant_id:
+        raise ApiError(404, "profile_not_found", "No such profile.")
+    service = ProfileDeletionService(keel.store, coordinator=keel.coordinator, bus=keel.bus,
+                                     background=keel.background)
+    try:
+        await service.delete(profile_id, request.state.tenant_id, operation_id)
+    except ProfileDeletionBusyError as exc:
+        raise ApiError(409, "profile_deletion_busy", "Work is still draining; retry the same operation.") from exc
+    except ProfileDeletionBusy as exc:
+        raise ApiError(409, "profile_deletion_busy", "This profile is being deleted.") from exc
+    except ProfileDeletionConflict as exc:
+        raise ApiError(409, "profile_deletion_conflict", "Another deletion owns this profile.") from exc
+    except ProfileDeletionUnavailableError as exc:
+        raise ApiError(503, "unavailable", "Profile cleanup is temporarily unavailable.") from exc
+    except ProfileTenantMismatch as exc:
+        raise ApiError(404, "profile_not_found", "No such profile.") from exc
+    return {"deleted": True, "blocked": True}
+
+
 def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
     """Build the HTTP application with authentication, error handlers and all API routes.
 
@@ -183,6 +222,11 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         """Return an explicitly raised API error in the standard JSON envelope."""
         return _error(exc.status, exc.code, exc.message)
 
+    @app.exception_handler(ProfileDeletionBusy)
+    async def deletion_busy(_request: Request, _exc: ProfileDeletionBusy):
+        """A fenced profile refuses every profile-owned write with a retryable 409."""
+        return _error(409, "profile_deletion_busy", "This profile is being deleted.")
+
     @app.exception_handler(Exception)
     async def unexpected_error(_request: Request, exc: Exception):
         """Log an unexpected exception and return a generic 500 without exposing its details."""
@@ -200,6 +244,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                 return _error(401, "unauthorized", "A valid service key is required.")
             request.state.tenant_id = tenant_id
         return await call_next(request)
+
 
     @app.get("/healthz")
     async def healthz(request: Request):
@@ -239,6 +284,9 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         """
         profile = await k(request).store.get_profile(_check_id(profile_id, "profile"))
         if profile is None or profile.tenant_id != request.state.tenant_id:
+            record = await k(request).store.get_profile_deletion(profile_id)
+            if record is not None and record.tenant_id == request.state.tenant_id:
+                raise ApiError(409, "profile_deletion_busy", "This profile is being deleted.")
             raise ApiError(404, "profile_not_found", "No such profile.")
         return profile
 
@@ -474,6 +522,37 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
         return StreamingResponse(frames(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    @app.delete("/v1/profiles/{profile_id}")
+    async def delete_profile(request: Request, profile_id: str):
+        """Fence, drain, retire and purge one profile; the fence remains until completion.
+
+        Repeating the request with the same operation id resumes it. A profile
+        that was never prepared is fenced and succeeds once no runtime
+        resources exist. Success means the profile can no longer be written;
+        the consumer must call the completion endpoint when its own data is gone.
+        """
+        return await _delete_profile(request, profile_id)
+
+    @app.post("/v1/profiles/{profile_id}/deletion/{operation_id}/complete")
+    async def complete_profile_deletion(request: Request, profile_id: str, operation_id: str):
+        """Release this exact operation's fence; idempotent for a lost-response retry."""
+        _check_id(profile_id, "profile")
+        operation_id = _operation_id(operation_id)
+        profile = await k(request).store.get_profile(profile_id)
+        if profile is not None and profile.tenant_id != request.state.tenant_id:
+            raise ApiError(404, "profile_not_found", "No such profile.")
+        service = ProfileDeletionService(
+            k(request).store, coordinator=k(request).coordinator, bus=k(request).bus,
+            background=k(request).background)
+        try:
+            await service.complete(profile_id, request.state.tenant_id, operation_id)
+        except ProfileDeletionConflict as exc:
+            raise ApiError(409, "profile_deletion_conflict",
+                           "This operation does not own the profile's deletion.") from exc
+        except ProfileTenantMismatch as exc:
+            raise ApiError(404, "profile_not_found", "No such profile.") from exc
+        return {"completed": True}
 
     @app.get("/v1/profiles/{profile_id}/sessions")
     async def list_sessions(request: Request, profile_id: str, limit: int = 100):

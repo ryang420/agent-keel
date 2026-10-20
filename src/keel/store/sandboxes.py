@@ -23,6 +23,7 @@ from keel.sandbox.records import (
 )
 from keel.sandbox.runtime import HELPER_PROTOCOL_VERSION
 from keel.store.base import Run, UniqueViolation
+from keel.store.deletions import ProfileDeletionAuthority
 
 _PREPARATION_KINDS = ("create", "install", "start")
 _RENEWABLE_USAGE_STATES = ("preparing", "active", "cleaning")
@@ -194,6 +195,16 @@ class SandboxStoreMixin:
         """
         async with self.db.transaction():
             if self.db.dialect == "postgres":
+                if skip_locked:
+                    locked = await self.db.fetchrow(
+                        "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
+                        profile_id)
+                    if not locked["locked"]:
+                        yield False
+                        return
+                else:
+                    await self.lock_profile(profile_id)
+            if self.db.dialect == "postgres":
                 lock = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
                 row = await self.db.fetchrow(f"SELECT id FROM profiles WHERE id = ?{lock}", profile_id)
             else:
@@ -214,6 +225,15 @@ class SandboxStoreMixin:
         """
         async with self.db.transaction():
             if self.db.dialect == "postgres":
+                if skip_locked:
+                    locked = await self.db.fetchrow(
+                        "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
+                        profile_id)
+                    if not locked["locked"]:
+                        yield False
+                        return
+                else:
+                    await self.lock_profile(profile_id)
                 suffix = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
                 row = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?" + suffix, profile_id)
                 if row is None and skip_locked:
@@ -265,6 +285,10 @@ class SandboxStoreMixin:
             candidates = await self.db.fetch(
                 "SELECT id, profile_id FROM runs WHERE status = 'queued' ORDER BY created_at, id")
             for candidate in candidates:
+                if await self.db.fetchrow(
+                        "SELECT 1 AS fenced FROM profile_deletions WHERE profile_id = ? LIMIT 1",
+                        candidate["profile_id"]):
+                    continue
                 async with self.profile_guard(candidate["profile_id"], skip_locked=True) as available:
                     if not available:
                         continue
@@ -1142,7 +1166,8 @@ class SandboxStoreMixin:
     # recovery planning and commit
 
     async def plan_recovery(self, key: SandboxKey, *, owner: str,
-                            lease_seconds: float) -> list[RecoveryAction]:
+                            lease_seconds: float,
+                            deletion_authority: ProfileDeletionAuthority | None = None) -> list[RecoveryAction]:
         """One guarded recovery pass; returns work for external dispatch and commit.
 
         Mutations: expired unreleased usages become `orphaned` and a matching `ready`/`creating` generation moves to
@@ -1153,9 +1178,11 @@ class SandboxStoreMixin:
         are dispatched and committed externally through `commit_recovery`. The guard and locks work after the
         profile row was deleted.
         """
-        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+        async with self.coordination_guard(key.profile_id, skip_locked=deletion_authority is None) as available:
             if not available:
                 return []
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox_row = await self._lock_sandbox(key, lock)
@@ -1332,22 +1359,26 @@ class SandboxStoreMixin:
         return (sandbox_row["generation"] != usage["generation"]
                 or sandbox_row["generation_token"] != usage["generation_token"])
 
-    async def commit_recovery(self, action: RecoveryAction, outcome: DockerOutcome) -> bool:
+    async def commit_recovery(self, action: RecoveryAction, outcome: DockerOutcome, *,
+                              deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         """Apply one planned recovery action.
 
         Removal records its inline outcome under the action's owner token and exact target; retirement and orphan
         release rerun their guarded predicates. Stale or duplicate actions change nothing and return False.
         """
         if action.action == "remove":
-            return await self._commit_remove(action, outcome)
+            return await self._commit_remove(action, outcome, deletion_authority=deletion_authority)
         if action.action == "retire_unbound":
-            return await self._commit_retire_unbound(action)
+            return await self._commit_retire_unbound(action, deletion_authority=deletion_authority)
         if action.action == "release_orphan":
-            return await self._commit_release_orphan(action)
+            return await self._commit_release_orphan(action, deletion_authority=deletion_authority)
         return False
 
-    async def _commit_remove(self, action: RecoveryAction, outcome: DockerOutcome) -> bool:
+    async def _commit_remove(self, action: RecoveryAction, outcome: DockerOutcome, *,
+                             deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         async with self.coordination_guard(action.key.profile_id):
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(action.key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox_row = await self._lock_sandbox(action.key, lock)
@@ -1422,8 +1453,11 @@ class SandboxStoreMixin:
                 "AND generation_token = ?",
                 now, action.key.deployment, action.key.profile_id, action.generation, action.generation_token)
 
-    async def _commit_retire_unbound(self, action: RecoveryAction) -> bool:
+    async def _commit_retire_unbound(self, action: RecoveryAction, *,
+                                    deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         async with self.coordination_guard(action.key.profile_id):
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(action.key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox_row = await self._lock_sandbox(action.key, lock)
@@ -1437,8 +1471,11 @@ class SandboxStoreMixin:
             return await self._retire_unbound_rows(
                 use, usage, sandbox_row, operations, usages, execs, now, False)
 
-    async def _commit_release_orphan(self, action: RecoveryAction) -> bool:
+    async def _commit_release_orphan(self, action: RecoveryAction, *,
+                                    deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         async with self.coordination_guard(action.key.profile_id):
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(action.key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox_row = await self._lock_sandbox(action.key, lock)
@@ -1494,6 +1531,13 @@ class SandboxStoreMixin:
         row = await self.db.fetchrow("SELECT * FROM sandbox_uses WHERE run_id = ?", run_id)
         return _usage(row) if row is not None else None
 
+    async def profile_sandbox_keys(self, profile_id: str, *, deployment: str) -> list[SandboxKey]:
+        """Every coordination identity recorded for one profile on this deployment."""
+        rows = await self.db.fetch(
+            "SELECT daemon_id FROM sandboxes WHERE deployment = ? AND profile_id = ? ORDER BY daemon_id, profile_id",
+            deployment, profile_id)
+        return [SandboxKey(deployment, profile_id, row["daemon_id"]) for row in rows]
+
     async def recovery_snapshot(self, key: SandboxKey) -> tuple[dict | None, list[SandboxUsage]]:
         """Observation only; all decisions re-read these identities under the guard."""
         row = await self.db.fetchrow(
@@ -1515,7 +1559,9 @@ class SandboxStoreMixin:
         return row["n"], max(0.0, now - row["oldest"]) if row["oldest"] is not None else None
 
     async def classify_inventory(self, observation: ContainerObservation, *, owner: str,
-                                 lease_seconds: float) -> RecoveryAction | None:
+                                 lease_seconds: float,
+                                 deletion_authority: ProfileDeletionAuthority | None = None
+                                 ) -> RecoveryAction | None:
         """Classify under the guard; only a fully matched retired attempt permits quarantine removal."""
         labels = dict(observation.labels)
         deployment, profile = labels.get("keel.deployment"), labels.get("keel.profile")
@@ -1533,10 +1579,12 @@ class SandboxStoreMixin:
         else:
             return None
         profile = key.profile_id
-        async with self.coordination_guard(profile, skip_locked=True) as available:
+        async with self.coordination_guard(profile, skip_locked=deletion_authority is None) as available:
             if not available:
                 # Another instance holds the profile: nothing was classified, so an inventory cycle stays open.
                 return RecoveryAction(key, "skipped", container_id=observation.container_id)
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(profile, deletion_authority)
             lock = self._lock_suffix()
             now = await self.coordination_now()
             sandbox = await self._lock_sandbox(key, lock)
@@ -1693,16 +1741,19 @@ class SandboxStoreMixin:
         return row["error_message"]
 
     async def clear_resolved_inventory_block(self, key: SandboxKey, *, daemon_id: str,
-                                             offending: str | None = None) -> bool:
+                                             offending: str | None = None,
+                                             deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         """Clear an admission block after the caller proves the recorded conflicting container absent.
 
         The exact-ID absence evidence must come from this same daemon. A profile still draining for another
         reason (expired, preparing, cleaning or orphaned usage, unresolved execution or current operation) keeps
         its state and loses only the conflict evidence, so this never reopens admission on a draining generation.
         """
-        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+        async with self.coordination_guard(key.profile_id, skip_locked=deletion_authority is None) as available:
             if not available:
                 return False
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             sandbox = await self._lock_sandbox(key, lock)
             if (sandbox is not None and sandbox["container_id"] is None and offending is not None
@@ -1769,11 +1820,14 @@ class SandboxStoreMixin:
             now, key.deployment, key.profile_id, daemon_id, sandbox["error_message"])
         return cleared is not None
 
-    async def confirm_generation_missing(self, key: SandboxKey, container_id: str) -> bool:
+    async def confirm_generation_missing(self, key: SandboxKey, container_id: str, *,
+                                         deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         """Revoke users only after the caller has authoritative exact-ID absence evidence."""
-        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+        async with self.coordination_guard(key.profile_id, skip_locked=deletion_authority is None) as available:
             if not available:
                 return False
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(key.profile_id, deletion_authority)
             sandbox = await self._lock_sandbox(key, self._lock_suffix())
             if sandbox is None or sandbox["daemon_id"] != key.daemon_id or sandbox["container_id"] != container_id:
                 return False
@@ -1791,11 +1845,15 @@ class SandboxStoreMixin:
             return True
 
     async def plan_idle_removal(self, key: SandboxKey, *, owner: str, lease_seconds: float,
-                                idle_seconds: float, helper_digest: str) -> list[RecoveryAction]:
+                                idle_seconds: float, helper_digest: str,
+                                deletion_authority: ProfileDeletionAuthority | None = None
+                                ) -> list[RecoveryAction]:
         """Remove expired idle or incompatible ready generations, after every valid user finishes."""
-        async with self.coordination_guard(key.profile_id, skip_locked=True) as available:
+        async with self.coordination_guard(key.profile_id, skip_locked=deletion_authority is None) as available:
             if not available:
                 return []
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             sandbox = await self._lock_sandbox(key, lock)
             operations = await self._lock_operations(key, lock)
@@ -1821,11 +1879,15 @@ class SandboxStoreMixin:
             action = await self._plan_remove(key, owner, lease_seconds, sandbox, operations, usages, execs, now)
             return [action] if action is not None else []
 
-    async def rearm_recovery_remove(self, action: RecoveryAction) -> RecoveryAction | None:
+    async def rearm_recovery_remove(self, action: RecoveryAction, *,
+                                    deletion_authority: ProfileDeletionAuthority | None = None
+                                    ) -> RecoveryAction | None:
         """After observing a still-present target, retire the old dispatch before a fresh remove intent."""
-        async with self.coordination_guard(action.key.profile_id, skip_locked=True) as available:
+        async with self.coordination_guard(action.key.profile_id, skip_locked=deletion_authority is None) as available:
             if not available:
                 return None
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(action.key.profile_id, deletion_authority)
             lock = self._lock_suffix()
             sandbox = await self._lock_sandbox(action.key, lock)
             operations = await self._lock_operations(action.key, lock)
@@ -1860,11 +1922,17 @@ class SandboxStoreMixin:
                                   container_id=action.container_id, generation=action.generation,
                                   generation_token=action.generation_token, owner_token=token, reason=action.reason)
 
-    async def authorize_recovery_remove(self, action: RecoveryAction) -> bool:
+    async def authorize_recovery_remove(self, action: RecoveryAction, *,
+                                        deletion_authority: ProfileDeletionAuthority | None = None) -> bool:
         """Recheck exact-target bindings immediately before dispatch under the same admission guard."""
-        async with self.coordination_guard(action.key.profile_id, skip_locked=True) as available:
+        # This is an already-owned exact-ID removal, so wait for the short guard rather than dropping
+        # authorization on transient contention. Discovery and claim paths remain nonblocking.
+        async with self.coordination_guard(action.key.profile_id) as available:
             if not available:
                 return False
+            if deletion_authority is not None:
+                await self._assert_deletion_authority(
+                    action.key.profile_id, deletion_authority)
             sandbox = await self._lock_sandbox(action.key, self._lock_suffix())
             if sandbox is not None and (sandbox["daemon_id"] != action.key.daemon_id
                                         or sandbox["error_code"] in _INVENTORY_BLOCK_CODES):

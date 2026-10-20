@@ -62,6 +62,8 @@ jobs:
           tests/test_sandbox_worker.py tests/test_coordinated_tools.py tests/test_service.py
           tests/test_docker_operations.py tests/test_api.py tests/test_agent_loop.py tests/test_models_verify.py
           tests/test_long_session.py tests/test_store_import.py tests/test_admin_import.py tests/test_review.py
+          tests/test_profile_deletion_store.py tests/test_profile_deletion_runtime.py
+          tests/test_profile_deletion_postgres.py tests/test_profile_deletion_api.py
         env:
           KEEL_TEST_POSTGRES_DSN: postgresql://keel@localhost:5432/keel_test
 
@@ -96,6 +98,7 @@ jobs:
       - run: >-
           pytest -q -rs tests/test_docker_sandbox.py tests/test_docker_operations.py tests/test_fault_injection.py
           tests/test_sandbox_lifecycle_docker.py
+          tests/test_profile_deletion_docker.py
         timeout-minutes: 30
         env:
           KEEL_TEST_DOCKER: "1"

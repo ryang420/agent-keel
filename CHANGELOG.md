@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Complete profile deletion: authenticated `DELETE /v1/profiles/{profile_id}` fences a tenant-owned profile,
+  cancels its queued and active runs, retires its sandboxes through verified exact container identities, and purges
+  its sessions, messages, runs, events, blobs, memory and profile configuration. A same-operation retry resumes
+  persisted progress, and `POST /v1/profiles/{profile_id}/deletion/{operation_id}/complete` releases only that
+  operation's fence, with an idempotent completion receipt.
 - Coordinator recovery APIs reconcile orphaned usage, stopped and delayed retired creates, and idle generations by
   exact container ID. Recovery preserves valid users and their execution authority, retains unresolved create
   evidence, blocks conflicting inventory until the recorded conflict is resolved, and safely replaces incompatible
@@ -41,6 +46,11 @@ All notable changes to this project are documented here. The format follows
   test/dev backend is unchanged.
 
 ### Fixed
+- Cross-instance background callbacks now carry a durable profile incarnation through memory, title and memory-review
+  writes, so work from a deleted profile cannot change a recreated profile that reuses its id or session ids. Old
+  deletion receipts cannot block or unblock another incarnation's background work.
+- Profile guards acquire PostgreSQL's shared profile advisory lock before the profile row lock, preventing the
+  profile update versus deletion purge deadlock while preserving nonblocking claim skips.
 - An unknown or legacy container no longer blocks its profile's sandbox runs forever after the operator removes it,
   including on a profile that never had a coordinated sandbox. A block clears only when the container it records
   is proven absent by exact ID on the same daemon (or is still listed but stopped as of the fresh exact-ID

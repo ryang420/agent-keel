@@ -25,7 +25,7 @@ from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy, profile_mount_root
 from keel.sandbox.records import MAX_DIAGNOSTIC_CHARS, UseHandle
 from keel.skills import discover_skills
-from keel.store.base import Event, Run, StoredMessage, TitleInUse, UnknownRun
+from keel.store.base import Event, ProfileIncarnationMismatch, Run, StoredMessage, TitleInUse, UnknownRun
 from keel.titles import (
     MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
 )
@@ -331,7 +331,8 @@ class RunExecutor:
             ctx = ToolContext(self.coordinator, sandbox,
                               cwd=(session.cwd if session and session.cwd else policy.workdir),
                               skills=tuple(skills), on_exec=self._exec_recorder(run, state), store=self.store,
-                              profile_id=run.profile_id, session_id=run.session_id, memory_chars=self.memory_chars,
+                              profile_id=run.profile_id, profile_incarnation=run.profile_incarnation,
+                              session_id=run.session_id, memory_chars=self.memory_chars,
                               user_chars=self.user_chars)
         names: list[str] = []
         if ctx is not None:
@@ -340,7 +341,8 @@ class RunExecutor:
             names.append("memory")
         if ctx is None and names:
             cwd = session.cwd if session and session.cwd else "/"
-            ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id, session_id=run.session_id,
+            ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id,
+                              profile_incarnation=run.profile_incarnation, session_id=run.session_id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
         saved_cwd = ctx.cwd if ctx else None
 
@@ -548,25 +550,49 @@ class RunExecutor:
             return
         for candidate in title_candidates(title, limit=TITLE_LIMIT):
             try:
-                await self.store.set_title(run.profile_id, run.session_id, candidate, "derived")
+                await self.store.set_title(run.profile_id, run.session_id, candidate, "derived",
+                                            profile_incarnation=run.profile_incarnation)
+                return
+            except ProfileIncarnationMismatch:
                 return
             except TitleInUse:
                 continue
 
     async def _after_complete(self, run: Run, profile) -> None:
-        """A completed run may be renamed, and every memory_review_turns runs may start a memory review."""
+        """A completed run may be renamed, and every memory_review_turns runs may start a memory review.
+
+        A fenced profile starts no new background work: the deletion drains what
+        exists and must not race a review spawned by a just-finished run.
+        """
+        if run.profile_incarnation is None or await self.store.get_profile_deletion(run.profile_id) is not None:
+            return
+        profile = await self.store.get_profile(run.profile_id)
+        if profile is None or (run.profile_incarnation is not None
+                               and profile.incarnation != run.profile_incarnation):
+            return
         await self._maybe_title(run)
         if profile is not None and profile.memory and self.background is not None:
-            if await self.store.note_memory_turn(run.session_id, self.memory_review_turns):
+            try:
+                due = await self.store.note_memory_turn(
+                    run.session_id, self.memory_review_turns, profile_incarnation=run.profile_incarnation)
+            except ProfileIncarnationMismatch:
+                return
+            if due:
                 from keel.review import claim, release, run_review
                 if claim(run.profile_id):
-                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}"):
+                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}",
+                                                 profile_id=run.profile_id,
+                                                 profile_incarnation=run.profile_incarnation):
                         release(run.profile_id)
 
     async def _maybe_title(self, run: Run) -> None:
         """After the first completed run, ask the model to name a session that still has a derived title, from every
         user message so far."""
-        if self.background is None:
+        if self.background is None or run.profile_incarnation is None:
+            return
+        profile = await self.store.get_profile(run.profile_id)
+        if profile is None or (run.profile_incarnation is not None
+                               and profile.incarnation != run.profile_incarnation):
             return
         session = await self.store.get_session(run.profile_id, run.session_id)
         if session is None or session.title_source in ("user", "llm"):
@@ -581,7 +607,8 @@ class RunExecutor:
         text = "\n".join(users)[:TITLE_INPUT_CHARS]
         if not text.strip():
             return
-        self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}")
+        self.background.spawn(self._title(run, text), f"keel-title-{run.session_id}",
+                             profile_id=run.profile_id, profile_incarnation=run.profile_incarnation)
 
     async def _title(self, run: Run, text: str) -> None:
         """One model call, no tools and no events. A bad reply or a provider error leaves the derived title."""
@@ -599,7 +626,10 @@ class RunExecutor:
             return
         for candidate in title_candidates(title, limit=MODEL_TITLE_LIMIT):
             try:
-                await self.store.set_title(run.profile_id, run.session_id, candidate, "llm")
+                await self.store.set_title(run.profile_id, run.session_id, candidate, "llm",
+                                            profile_incarnation=run.profile_incarnation)
+                return
+            except ProfileIncarnationMismatch:
                 return
             except TitleInUse:
                 continue

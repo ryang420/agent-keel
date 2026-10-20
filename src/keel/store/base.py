@@ -41,6 +41,18 @@ class ProfileTenantMismatch(StoreError):
     pass
 
 
+class ProfileDeletionBusy(StoreError):
+    """The profile is being deleted; the caller's write must not proceed."""
+
+
+class ProfileDeletionConflict(StoreError):
+    """A deletion operation could not perform its expected transition."""
+
+
+class ProfileIncarnationMismatch(StoreError):
+    """A delayed writer belongs to an older incarnation of a deterministic profile id."""
+
+
 class UniqueViolation(Exception):
     """Raised by a Db adapter when a unique constraint rejects a write."""
 
@@ -59,6 +71,7 @@ class Profile:
     updated_at: float
     memory: bool = False
     tenant_id: int | None = None
+    incarnation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +137,7 @@ class Run:
     started_at: float | None
     finished_at: float | None
     current_exec_id: str | None = None
+    profile_incarnation: str | None = None
 
 
 @dataclass(frozen=True)

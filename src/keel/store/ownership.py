@@ -53,10 +53,11 @@ async def _enforce(db) -> None:
             "CREATE TABLE profiles_owned ("
             "id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL, "
             "skills TEXT NOT NULL, updated_at REAL NOT NULL, memory INTEGER NOT NULL DEFAULT 0, "
+            "incarnation TEXT, "
             "tenant_id INTEGER NOT NULL REFERENCES tenants(id))")
         await db.execute(
-            "INSERT INTO profiles_owned (id, models, sandbox, soul, skills, updated_at, memory, tenant_id) "
-            "SELECT id, models, sandbox, soul, skills, updated_at, memory, tenant_id FROM profiles")
+            "INSERT INTO profiles_owned (id, models, sandbox, soul, skills, updated_at, memory, incarnation, tenant_id) "
+            "SELECT id, models, sandbox, soul, skills, updated_at, memory, incarnation, tenant_id FROM profiles")
         await db.execute("DROP TABLE profiles")
         await db.execute("ALTER TABLE profiles_owned RENAME TO profiles")
         await db.execute("CREATE INDEX profiles_tenant ON profiles (tenant_id)")

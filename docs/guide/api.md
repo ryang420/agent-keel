@@ -182,6 +182,30 @@ A refused model is 422, with code `access_denied` (the account may not call it),
 recognize the id) or `unsupported` (the provider rejected the test request for another reason). A provider that did
 not answer (rate limit, server error, timeout) is 503 `unavailable`.
 
+## Deleting a profile
+
+`DELETE /v1/profiles/{profile_id}` with a JSON body `{"operation_id": "<uuid>"}` removes one profile's sessions,
+messages, runs, events, blobs, memory and model/persona configuration, and retires its sandbox by exact recorded
+container identity. It is tenant-owned and resumable: a retry with the same operation id continues from the
+persisted phase. A different operation id while a deletion is active is refused with 409 `profile_deletion_busy`.
+
+Success is exactly `{"deleted": true, "blocked": true}` and means the profile's runtime data is gone and the
+profile cannot be written. The fence stays in place until the consumer acknowledges that its own data is gone:
+
+`POST /v1/profiles/{profile_id}/deletion/{operation_id}/complete` returns `{"completed": true}` and releases only
+that operation's fence. It is idempotent for a retried operation and never releases a newer fence or changes a
+newer profile. A minimal receipt (profile, tenant, operation, time) outlives the fence so a lost-response retry is
+acknowledged safely.
+
+A profile that was never prepared is still fenced by the operation and succeeds once the service establishes that
+no runtime resources exist. A profile owned by another tenant is `404 profile_not_found`, exactly as if it did not
+exist. A malformed operation id is `400 invalid_input` before anything is written.
+
+While a deletion is active, profile updates, run/session creation and memory writes answer `409
+profile_deletion_busy`. A `503 unavailable` means a cleanup dependency could not answer; the fence remains and the
+same operation may be retried. Cleanup is bounded, and a timeout is never reported as success. Requests never
+remove a container by name alone.
+
 ## Error codes
 
 | HTTP | Code | When |
