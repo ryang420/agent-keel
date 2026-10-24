@@ -10,8 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  # Keep the required check names stable: repository rules expect both test and postgres.
   test:
-    name: test (PostgreSQL)
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: pytest -q -m 'not integration'
+
+  postgres:
+    name: postgres
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:
