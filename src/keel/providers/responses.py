@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import AsyncIterator, Iterable
+from typing import AsyncIterator, Callable, Iterable
 
 import httpx
 
@@ -144,13 +144,18 @@ async def _sse_events(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, dic
         yield decoded
 
 
-async def _until_stalled(events: AsyncIterator[tuple[str, dict]], first_event: float,
-                         between_events: float) -> AsyncIterator[tuple[str, dict]]:
+def _responses_progress(kind: str) -> bool:
+    return kind.startswith("response.") or kind == "error"
+
+
+async def _until_stalled(events: AsyncIterator[tuple[str, dict]], first_event: float, between_events: float,
+                         progress: Callable[[str], bool] = _responses_progress) -> AsyncIterator[tuple[str, dict]]:
     """Pass events through, failing as "timeout" when no response event arrives in time: `first_event` seconds
     for the first one, then `between_events` seconds between them.
 
     A read timeout alone cannot see a stall: Mantle keeps a stalled stream open with keep-alive traffic, which
-    resets it. So only `response.*` and `error` events count as progress; comments and other events do not.
+    resets it. So only events `progress` accepts count (for the Responses API, `response.*` and `error`); comments
+    and other events do not.
     """
     loop = asyncio.get_running_loop()
     deadline, started = loop.time() + first_event, False
@@ -164,7 +169,7 @@ async def _until_stalled(events: AsyncIterator[tuple[str, dict]], first_event: f
             message = (f"The model sent no response event for {between_events:g} s." if started else
                        f"The model sent no first response event within {first_event:g} s.")
             raise ModelError("timeout", message) from None
-        if kind.startswith("response.") or kind == "error":
+        if progress(kind):
             deadline, started = loop.time() + between_events, True
         yield kind, data
 

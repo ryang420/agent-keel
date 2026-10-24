@@ -14,6 +14,27 @@ AWS credential chain (for example `AWS_PROFILE`, environment keys or an instance
 It reports a 272,000-token context window, vision, reasoning replay, parallel tool calls and prompt caching by key.
 It is always registered.
 
+### Claude models on Bedrock Mantle
+
+A model id that starts with `anthropic.` (for example `anthropic.claude-opus-5-5`) is sent to the Anthropic
+Messages API on the same host, `https://bedrock-mantle.<region>.api.aws/anthropic/v1/messages`, with the same
+region and credentials. Nothing else needs to be configured: list `{"provider": "bedrock", "model": "anthropic.…"}`
+in a profile. Which Claude ids Mantle serves differs by region and account; the signed, read-only
+`GET https://bedrock-mantle.<region>.api.aws/v1/models` lists them. The first call to a model can start an AWS
+Marketplace subscription, which answers `auth` ("Your subscription to the model is being set up") for a few
+minutes.
+
+- It reports a 200,000-token context window, vision, reasoning replay, parallel tool calls and prompt caching at
+  breakpoints: one after the session's system prompt (per-run instructions follow it) and one on the newest
+  message.
+- Claude 4.6 and later get adaptive thinking, and `reasoning_effort` is sent as `output_config.effort`. These models
+  cannot turn thinking off, so `none` is sent as `low`. Older ids get neither.
+- Each assistant turn is replayed as the content blocks the model produced, thinking included, to the same model
+  only. Requests set `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`
+  (`anthropic-beta: thinking-binding-controls-2026-08-01`), so thinking whose earlier conversation changed (after
+  compression, compaction or new run instructions) is dropped for that request instead of failing it.
+- `max_tokens` is the request's `max_output_tokens`, else 32,000. A `refusal` ends the call as `bad_request`.
+
 ## OpenAI-compatible (`openai`)
 
 Any server that implements the Responses API (`POST <base>/responses`, streaming) with bearer-key auth. It is
@@ -36,7 +57,7 @@ python -m keel
   them can fail at the server.
 - Error messages are scrubbed of the key before they are stored or returned.
 
-Both providers share one wire implementation (`keel/providers/responses.py`): streaming SSE, tool calls assembled
+Except for Claude models, both providers share one wire implementation (`keel/providers/responses.py`): streaming SSE, tool calls assembled
 from completed output items, encrypted reasoning returned and replayed only to the provider and model that produced
 it, and `store: false`.
 
