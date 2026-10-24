@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0-rc.3] - 2026-10-24
+
 ### Added
 - The `bedrock` provider serves Claude models: an id starting with `anthropic.` (for example
   `anthropic.claude-opus-5-5`) goes to Bedrock Mantle's Anthropic Messages API at `/anthropic/v1/messages`, with
@@ -183,7 +185,8 @@ All notable changes to this project are documented here. The format follows
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.2...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.3...HEAD
+[0.3.0-rc.3]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.2...v0.3.0-rc.3
 [0.3.0-rc.2]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.1...v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0-rc.1
 [0.2.0]: https://github.com/ryang420/agent-keel/compare/v0.1.0...v0.2.0
