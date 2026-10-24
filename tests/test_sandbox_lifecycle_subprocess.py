@@ -1,6 +1,6 @@
 """Kill a keel process during each sandbox lifecycle phase and recover from an independent process (design §16).
 
-A child process runs a real worker pool and coordinator over a SQLite file and a file-backed Docker double whose
+A child process runs a real worker pool and coordinator over PostgreSQL and a file-backed Docker double whose
 containers outlive the process. It holds one lifecycle call open, the test kills it with SIGKILL, and a fresh
 instance (its own store and coordinator, with the run's lease observed as expired through an injected coordination
 clock) sweeps and recovers. Recovery must not assume that an expired lease means a command stopped: every container
@@ -121,10 +121,10 @@ async def terminal_events(store, run_id: str) -> list[str]:
 
 
 @pytest.mark.parametrize("phase", PHASES)
-async def test_a_process_killed_during_each_lifecycle_phase_is_recovered_by_another(tmp_path, monkeypatch, phase):
+async def test_a_process_killed_during_each_lifecycle_phase_is_recovered_by_another(tmp_path, monkeypatch, phase, pg_dsn):
     state = tmp_path / "daemon"
     write_helper_assets(state / "bin")
-    url = f"sqlite:///{tmp_path / 'keel.sqlite3'}"
+    url = pg_dsn
     store = await open_store(url)
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox=SANDBOX, soul="",
                                skills=[])

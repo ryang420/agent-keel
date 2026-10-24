@@ -1,7 +1,6 @@
 """Restart, orphan and idle recovery through exact container identities (task 9)."""
 
 import asyncio
-import os
 
 import pytest
 
@@ -25,10 +24,8 @@ async def recovery(store, clock, helper_assets):
     return coordinator, backend, store, clock
 
 
-async def test_owned_remove_authorization_waits_for_competing_short_guard(recovery):
+async def test_owned_remove_authorization_waits_for_competing_short_guard(recovery, pg_dsn):
     coordinator, backend, store, clock = recovery
-    if store.db.dialect != "postgres":
-        pytest.skip("PostgreSQL guard-contention regression")
     claim = await make_claim(store, "idle")
     bound = await coordinator.prepare(claim.use)
     assert await coordinator.release(claim.use)
@@ -38,7 +35,7 @@ async def test_owned_remove_authorization_waits_for_competing_short_guard(recove
         claim.use.key, owner=coordinator.owner, lease_seconds=30, idle_seconds=10,
         helper_digest=artifact.sha256)
 
-    blocker = await open_store(os.environ["KEEL_TEST_POSTGRES_DSN"])
+    blocker = await open_store(pg_dsn)
     reached = asyncio.Event()
     original = store.authorize_recovery_remove
 
@@ -545,8 +542,7 @@ async def test_unbound_preparation_releases_while_the_daemon_is_unreachable(reco
     assert (await store.get_operation(create.id)).resolved_at is None
 
 
-async def test_restarted_independent_store_removes_historical_attempt_without_touching_current(recovery):
-    import os
+async def test_restarted_independent_store_removes_historical_attempt_without_touching_current(recovery, pg_dsn):
     from keel.store import open_store
     coordinator, backend, store, clock = recovery
     old = await make_claim(store, "before-restart")
@@ -557,11 +553,7 @@ async def test_restarted_independent_store_removes_historical_attempt_without_to
     await store.retire_unbound_preparation(old.use, abandon=True)
     current = await make_claim(store, "after-restart")
     bound = await coordinator.prepare(current.use)
-    if store.db.dialect == "sqlite":
-        path = (await store.db.fetchrow("PRAGMA database_list"))["file"]
-        url = "sqlite:///" + path
-    else:
-        url = os.environ["KEEL_TEST_POSTGRES_DSN"]
+    url = pg_dsn
     restarted_store = await open_store(url, clock=clock)
     restarted_store.coordination_clock = clock
     try:
@@ -576,18 +568,15 @@ async def test_restarted_independent_store_removes_historical_attempt_without_to
         await restarted_store.close()
 
 
-async def test_postgres_recovery_skips_locked_profile_and_retries_later(recovery):
-    import os
+async def test_postgres_recovery_skips_locked_profile_and_retries_later(recovery, pg_dsn):
     from keel.store import open_store
     coordinator, backend, store, clock = recovery
-    if store.db.dialect != "postgres":
-        pytest.skip("a row-lock barrier needs PostgreSQL")
     first = await make_claim(store, "locked", profile_id="locked")
     await coordinator.prepare(first.use)
     second = await make_claim(store, "available", profile_id="available")
     other = await coordinator.prepare(second.use)
     clock.now += 31
-    independent = await open_store(os.environ["KEEL_TEST_POSTGRES_DSN"], clock=clock)
+    independent = await open_store(pg_dsn, clock=clock)
     try:
         async with independent.db.transaction():
             await independent.db.fetchrow("SELECT id FROM profiles WHERE id = 'locked' FOR UPDATE")

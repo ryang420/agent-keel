@@ -1,9 +1,7 @@
 import asyncio
-from contextlib import closing
 import json
 import os
 import shutil
-import sqlite3
 import time
 
 import pytest
@@ -13,50 +11,47 @@ from keel.service import build
 from keel.sandbox.base import parse_policy, profile_mount_root
 from keel.store import migrations, open_store
 from keel.store.base import OwnershipError, UniqueViolation
-from keel.store.db import SqliteDb
+from keel.store.postgres import PostgresDb
 from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
 ALL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memories, run_events, "
               "runs, messages, sessions, profiles, tenants, blobs")
-BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get("KEEL_TEST_POSTGRES_DSN") else [])
-needs_postgres = pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"),
-                                    reason="needs KEEL_TEST_POSTGRES_DSN")
 
 # keel 0.2.0's schema as released (src/keel/store/sql.py at v0.2.0). Kept apart from migration 1, which must
 # reproduce it, so that an edit to migration 1 fails the schema comparison below.
 V020 = """
 CREATE TABLE IF NOT EXISTS profiles (
     id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL,
-    skills TEXT NOT NULL, updated_at {real} NOT NULL);
+    skills TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, title TEXT, title_source TEXT,
-    created_at {real} NOT NULL, last_active_at {real} NOT NULL, message_count INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL, last_active_at DOUBLE PRECISION NOT NULL, message_count INTEGER NOT NULL DEFAULT 0,
     system_prompt TEXT, provider TEXT, model TEXT, cwd TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS sessions_profile_title ON sessions (profile_id, title) WHERE title IS NOT NULL;
 CREATE INDEX IF NOT EXISTS sessions_profile_active ON sessions (profile_id, last_active_at);
 CREATE TABLE IF NOT EXISTS messages (
-    id {serial} PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT, role TEXT NOT NULL,
+    id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT, role TEXT NOT NULL,
     parts TEXT NOT NULL, tool_calls TEXT NOT NULL, tool_call_id TEXT, tool_name TEXT,
-    reasoning TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at {real} NOT NULL);
+    reasoning TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at DOUBLE PRECISION NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_session ON messages (session_id, id);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL,
     provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_effort TEXT, input TEXT NOT NULL,
-    instructions TEXT, output TEXT NOT NULL DEFAULT '', usage TEXT NOT NULL DEFAULT '{{}}',
-    error_code TEXT, error TEXT, lease_owner TEXT, lease_expires_at {real},
-    created_at {real} NOT NULL, started_at {real}, finished_at {real}, current_exec_id TEXT);
+    instructions TEXT, output TEXT NOT NULL DEFAULT '', usage TEXT NOT NULL DEFAULT '{}',
+    error_code TEXT, error TEXT, lease_owner TEXT, lease_expires_at DOUBLE PRECISION,
+    created_at DOUBLE PRECISION NOT NULL, started_at DOUBLE PRECISION, finished_at DOUBLE PRECISION, current_exec_id TEXT);
 CREATE INDEX IF NOT EXISTS runs_status ON runs (status, created_at);
 CREATE INDEX IF NOT EXISTS runs_session ON runs (session_id);
 CREATE UNIQUE INDEX IF NOT EXISTS runs_one_in_flight_per_session ON runs (session_id)
     WHERE status IN ('queued', 'running', 'stopping');
 CREATE TABLE IF NOT EXISTS run_events (
     run_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL,
-    at {real} NOT NULL, PRIMARY KEY (run_id, seq));
+    at DOUBLE PRECISION NOT NULL, PRIMARY KEY (run_id, seq));
 CREATE TABLE IF NOT EXISTS blobs (
     id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, media_type TEXT NOT NULL,
-    data TEXT NOT NULL, created_at {real} NOT NULL);
+    data TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL);
 CREATE INDEX IF NOT EXISTS blobs_session ON blobs (session_id);
 """
 
@@ -73,10 +68,6 @@ INSERT INTO run_events (run_id, seq, type, data, at) VALUES ('run_1', 1, 'run.co
 
 
 async def run_script(url: str, script: str) -> None:
-    if url.startswith("sqlite:///"):
-        with closing(sqlite3.connect(url[len("sqlite:///"):])) as conn:
-            conn.executescript(script)
-        return
     import asyncpg
 
     conn = await asyncpg.connect(url)
@@ -88,35 +79,17 @@ async def run_script(url: str, script: str) -> None:
 
 async def connect(url: str):
     """A connection that, unlike open_store, does not migrate."""
-    if url.startswith("sqlite:///"):
-        return await SqliteDb.connect(url[len("sqlite:///"):])
-    from keel.store.postgres import PostgresDb
-
     return await PostgresDb.connect(url)
 
 
-def v020_script(url: str) -> str:
-    if url.startswith("sqlite:///"):
-        script = V020.format(real="REAL", serial="INTEGER")
-        return script.replace("id INTEGER PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
-    return V020.format(real="DOUBLE PRECISION", serial="BIGSERIAL")
-
-
 async def empty_database(url: str) -> str:
-    """A URL for an empty database of the same kind: a new SQLite file, or the Postgres one with keel's tables
-    dropped."""
-    if url.startswith("sqlite:///"):
-        return url + "-fresh"
+    """Reset this test's isolated PostgreSQL database for fresh-schema comparison."""
     await run_script(url, f"DROP TABLE IF EXISTS {ALL_TABLES}")
     return url
 
 
 async def database_table_names(db) -> set[str]:
-    """Every table in this database, read through the dialect's own catalog."""
-    if db.dialect == "sqlite":
-        rows = await db.fetch(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-        return {row["name"] for row in rows}
+    """Every table in the current PostgreSQL schema."""
     rows = await db.fetch(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()")
     return {row["table_name"] for row in rows}
@@ -161,14 +134,6 @@ async def insert_operation(db, operation_id="op1", kind="create", intended_name=
 
 async def schema_shape(db) -> dict:
     """Every table's columns and every index, in a form that compares equal for equal schemas."""
-    if db.dialect == "sqlite":
-        tables = [row["name"] for row in await db.fetch(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-        columns = {table: [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
-                           for r in await db.fetch(f"PRAGMA table_info({table})")] for table in tables}
-        indexes = {row["name"]: " ".join(row["sql"].split()) for row in await db.fetch(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")}
-        return {"columns": columns, "indexes": indexes}
     columns: dict[str, list] = {}
     for row in await db.fetch(
             "SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns "
@@ -180,11 +145,9 @@ async def schema_shape(db) -> dict:
     return {"columns": columns, "indexes": indexes}
 
 
-@pytest.fixture(params=BACKENDS)
-async def db_url(request, tmp_path):
-    if request.param == "sqlite":
-        return f"sqlite:///{tmp_path / 'keel.sqlite3'}"
-    return await empty_database(os.environ["KEEL_TEST_POSTGRES_DSN"])
+@pytest.fixture
+async def db_url(pg_dsn):
+    return pg_dsn
 
 
 async def test_a_fresh_database_reaches_the_latest_version(db_url):
@@ -198,7 +161,7 @@ async def test_a_fresh_database_reaches_the_latest_version(db_url):
 
 
 async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_url):
-    await run_script(db_url, v020_script(db_url) + SEED)
+    await run_script(db_url, V020 + SEED)
     store = await open_store(db_url)
     try:
         assert await schema_version(store.db) == LATEST_VERSION
@@ -224,7 +187,7 @@ async def test_a_0_2_0_database_is_upgraded_in_place_and_matches_a_fresh_one(db_
 
 
 async def test_invalid_tenant_cutover_does_not_change_the_old_database(db_url):
-    await run_script(db_url, v020_script(db_url) + SEED)
+    await run_script(db_url, V020 + SEED)
     db = await connect(db_url)
     try:
         before = await schema_shape(db)
@@ -243,7 +206,7 @@ async def test_invalid_tenant_cutover_does_not_change_the_old_database(db_url):
 
 
 async def test_complete_tenant_cutover_preserves_old_data_and_matches_fresh_schema(db_url):
-    await run_script(db_url, v020_script(db_url) + SEED + """
+    await run_script(db_url, V020 + SEED + """
         INSERT INTO blobs (id, profile_id, session_id, media_type, data, created_at)
         VALUES ('b1', 'p1', 's1', 'image/png', 'aGVsbG8=', 1);
     """)
@@ -273,7 +236,7 @@ async def test_complete_tenant_cutover_preserves_old_data_and_matches_fresh_sche
 
 
 async def test_stopped_service_cutover_preserves_a_legacy_mount_and_its_file(db_url, tmp_path):
-    await run_script(db_url, v020_script(db_url) + SEED)
+    await run_script(db_url, V020 + SEED)
     old = tmp_path / "legacy-p1"
     old.mkdir()
     (old / "marker.txt").write_text("kept")
@@ -363,7 +326,7 @@ INSERT INTO no_such_table (id) VALUES ('x');
 
 
 async def test_a_0_2_0_database_whose_first_start_crashed_is_completed(db_url):
-    partial = [s for s in v020_script(db_url).split(";") if "TABLE IF NOT EXISTS profiles" in s or "blobs" in s]
+    partial = [s for s in V020.split(";") if "TABLE IF NOT EXISTS profiles" in s or "blobs" in s]
     await run_script(db_url, ";".join(partial))
     store = await open_store(db_url)
     try:
@@ -379,7 +342,7 @@ async def test_a_0_2_0_database_whose_first_start_crashed_is_completed(db_url):
 
 
 async def test_an_empty_version_table_reads_like_no_version_table(db_url):
-    await run_script(db_url, v020_script(db_url) + "CREATE TABLE schema_version (version INTEGER NOT NULL);")
+    await run_script(db_url, V020 + "CREATE TABLE schema_version (version INTEGER NOT NULL);")
     db = await connect(db_url)
     try:
         assert await schema_version(db) == 1
@@ -387,10 +350,9 @@ async def test_an_empty_version_table_reads_like_no_version_table(db_url):
         await db.close()
 
 
-@needs_postgres
-async def test_instances_starting_together_upgrade_an_old_database_once():
-    url = await empty_database(os.environ["KEEL_TEST_POSTGRES_DSN"])
-    await run_script(url, v020_script(url) + SEED)
+async def test_instances_starting_together_upgrade_an_old_database_once(db_url):
+    url = db_url
+    await run_script(url, V020 + SEED)
     stores = await asyncio.gather(*(open_store(url) for _ in range(6)))
     try:
         for store in stores:
@@ -418,7 +380,7 @@ async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
 
 
 async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
-    await run_script(db_url, v020_script(db_url) + SEED)
+    await run_script(db_url, V020 + SEED)
     store = await open_store(db_url)
     try:
         assert (await store.get_profile("p1")).memory is False
@@ -435,7 +397,6 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     await store.db.execute("UPDATE schema_version SET version = 3")
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
-    # SQLite refuses DROP COLUMN while profiles_tenant still indexes tenant_id.
     await store.db.execute("DROP INDEX IF EXISTS profiles_tenant")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN tenant_id")
     # A v3 database predates migration 5; drop its tables so the reopen exercises both migrations.
@@ -451,26 +412,18 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
         columns = await schema_shape(upgraded.db)
         assert "tenants" in columns["columns"]
         assert "profiles_tenant" in columns["indexes"]
-        if upgraded.db.dialect == "sqlite":
-            tenant_type = await upgraded.db.fetchrow(
-                "SELECT type FROM pragma_table_info('tenants') WHERE name = 'id'")
-            owner_type = await upgraded.db.fetchrow(
-                "SELECT type FROM pragma_table_info('profiles') WHERE name = 'tenant_id'")
-            assert tenant_type["type"] == owner_type["type"] == "INTEGER"
-        else:
-            tenant_type = await upgraded.db.fetchrow(
-                "SELECT data_type FROM information_schema.columns "
-                "WHERE table_name = 'tenants' AND column_name = 'id'")
-            owner_type = await upgraded.db.fetchrow(
-                "SELECT data_type FROM information_schema.columns "
-                "WHERE table_name = 'profiles' AND column_name = 'tenant_id'")
-            assert tenant_type["data_type"] == owner_type["data_type"] == "integer"
+        tenant_type = await upgraded.db.fetchrow(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'tenants' AND column_name = 'id'")
+        owner_type = await upgraded.db.fetchrow(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'profiles' AND column_name = 'tenant_id'")
+        assert tenant_type["data_type"] == owner_type["data_type"] == "integer"
     finally:
         await upgraded.close()
 
 
-async def test_open_backfills_v7_incarnation_tokens_for_existing_profiles_and_runs(tmp_path):
-    db_url = f"sqlite:///{tmp_path / 'backfill.sqlite3'}"
+async def test_open_backfills_v7_incarnation_tokens_for_existing_profiles_and_runs(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="old", skills=[], tenant_id=1)
     await store.ensure_session("p1", "s1")
@@ -567,10 +520,10 @@ async def test_coordination_constraints_survive_tenant_ownership_enforcement(db_
         await insert_sandbox(store.db, token="gen-token-before", container_id="c-before")
         await require_tenant_ownership(store.db, (1,), {"p1": 1})
         assert await database_table_names(store.db) >= COORDINATION_TABLES
-        if store.db.dialect == "sqlite":
-            row = await store.db.fetchrow(
-                "SELECT \"notnull\" AS nn FROM pragma_table_info('profiles') WHERE name = 'tenant_id'")
-            assert row["nn"] == 1
+        row = await store.db.fetchrow(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'profiles' AND column_name = 'tenant_id'")
+        assert row["is_nullable"] == "NO"
         survivor = await store.db.fetchrow(
             "SELECT generation_token, container_id FROM sandboxes WHERE profile_id = ?", "p1")
         assert (survivor["generation_token"], survivor["container_id"]) == ("gen-token-before", "c-before")

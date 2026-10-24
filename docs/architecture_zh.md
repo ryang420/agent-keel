@@ -29,8 +29,8 @@ flowchart TB
 
     subgraph shared["共享状态"]
         direction LR
-        DB[("Store<br/>Postgres 或 SQLite<br/>profiles、sessions、messages、<br/>runs、run_events、blobs")]
-        BUS{{"EventBus<br/>Postgres LISTEN/NOTIFY<br/>或进程内"}}
+        DB[("Store<br/>Postgres<br/>profiles、sessions、messages、<br/>runs、run_events、blobs")]
+        BUS{{"EventBus<br/>Postgres LISTEN/NOTIFY"}}
     end
 
     DK["Docker 守护进程<br/>/var/run/docker.sock"]
@@ -72,7 +72,7 @@ flowchart TB
 | `runner.py` | `RunExecutor`：agent 循环，以及取消和失败的清理路径。 |
 | `compress.py`、`compactor.py` | 上下文压缩：纯函数部分（估算、边界、请求组装和摘要输入）；以及 run 何时压缩、存储什么。 |
 | `models.py` | 与 provider 无关的类型：`Message`、各类 part、`ToolCall`、`ModelRequest`、`Usage`、模型事件。 |
-| `store/` | 基于 `Db` 适配器的 `Store`：`sql.py`（两种方言的全部查询）、`db.py`（SQLite）、`postgres.py`。 |
+| `store/` | 基于 PostgreSQL 的 `Store`：`sql.py`（查询）、`postgres.py`（连接池与事务）。 |
 | `events.py` | `InMemoryEventBus`、`PostgresEventBus`。 |
 | `providers/` | `ModelProvider` 接口、注册表、重试策略、Responses API 传输层、Bedrock（SigV4）、OpenAI。 |
 | `sandbox/` | 策略解析、协调的精确 ID Docker 后端及其 supervisor、恢复，以及供测试用的宿主进程后端。 |
@@ -84,7 +84,7 @@ flowchart TB
 | `memory.py` | 两个记忆目标的条目，以及写入时的检查。 |
 | `review.py` | 后台记忆复查。它只写记忆。 |
 
-只有存在多个实现的地方才定义接口：`Store`（SQLite、Postgres）、`EventBus`（进程内、Postgres）、
+`Store` 在所有环境中都使用 PostgreSQL。其他接口包括 `EventBus`（本地测试替身、Postgres）、
 `ModelProvider`（Bedrock、OpenAI，以及测试用的 fake）、`SandboxExecutor`（协调的工具门面、供测试用的宿主
 进程后端）。其余都是具体代码。
 
@@ -179,7 +179,7 @@ erDiagram
   编号分配因此串行化，不需要重试循环；它会拒绝终止事件类型（这类事件由终止转换写入）和不存在的 run，并对终态 run
   返回 `None`，让迟到的写入方安静地停下。
 
-同一套 SQL（`?` 占位符）同时跑在 SQLite 和 Postgres 上。schema 在启动时由编号迁移（`store/migrations.py`）
+存储统一使用 PostgreSQL，由适配器转换 SQL 中的 `?` 占位符。schema 在启动时由编号迁移（`store/migrations.py`）
 创建和升级：每个迁移在自己的事务里、持有 Postgres advisory lock 执行，多个实例同时启动时只会迁移一次。0.2.0 的
 数据库会原地升级；由更新版本 keel 写入的数据库会被拒绝。
 
@@ -356,9 +356,9 @@ sequenceDiagram
 
 ### 总线
 
-`InMemoryEventBus` 是以 run id（以及 `stop:<run id>`）为键的 `asyncio.Event` 字典，服务于单个实例和测试。
-`PostgresEventBus` 在其上增加了在一个通道（`keel_events`，键作为负载）上的 `LISTEN`/`pg_notify`，所以一个实例上的
-notify 可以唤醒另一个实例上的读取方。它需要两个直连（一个监听，一个发送）；事务模式的连接池（例如 RDS Proxy）
+`InMemoryEventBus` 是以 run id（以及 `stop:<run id>`）为键的 `asyncio.Event` 字典，用作测试替身和
+`PostgresEventBus` 的本地基础。服务始终使用 `PostgresEventBus`，它增加了单通道
+（`keel_events`，键作为负载）的 `LISTEN`/`pg_notify`，所以一个实例上的 notify 可以唤醒另一个实例上的读取方。它需要两个直连（一个监听，一个发送）；事务模式的连接池（例如 RDS Proxy）
 会固定或丢弃 `LISTEN`。如果监听连接丢失，在以退避方式重连期间（0.5 秒起，每次翻倍，最多 30 秒），跨实例的唤醒
 退回到轮询。连接恢复后会唤醒所有 waiter，因为期间发出的 notify 已经丢失；每个读取方随后重新读取存储。
 
@@ -569,15 +569,15 @@ flowchart LR
     end
     subgraph dev["开发"]
         direction TB
-        K2["keel，KEEL_SANDBOX=none 或 docker"] --- SQ[("SQLite 文件")]
+        K2["keel，KEEL_SANDBOX=none 或 docker"] --- PG2[("Postgres")]
     end
 ```
 
 - **目前的生产形态：** 一个 keel 容器加 Postgres，并挂载宿主机的 Docker socket 来运行沙箱。每个沙箱加入你选定的网络；
   keel 的数据库应放在沙箱无法访问的网络上。
-- **开发：** SQLite；如果不需要隔离，用 `KEEL_SANDBOX=none`（仅聊天），测试中则使用宿主进程后端。
+- **开发：** PostgreSQL；用 `KEEL_SANDBOX=none` 仅运行聊天，测试中则使用宿主进程后端。
 - **横向扩展**正是这个设计的目标（无状态 worker、用 `SKIP LOCKED` 认领、跨实例唤醒），多个实例可以
-  共用一个 Postgres 数据库（SQLite 只服务一个实例）。
+  共用一个 Postgres 数据库。
 
 配置完全由环境变量提供，启动时校验（`config.py`）；变量列表见[配置指南](guide/configuration.md)。
 
@@ -611,14 +611,21 @@ flowchart LR
 
 ## 16. 测试
 
-`.venv/bin/python -m pytest -q` 运行时不需要 Docker、Postgres 或模型：存储跑在 SQLite 上，循环用 fake provider 和
-宿主进程沙箱。可选的测试套件通过环境变量开启：
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
+```
+
+测试 compose 文件在 `127.0.0.1:55437` 启动 PostgreSQL 17。集成测试必须设置 `KEEL_TEST_POSTGRES_DSN`；
+缺少该变量会失败。每个测试创建并删除独立的唯一数据库，因此连接用户需要 `CREATEDB` 权限；传入 URL 指定的基础
+数据库不会被清空。无需数据库的单元测试子集可用 `.venv/bin/python -m pytest -q -m 'not integration'` 运行。
+循环测试使用 fake provider 和宿主进程沙箱。可选的测试套件通过环境变量开启：
 
 | 变量 | 增加的内容 |
 |---|---|
-| `KEEL_TEST_POSTGRES_DSN` | 在 Postgres 上运行的存储和事件总线测试 |
 | `KEEL_TEST_DOCKER=1` | 针对真实守护进程的 Docker 沙箱（`KEEL_TEST_DOCKER_IMAGE` 指定镜像） |
 | `KEEL_TEST_SUBPROCESS=1` | 用 `SIGKILL` 杀掉一个服务进程再重启（故障注入） |
 | `KEEL_LIVE_BEDROCK=1` 加 `KEEL_TEST_DOCKER=1` | 一次真实的模型运行，在沙箱里调用 `terminal` |
 
-CI 在每次推送时运行测试套件、Postgres 测试、Docker 沙箱测试和镜像构建。
+CI 在每次推送时运行单元测试、PostgreSQL 集成测试、Docker 沙箱测试和镜像构建。

@@ -30,8 +30,8 @@ flowchart TB
 
     subgraph shared["shared state"]
         direction LR
-        DB[("Store<br/>Postgres or SQLite<br/>profiles, sessions, messages,<br/>runs, run_events, blobs")]
-        BUS{{"EventBus<br/>Postgres LISTEN/NOTIFY<br/>or in-memory"}}
+        DB[("Store<br/>Postgres<br/>profiles, sessions, messages,<br/>runs, run_events, blobs")]
+        BUS{{"EventBus<br/>Postgres LISTEN/NOTIFY"}}
     end
 
     DK["Docker daemon<br/>/var/run/docker.sock"]
@@ -76,7 +76,7 @@ Everything is in `src/keel/`.
 | `runner.py` | `RunExecutor`: the agent loop and the cancel / failure clean-up paths. |
 | `compress.py`, `compactor.py` | Context compression: the pure estimate, boundaries, request assembly and summary input; when a run compacts and what it stores. |
 | `models.py` | Provider-neutral types: `Message`, parts, `ToolCall`, `ModelRequest`, `Usage`, model events. |
-| `store/` | `Store` over a `Db` adapter: `sql.py` (all queries, both dialects), `db.py` (SQLite), `postgres.py`. |
+| `store/` | `Store` over PostgreSQL: `sql.py` (queries), `postgres.py` (connection pool and transactions). |
 | `events.py` | `InMemoryEventBus`, `PostgresEventBus`. |
 | `providers/` | `ModelProvider` interface, registry, retry policy, the Responses-API transport, Bedrock (SigV4), OpenAI. |
 | `sandbox/` | Policy parsing, the coordinated exact-ID Docker backend and its supervisor, recovery, and a host-process backend for tests. |
@@ -88,7 +88,7 @@ Everything is in `src/keel/`.
 | `memory.py` | Curated entries for the two memory targets, and the checks on a write. |
 | `review.py` | A background memory review. It writes memory only. |
 
-Interfaces exist only where there is more than one implementation: `Store` (SQLite, Postgres), `EventBus` (in-memory,
+`Store` uses PostgreSQL in every environment. Interfaces also separate `EventBus` (a local test double and
 Postgres), `ModelProvider` (Bedrock, OpenAI, a fake for tests), `SandboxExecutor` (coordinated tool facade, local
 host-process backend for tests). Everything else is concrete code.
 
@@ -184,8 +184,8 @@ Rules the schema enforces:
   rejects a terminal event type (the run transition writes that one) and an unknown run, and returns `None` for a
   terminal run so a late writer can stop quietly.
 
-The same SQL (`?` placeholders) runs on SQLite and Postgres. The schema is created and upgraded by numbered
-migrations (`store/migrations.py`) at start: each runs in its own transaction under a Postgres advisory lock, so
+The store uses PostgreSQL, with `?` query placeholders translated by its adapter. The schema is created and upgraded
+by numbered migrations (`store/migrations.py`) at start: each runs in its own transaction under a Postgres advisory lock, so
 several instances starting together migrate once. A database from 0.2.0 is upgraded in place; one written by a newer
 keel is refused.
 
@@ -382,9 +382,9 @@ sequenceDiagram
 
 ### The bus
 
-`InMemoryEventBus` is a dictionary of `asyncio.Event` keyed by run id (and `stop:<run id>`); it serves one instance
-and the tests. `PostgresEventBus` adds `LISTEN`/`pg_notify` on one channel (`keel_events`, the key as payload), so a
-notify on one instance wakes a reader on another. It needs two direct connections (one to listen, one to send); a
+`InMemoryEventBus` is a dictionary of `asyncio.Event` keyed by run id (and `stop:<run id>`); it is a test double
+and the local base of `PostgresEventBus`. The service always uses `PostgresEventBus`, which adds `LISTEN`/`pg_notify`
+on one channel (`keel_events`, the key as payload), so a notify on one instance wakes a reader on another. It needs two direct connections (one to listen, one to send); a
 transaction-mode pooler such as RDS Proxy pins or drops `LISTEN`. If the listen connection is lost, cross-instance
 wake-ups fall back to polling while it is reconnected with backoff (0.5 s, doubling up to 30 s). Once it is back,
 every waiter is woken, because a notify sent meanwhile was lost; each reader then re-reads the store.
@@ -617,16 +617,15 @@ flowchart LR
     end
     subgraph dev["Development"]
         direction TB
-        K2["keel, KEEL_SANDBOX=none or docker"] --- SQ[("SQLite file")]
+        K2["keel, KEEL_SANDBOX=none or docker"] --- PG2[("Postgres")]
     end
 ```
 
 - **Production shape today:** one keel container with Postgres, and the host's Docker socket mounted for sandboxes.
   Each sandbox joins a network you choose; keel's database should sit on a network sandboxes cannot reach.
-- **Development:** SQLite and, if you do not need isolation, `KEEL_SANDBOX=none` (chat only) or the host-process
-  backend in tests.
+- **Development:** PostgreSQL, with `KEEL_SANDBOX=none` for chat only or the host-process backend in tests.
 - **Scaling out** is what the design is for (stateless workers, claims with `SKIP LOCKED`, cross-instance wake-ups),
-  and several instances can share one Postgres database (SQLite serves one instance).
+  and several instances can share one Postgres database.
 
 Configuration is entirely environment variables, validated at start (`config.py`); the list is in the
 [configuration guide](guide/configuration.md).
@@ -662,14 +661,23 @@ The reporting policy for vulnerabilities is in [SECURITY.md](../SECURITY.md).
 
 ## 16. Testing
 
-`.venv/bin/python -m pytest -q` runs the suite without Docker, Postgres or a model: the store runs on SQLite, the
-loop on a fake provider and the host-process sandbox. Opt-in suites switch on with environment variables:
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
+```
+
+The test compose file runs PostgreSQL 17 on `127.0.0.1:55437`. Integration tests require
+`KEEL_TEST_POSTGRES_DSN`; a missing DSN fails those tests. Each test creates and drops its own unique database,
+so the configured user needs `CREATEDB`; the supplied base database is never cleared. To run only unit tests
+without a database, use `.venv/bin/python -m pytest -q -m 'not integration'`.
+
+The loop uses a fake provider and the host-process sandbox. Optional suites switch on with environment variables:
 
 | Variable | Adds |
 |---|---|
-| `KEEL_TEST_POSTGRES_DSN` | the store and event-bus tests on Postgres |
 | `KEEL_TEST_DOCKER=1` | the Docker sandbox against a real daemon (`KEEL_TEST_DOCKER_IMAGE` picks the image) |
 | `KEEL_TEST_SUBPROCESS=1` | a server process killed with `SIGKILL` and restarted (fault injection) |
 | `KEEL_LIVE_BEDROCK=1` with `KEEL_TEST_DOCKER=1` | one real model run that calls `terminal` in a sandbox |
 
-CI runs the suite, the Postgres tests, the Docker sandbox tests and an image build on every push.
+CI runs the unit and PostgreSQL integration suites, the Docker sandbox tests and an image build on every push.

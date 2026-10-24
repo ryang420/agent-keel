@@ -68,7 +68,7 @@ removal) with coordinated exact-ID generations. Migration 5 adds the `sandboxes`
 Requirements:
 
 - Every instance of one deployment uses the same PostgreSQL database, the same Docker daemon and the same
-  `KEEL_DEPLOYMENT` label. SQLite supports one instance.
+  `KEEL_DEPLOYMENT` label.
 - The installed package carries the sandbox supervisor for amd64 and arm64 (the wheel, the source distribution and
   the container image do). Building from a source tree needs `scripts/build_supervisor.py --arch all` once; it is
   never downloaded at run time.
@@ -133,5 +133,5 @@ A consumer may ask the service to remove one profile completely through the dele
 6. Do not delete rows from `profile_deletions`, `profile_deletion_receipts` or the sandbox ledger by hand: they
    are the evidence a retry relies on. A receipt may be retained after completion; it contains no conversation,
    file, memory or user email.
-7. On both SQLite and PostgreSQL the same migration and store code apply. A newer schema is refused by an older
+7. PostgreSQL databases are upgraded in place by numbered migrations. A newer schema is refused by an older
    keel, so roll back by restoring the database backup, as with any migration.

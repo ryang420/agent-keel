@@ -16,10 +16,10 @@ async def put_profile(store, profile_id="p1", tenant_id=1):
                                       tenant_id=tenant_id)
 
 
-async def test_delete_fence_survives_reopen(tmp_path, clock):
+async def test_delete_fence_survives_reopen(tmp_path, clock, pg_dsn):
     from keel.store import open_store
 
-    url = f"sqlite:///{tmp_path / 'keel.sqlite3'}"
+    url = pg_dsn
     first = await open_store(url, clock=clock)
     await put_profile(first)
     record = await first.begin_profile_deletion("p1", 1, OP_A)

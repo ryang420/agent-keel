@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
 
@@ -11,8 +10,6 @@ from keel.deletion import ProfileDeletionService
 from keel.store import open_store
 from keel.store.base import ProfileDeletionBusy
 
-DSN = os.environ.get("KEEL_TEST_POSTGRES_DSN")
-pytestmark = pytest.mark.skipif(DSN is None, reason="needs KEEL_TEST_POSTGRES_DSN")
 OP_A = "11111111-1111-4111-8111-111111111111"
 OP_B = "22222222-2222-4222-8222-222222222222"
 MODELS = [{"provider": "fake", "model": "m"}]
@@ -22,12 +19,9 @@ async def put(store, profile_id="p1"):
     return await store.upsert_profile(profile_id, models=MODELS, sandbox={}, soul="s", skills=[], tenant_id=1)
 
 
-async def test_competing_deletion_claims_have_one_winner():
-    from tests.sandbox_support import reset_postgres_schema
-
-    await reset_postgres_schema(DSN)
-    first = await open_store(DSN)
-    second = await open_store(DSN)
+async def test_competing_deletion_claims_have_one_winner(pg_dsn):
+    first = await open_store(pg_dsn)
+    second = await open_store(pg_dsn)
     try:
         await put(first)
         results = await asyncio.gather(
@@ -49,12 +43,9 @@ async def test_competing_deletion_claims_have_one_winner():
         await second.close()
 
 
-async def test_a_paused_writer_is_serialized_with_the_deletion_fence():
-    from tests.sandbox_support import reset_postgres_schema
-
-    await reset_postgres_schema(DSN)
-    writer_store = await open_store(DSN)
-    deleter_store = await open_store(DSN)
+async def test_a_paused_writer_is_serialized_with_the_deletion_fence(pg_dsn):
+    writer_store = await open_store(pg_dsn)
+    deleter_store = await open_store(pg_dsn)
     try:
         await put(writer_store)
         entered, release = asyncio.Event(), asyncio.Event()
@@ -93,12 +84,9 @@ async def test_a_paused_writer_is_serialized_with_the_deletion_fence():
         await deleter_store.close()
 
 
-async def test_guard_and_completion_serialize_across_instances():
-    from tests.sandbox_support import reset_postgres_schema
-
-    await reset_postgres_schema(DSN)
-    first = await open_store(DSN)
-    second = await open_store(DSN)
+async def test_guard_and_completion_serialize_across_instances(pg_dsn):
+    first = await open_store(pg_dsn)
+    second = await open_store(pg_dsn)
     try:
         await put(first)
         record = await first.begin_profile_deletion("p1", 1, OP_A)
@@ -116,12 +104,9 @@ async def test_guard_and_completion_serialize_across_instances():
         await second.close()
 
 
-async def test_profile_put_guard_takes_advisory_lock_before_the_profile_row():
-    from tests.sandbox_support import reset_postgres_schema
-
-    await reset_postgres_schema(DSN)
-    writer = await open_store(DSN)
-    deleter = await open_store(DSN)
+async def test_profile_put_guard_takes_advisory_lock_before_the_profile_row(pg_dsn):
+    writer = await open_store(pg_dsn)
+    deleter = await open_store(pg_dsn)
     row_held, resume_writer, delete_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
     try:
         await put(writer)

@@ -343,8 +343,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         async with store.db.transaction():
             # Lock order: the global mount-policy lock, then the profile guard that serializes this comparison and
             # update with enqueue, claims and sandbox admission (design section 6).
-            if store.db.dialect == "postgres":
-                await store.db.execute("SELECT pg_advisory_xact_lock(7312100002)")
+            await store.db.execute("SELECT pg_advisory_xact_lock(7312100002)")
             async with store.profile_guard(profile_id):
                 existing = await store.get_profile(profile_id)
                 if existing is not None and existing.tenant_id != request.state.tenant_id:

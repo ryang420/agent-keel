@@ -330,23 +330,6 @@ async def make_claim(store, session_id: str, *, profile_id: str = "p1", sandbox:
     return claim
 
 
-# Every keel table, dependents first, so a disposable PostgreSQL database starts each test from a clean schema.
-KEEL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memories, run_events, "
-               "runs, messages, sessions, profiles, tenants, blobs, profile_deletions, "
-               "profile_deletion_receipts")
-
-
-async def reset_postgres_schema(dsn: str) -> None:
-    """Drop keel's tables in the disposable test database named by `dsn` (never a real deployment's)."""
-    import asyncpg
-
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute(f"DROP TABLE IF EXISTS {KEEL_TABLES}")
-    finally:
-        await conn.close()
-
-
 async def wait_until(probe, task: asyncio.Task | None = None, *, seconds: float = 30.0,
                      what: str = "the payload to become ready") -> None:
     """Poll the async `probe` until it is true, failing at the deadline or as soon as `task` ends first.
@@ -402,7 +385,7 @@ async def seed_ready_sandbox(store, *, profile_id: str = "p1", deployment: str =
 
 
 class TransactionProbe:
-    """A `Db` proxy that records whether a test backend operation is invoked while a transaction is open.
+    """A database proxy that records whether a test backend operation is invoked while a transaction is open.
 
     Task 2's store mixin has no Docker or model calls at all, so the structural invariant holds by construction:
     every public method returns with the transaction scope closed. The probe makes that observable, and later
@@ -414,10 +397,6 @@ class TransactionProbe:
         self.depth = 0
         self.max_depth = 0
         self.backend_observations: list[tuple[str, int]] = []
-
-    @property
-    def dialect(self) -> str:
-        return self.inner.dialect
 
     async def execute(self, sql: str, *args) -> None:
         await self.inner.execute(sql, *args)

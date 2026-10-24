@@ -1,4 +1,4 @@
-"""Every query the service runs, written once for SQLite and Postgres (`?` placeholders)."""
+"""PostgreSQL store queries (`?` placeholders are numbered by the adapter)."""
 
 from __future__ import annotations
 
@@ -210,7 +210,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
                 "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, '[]', ?) "
                 "ON CONFLICT (profile_id, target) DO NOTHING",
                 profile_id, target, self.clock())
-            lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
+            lock = " FOR UPDATE"
             row = await self.db.fetchrow(
                 f"SELECT entries FROM memories WHERE profile_id = ? AND target = ?{lock}", profile_id, target)
             current = json.loads(row["entries"])
@@ -533,7 +533,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
         It reserves no sandbox usage, so a sandbox-enabled executor refuses to run what it returns.
         """
-        lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
+        lock = " FOR UPDATE SKIP LOCKED"
         row = await self.db.fetchrow(
             "UPDATE runs SET status = 'running', lease_owner = ?, lease_expires_at = ?, started_at = ? "
             "WHERE id = (SELECT id FROM runs WHERE status = 'queued' AND NOT EXISTS ("
@@ -551,8 +551,8 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         return row["status"] if row else None
 
     async def _locked_run(self, run_id: str, profile_id: str | None = None) -> dict | None:
-        """Read a run under the transaction's row lock (Postgres) or its BEGIN IMMEDIATE write lock (SQLite)."""
-        lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
+        """Read a run under the transaction's row lock."""
+        lock = " FOR UPDATE"
         if profile_id is None:
             return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ?{lock}", run_id)
         return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ? AND profile_id = ?{lock}",
@@ -640,14 +640,14 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         """Fail one bounded batch of runs whose lease expired, their terminal events committing with them.
 
         Postgres locks the selected rows with SKIP LOCKED, so a sweep, a renewal and a finish serialise on the run
-        row. SQLite serialises writers with BEGIN IMMEDIATE. A failure rolls the whole batch back; the next pass
+        row. A failure rolls the whole batch back; the next pass
         selects the same runs again. Deadlines are compared with database coordination time, the basis claims and
         renewals use; the finish time stays transcript time.
         """
         now = self.clock()
         async with self.db.transaction():
             deadline = await self.coordination_now()
-            lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
+            lock = " FOR UPDATE SKIP LOCKED"
             rows = await self.db.fetch(
                 "SELECT * FROM runs WHERE status IN ('running', 'stopping') AND lease_expires_at < ? "
                 f"ORDER BY id LIMIT ?{lock}", deadline, batch)

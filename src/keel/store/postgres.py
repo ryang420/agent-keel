@@ -27,8 +27,6 @@ CONNECT_TIMEOUT = 10
 
 
 class PostgresDb:
-    dialect = "postgres"
-
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
         self._conn: ContextVar[asyncpg.Connection | None] = ContextVar(f"keel_pg_conn_{id(self)}", default=None)

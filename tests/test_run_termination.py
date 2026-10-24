@@ -1,31 +1,22 @@
 """Postgres-only races over run termination: two independent stores, released together by a barrier.
 
 Every race must end with exactly one terminal event, and the event must agree with the stored run. The same
-scenarios run against SQLite in `tests/test_store.py`; only Postgres can exercise row-lock contention.
+scenarios also run in `tests/test_store.py`; these cases exercise row-lock contention across connection pools.
 """
 
 import asyncio
-import os
 
 import pytest
 
 from keel.store import open_store
 
-DSN = os.environ.get("KEEL_TEST_POSTGRES_DSN")
-pytestmark = pytest.mark.skipif(DSN is None, reason="needs KEEL_TEST_POSTGRES_DSN")
 REPEATS = 10
 
 
 @pytest.fixture
-async def stores():
-    import asyncpg
-
-    conn = await asyncpg.connect(DSN)
-    await conn.execute("DROP TABLE IF EXISTS sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, "
-                       "schema_version, memories, run_events, runs, messages, sessions, profiles, tenants, blobs")
-    await conn.close()
-    first = await open_store(DSN)
-    second = await open_store(DSN)
+async def stores(pg_dsn):
+    first = await open_store(pg_dsn)
+    second = await open_store(pg_dsn)
     try:
         yield first, second
     finally:
