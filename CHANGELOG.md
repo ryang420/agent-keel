@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
+M3 is accepted (`docs/design/2026-10-12-m3-reliability-memory-compression.md`, acceptance record at the end). No
+code changes since 0.3.0-rc.3; the entries for 0.3.0-rc.1 to 0.3.0-rc.3 below are the changes since 0.2.0. Highlights:
+
+- Long sessions: numbered schema migrations (a 0.2.0 database upgrades in place), context compression in place on
+  the session, run-event pruning, model-generated titles, the opt-in `memory` tool and background review.
+- Multi-tenant safety: explicit tenant ownership with tenant-scoped credentials and independent profiles, complete
+  profile deletion, and the coordinated sandbox lifecycle.
+- Reliability: Postgres listener reconnect, lease recovery, stall limits between model events, fault-injection
+  tests.
+- Models: `POST /v1/models/verify`, and Claude models on the `bedrock` provider over
+  Bedrock Mantle's Anthropic Messages API.
+
+Upgrading: back up the database first; it is migrated at start. Running more than one instance against one Docker
+daemon needs PostgreSQL and the stopped-service cutover in the operations guide.
+
 ## [0.3.0-rc.3] - 2026-10-24
 
 ### Added
@@ -185,7 +202,8 @@ All notable changes to this project are documented here. The format follows
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.3...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0
 [0.3.0-rc.3]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.2...v0.3.0-rc.3
 [0.3.0-rc.2]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.1...v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0-rc.1

@@ -6,9 +6,8 @@ sessions and multi-instance deployments safe: faults are survived and tested, se
 long-term memory, and a conversation can outgrow the model's context window. Tenant ownership and authorization
 are explicit, while every profile keeps its own runtime state (§12).
 
-Status: implemented, pending acceptance. Tenant/profile isolation requirements agreed on 2026-10-14 are
-implemented in keel; §12 remains the acceptance contract. The consumer's account-authorization and quality checks,
-the live long-session eval, and a deployment cutover rehearsal are required before a real-user pilot.
+Status: accepted 2026-10-24, released in 0.3.0. See "Acceptance record" at the end; §12 remains the tenant
+isolation contract.
 
 ## Goal and gate
 
@@ -43,8 +42,9 @@ harness and an opt-in live script (§6).
 | Explicit tenant ownership and authorization | profile isolation only | **M3** | A tenant contains multiple independent account profiles; profile isolation alone does not authorize a caller for a tenant (§12). |
 | Hermes history import | M4 | M4 | Unchanged. |
 
-Still out of M3: parallel read-only tools, scheduled jobs, approvals, web tools, the Anthropic provider and the
-Hermes import. Tenant-level quotas, billing, and shared files or knowledge are also outside this milestone (§12).
+Still out of M3: parallel read-only tools, scheduled jobs, approvals, web tools and the Hermes import. (The
+Anthropic provider was out of M3 too; it shipped separately, as Claude models on the `bedrock` provider:
+`2026-10-23-bedrock-anthropic-messages.md`.) Tenant-level quotas, billing, and shared files or knowledge are also outside this milestone (§12).
 
 ## 1. Reliability and fault injection
 
@@ -553,3 +553,18 @@ demonstrate the boundary. Do not randomly split an account's requests between ru
 Tenant-level quotas, fair scheduling, usage reporting and billing can follow based on operational needs. M3 keeps
 the existing global capacity controls and per-sandbox limits and does not claim tenant-level resource fairness.
 Shared files, shared knowledge, identity federation and cross-tenant account linking are not part of this design.
+
+## Acceptance record
+
+Accepted 2026-10-24 against the gate at the top of this document.
+
+| Gate | Evidence |
+|---|---|
+| Fault injection | `tests/test_fault_injection.py` (killed worker, deleted sandbox, provider 5xx; the next turn works) in CI on SQLite and Postgres. The first consumer also killed keel mid-command against a live model: the run failed with a user-facing message, the session stayed usable and the command was killed. |
+| Long session, scripted | `tests/test_long_session.py` in CI, covering every edge case listed in §6. |
+| Long session, live | `tests/test_long_session_live.py` with `openai.gpt-6-luna` passed: a summary compaction fired (19 → 10 messages, about 13.2k → 9.2k tokens) and the facts planted in turns 3 and 4 were recalled after it. Per turn, the prompt cache read the whole previous prefix before the compaction (2.3k → 8.5k tokens read) and 99% of the prompt on the first turn after it (6.9k of 7.0k), so the rebuilt prefix is stable. |
+| Consumer checks | The first consumer re-ran its contract checks and quality eval as same-window pairs against its previous runtime and passed its gate before and after its cutover. |
+| Tenant and profile isolation | The §12 API and store checks run in CI with the fake provider, on SQLite and Postgres; the real-sandbox checks run in the Docker suite. The first consumer's account-authorization checks pass in its own repository. |
+
+The deferred items in `CLAUDE.md` (full image replay on later turns, the tool-less final call's cache miss, a
+unique index on tool rows, command cleanup at shutdown) are not part of this gate.
