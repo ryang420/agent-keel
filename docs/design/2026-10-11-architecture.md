@@ -374,7 +374,7 @@ SQLite and a real Docker daemon; a consumer's evals reach agent-keel through the
 |---|---|---|
 | M1 | Service skeleton, store (Postgres + SQLite), event bus, provider interface and the Mantle provider, tool-less single-turn runs, events and run API; consumer HTTP client adapter | A consumer's tool-less generation jobs run on agent-keel with results equivalent to its previous runtime |
 | M2 | Agent loop, eight tools (memory in M3), Docker sandbox, sessions API, skills | An eval of a consumer's workload against its previous runtime's recorded baseline: contract checks all pass; correctness, latency, tokens and cache hit rate within agreed bounds |
-| M3 | Stop and lease recovery, compression, titles, images, memory and background review; explicit tenant ownership and authorization with independent profiles | Fault injection (kill a worker, delete a sandbox, provider 5xx) passes; a long-session eval; tenant/profile isolation and consumer account-authorization checks pass before a real-user pilot |
+| M3 | Stop and lease recovery, compression, titles, images, memory and background review; explicit tenant ownership and authorization with independent profiles | Fault injection (kill a worker, delete a sandbox, provider 5xx) passes; a long-session eval; tenant/profile isolation and consumer account-authorization checks pass before a real-user pilot (accepted 2026-10-24, released in 0.3.0) |
 | M4 | Optional, consumer-specific: import of another runtime's history and a staged cutover; not planned for keel itself | — |
 
 Each milestone gets its own spec and plan.

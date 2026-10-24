@@ -76,7 +76,7 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 
 ## Status
 
-Pre-1.0 (0.3.0-rc.3). The API and the database schema may change between releases. A database is upgraded in place at
+Pre-1.0 (0.3.0). The API and the database schema may change between releases. A database is upgraded in place at
 start (numbered migrations; the coordinated sandbox lifecycle is migration 5); a database written by a newer keel is
 refused. Back up the database before upgrading. Sandbox coordination across more than one instance needs PostgreSQL
 and the stopped-service cutover in [the operations guide](docs/guide/operations.md#upgrading-to-the-coordinated-sandbox-lifecycle).
