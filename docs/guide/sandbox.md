@@ -112,10 +112,9 @@ restore the recorded daemon and restart the service.
 ## Multiple instances and shared deployments
 
 Every instance of one deployment shares the database and the Docker daemon and uses the same `KEEL_DEPLOYMENT`
-label; deployments that share a daemon must use different labels. Use PostgreSQL when more than one instance runs:
-claims, leases, profile guards and lifecycle records are coordinated through it, and only one instance prepares or
-publishes a profile's generation at a time. SQLite supports one instance. All instances must run the same keel
-version (same helper protocol) while coordinating; mixed versions are a cutover, not a rolling state (see
+label; deployments that share a daemon must use different labels. PostgreSQL coordinates claims, leases, profile
+guards and lifecycle records, and only one instance prepares or publishes a profile's generation at a time.
+All instances must run the same keel version (same helper protocol) while coordinating; mixed versions are a cutover, not a rolling state (see
 [operations.md](operations.md)).
 
 A queue is fair while admission is closed: chat-only runs proceed, and sandbox runs stay queued in order rather

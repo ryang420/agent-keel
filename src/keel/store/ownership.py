@@ -11,8 +11,7 @@ from keel.store.migrations import _PG_LOCK
 
 async def require_tenant_ownership(db, tenant_ids: tuple[int, ...], assignment: dict[str, int]) -> None:
     async with db.transaction():
-        if db.dialect == "postgres":
-            await db.execute(_PG_LOCK)
+        await db.execute(_PG_LOCK)
         for tenant_id in dict.fromkeys(tenant_ids):
             await db.execute("INSERT INTO tenants (id) VALUES (?) ON CONFLICT (id) DO NOTHING", tenant_id)
         profiles = await db.fetch("SELECT id, tenant_id FROM profiles")
@@ -45,23 +44,6 @@ async def require_tenant_ownership(db, tenant_ids: tuple[int, ...], assignment: 
 
 
 async def _enforce(db) -> None:
-    if db.dialect == "sqlite":
-        row = await db.fetchrow("SELECT \"notnull\" AS nn FROM pragma_table_info('profiles') WHERE name = 'tenant_id'")
-        if row is not None and row["nn"] == 1:
-            return
-        await db.execute(
-            "CREATE TABLE profiles_owned ("
-            "id TEXT PRIMARY KEY, models TEXT NOT NULL, sandbox TEXT NOT NULL, soul TEXT NOT NULL, "
-            "skills TEXT NOT NULL, updated_at REAL NOT NULL, memory INTEGER NOT NULL DEFAULT 0, "
-            "incarnation TEXT, "
-            "tenant_id INTEGER NOT NULL REFERENCES tenants(id))")
-        await db.execute(
-            "INSERT INTO profiles_owned (id, models, sandbox, soul, skills, updated_at, memory, incarnation, tenant_id) "
-            "SELECT id, models, sandbox, soul, skills, updated_at, memory, incarnation, tenant_id FROM profiles")
-        await db.execute("DROP TABLE profiles")
-        await db.execute("ALTER TABLE profiles_owned RENAME TO profiles")
-        await db.execute("CREATE INDEX profiles_tenant ON profiles (tenant_id)")
-        return
     row = await db.fetchrow("SELECT 1 AS ok FROM pg_constraint WHERE conname = 'profiles_tenant_fk'")
     if row is None:
         await db.execute("ALTER TABLE profiles ALTER COLUMN tenant_id SET NOT NULL")

@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 
 class InMemoryEventBus:
-    """For a single instance and for tests."""
+    """Local wake-up delivery, also used as a test double and the PostgreSQL bus base."""
 
     def __init__(self) -> None:
         self._waiters: dict[str, asyncio.Event] = {}

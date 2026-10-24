@@ -1,7 +1,6 @@
 # agent-keel
 
-A server-side, multi-tenant agent runtime: an HTTP + SSE API, runs queued in Postgres (SQLite for local use and
-tests), an agent loop with eight tools in a per-profile Docker sandbox, skills, and pluggable model providers
+A server-side, multi-tenant agent runtime: an HTTP + SSE API, runs queued in PostgreSQL in every environment, an agent loop with eight tools in a per-profile Docker sandbox, skills, and pluggable model providers
 (Bedrock Mantle over the OpenAI Responses API, and for `anthropic.` ids the Anthropic Messages API;
 OpenAI-compatible over the Responses API). Public, MIT-licensed open-source project
 at https://github.com/ryang420/agent-keel.
@@ -25,19 +24,22 @@ milestones) and `docs/design/2026-10-12-m2-agent-loop.md` (the agent loop, tools
 
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
 ```
 
-The default run needs no Docker, database or network. Opt-in suites:
+Integration tests require PostgreSQL and `KEEL_TEST_POSTGRES_DSN`; missing infrastructure fails them. Each test
+creates/drops a private database (role needs CREATEDB), leaving the base database untouched. For pure unit tests
+without PostgreSQL, run `.venv/bin/python -m pytest -q -m 'not integration'`. Opt-in suites:
 
 - `KEEL_TEST_DOCKER=1` — Docker sandbox tests (image `KEEL_TEST_DOCKER_IMAGE`, default `python:3.12-slim`). Leave no
   containers labelled `keel.managed=1` behind.
-- `KEEL_TEST_POSTGRES_DSN=postgresql://…` — store and event-bus tests on Postgres; drops and recreates keel's tables,
-  so use a scratch database (e.g. a throwaway `postgres:16` container).
+- `KEEL_TEST_SUBPROCESS=1` — server crash/restart fault injection against PostgreSQL.
 - `KEEL_LIVE_BEDROCK=1`, `KEEL_LIVE_OPENAI=1` — call a real model. Use only the model ids the tests name
   (`KEEL_LIVE_MODEL`, `KEEL_LIVE_CLAUDE_MODEL`, `KEEL_LIVE_OPENAI_MODEL`); never probe other Bedrock model ids or regions.
 
-CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an image build. A `v*` tag runs
+CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docker and an image build. A `v*` tag runs
 `release.yml`: tests, a multi-arch image to GHCR and a GitHub release from `CHANGELOG.md`.
 
 ## How work is done here

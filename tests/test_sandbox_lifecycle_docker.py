@@ -5,7 +5,7 @@ Each test uses its own deployment label, and the fixture removes that deployment
 packaged helper for the daemon's architecture must already be built (`scripts/build_supervisor.py`); a missing
 helper fails the test rather than skipping it.
 
-The two-instance cases need both `KEEL_TEST_DOCKER=1` and `KEEL_TEST_POSTGRES_DSN`: each instance has its own store
+These cases need both `KEEL_TEST_DOCKER=1` and `KEEL_TEST_POSTGRES_DSN`: each instance has its own store
 (and connection pool) over one database, as separate keel processes do, and both share this daemon.
 """
 
@@ -27,11 +27,9 @@ from keel.sandbox.docker import DockerSandbox
 from keel.sandbox.records import SandboxUncertain
 from keel.sandbox.runtime import helper_artifact
 from keel.store import open_store
-from tests.sandbox_support import queue_run, reset_postgres_schema, wait_until
+from tests.sandbox_support import queue_run, wait_until
 
 needs_docker = pytest.mark.skipif(os.environ.get("KEEL_TEST_DOCKER") != "1", reason="set KEEL_TEST_DOCKER=1")
-DSN = os.environ.get("KEEL_TEST_POSTGRES_DSN")
-needs_postgres = pytest.mark.skipif(DSN is None, reason="the two-instance cases need KEEL_TEST_POSTGRES_DSN")
 pytestmark = needs_docker
 IMAGE = os.environ.get("KEEL_TEST_DOCKER_IMAGE", "python:3.12-slim")
 MODELS = [{"provider": "fake", "model": "m"}]
@@ -97,21 +95,14 @@ def backend(deployment, tmp_path):
     return backend
 
 
-@pytest.fixture(params=["sqlite"] + (["postgres"] if DSN else []))
-async def single(request, tmp_path):
-    """One instance's store: SQLite, and PostgreSQL when a disposable database is configured."""
-    if request.param == "sqlite":
-        url = f"sqlite:///{tmp_path / 'keel.sqlite3'}"
-    else:
-        await reset_postgres()
-        url = DSN
-    store = await open_store(url)
-    yield store, url
-    await store.close()
-
-
-async def reset_postgres() -> None:
-    await reset_postgres_schema(DSN)
+@pytest.fixture
+async def single(pg_dsn):
+    """One instance's independent connection pool over its isolated PostgreSQL database."""
+    store = await open_store(pg_dsn)
+    try:
+        yield store, pg_dsn
+    finally:
+        await store.close()
 
 
 def coordinator_for(store, backend, owner: str, *, idle_seconds: float = 1800.0) -> SandboxCoordinator:
@@ -440,11 +431,9 @@ async def test_unknown_and_legacy_containers_block_only_their_profile_until_reso
 # --- two instances sharing one database and one daemon ------------------------------------------------------
 
 
-@needs_postgres
 async def test_two_instances_share_a_generation_and_recover_an_orphan_without_touching_the_survivor(
-        backend, tmp_path):
-    await reset_postgres()
-    stores = [await open_store(DSN) for _ in range(3)]
+        backend, tmp_path, pg_dsn):
+    stores = [await open_store(pg_dsn) for _ in range(3)]
     try:
         a, b, c = [await opened(store, backend, owner) for store, owner in zip(
             stores, ("instance-a", "instance-b", "instance-c"))]
@@ -505,10 +494,8 @@ async def test_two_instances_share_a_generation_and_recover_an_orphan_without_to
             await store.close()
 
 
-@needs_postgres
-async def test_a_late_create_from_a_stale_instance_cannot_replace_the_published_generation(backend):
-    await reset_postgres()
-    stores = [await open_store(DSN) for _ in range(2)]
+async def test_a_late_create_from_a_stale_instance_cannot_replace_the_published_generation(backend, pg_dsn):
+    stores = [await open_store(pg_dsn) for _ in range(2)]
     try:
         a, b = [await opened(store, backend, owner) for store, owner in zip(stores, ("instance-a", "instance-b"))]
         await seed(stores[0], "p1")

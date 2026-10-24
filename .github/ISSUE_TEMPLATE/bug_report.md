@@ -12,7 +12,7 @@ labels: bug
 
 **Environment**
 - keel version:
-- Database (Postgres or SQLite):
+- PostgreSQL version:
 - Provider (bedrock or openai, and the server if compatible):
 - Docker and sandbox runtime:
 

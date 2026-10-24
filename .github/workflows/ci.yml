@@ -10,6 +10,7 @@ permissions:
   contents: read
 
 jobs:
+  # Keep the required check names stable: repository rules expect both test and postgres.
   test:
     name: test
     runs-on: ubuntu-latest
@@ -21,9 +22,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e '.[dev]'
-      - run: pytest -q
-        env:
-          KEEL_TEST_SUBPROCESS: "1"
+      - run: pytest -q -m 'not integration'
 
   postgres:
     name: postgres
@@ -31,7 +30,7 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_USER: keel
           POSTGRES_HOST_AUTH_METHOD: trust
@@ -50,22 +49,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e '.[dev]'
-      # The store, bus, runner and sandbox coordination tests drop and recreate keel's tables in this throwaway
-      # database. Every module with PostgreSQL cases is listed explicitly, except the live-model modules and the
-      # Docker lifecycle module (its PostgreSQL cases run in the docker job's two-instance step).
-      - run: >-
-          pytest -q -rs tests/test_postgres_db.py tests/test_store.py tests/test_events.py tests/test_runner.py
-          tests/test_worker.py tests/test_migrations.py tests/test_compaction.py tests/test_fault_injection.py
-          tests/test_tenant_api.py tests/test_tenant_ownership.py tests/test_run_termination.py
-          tests/test_sandbox_store.py tests/test_sandbox_recovery_store.py tests/test_sandbox_postgres.py
-          tests/test_sandbox_coordinator.py tests/test_sandbox_recovery.py tests/test_sandbox_api.py
-          tests/test_sandbox_worker.py tests/test_coordinated_tools.py tests/test_service.py
-          tests/test_docker_operations.py tests/test_api.py tests/test_agent_loop.py tests/test_models_verify.py
-          tests/test_long_session.py tests/test_store_import.py tests/test_admin_import.py tests/test_review.py
-          tests/test_profile_deletion_store.py tests/test_profile_deletion_runtime.py
-          tests/test_profile_deletion_postgres.py tests/test_profile_deletion_api.py
+      - run: pytest -q -rs
         env:
           KEEL_TEST_POSTGRES_DSN: postgresql://keel@localhost:5432/keel_test
+          KEEL_TEST_SUBPROCESS: "1"
 
   docker:
     name: docker
@@ -73,7 +60,7 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_USER: keel
           POSTGRES_HOST_AUTH_METHOD: trust
@@ -95,16 +82,10 @@ jobs:
       - run: docker pull python:3.12-slim && docker pull debian:bookworm-slim
       # The coordinator installs the packaged helper for the daemon's architecture; build it for this runner.
       - run: python scripts/build_supervisor.py --arch amd64
+      # Includes independent PostgreSQL stores and real Docker lifecycle acceptance.
       - run: >-
           pytest -q -rs tests/test_docker_sandbox.py tests/test_docker_operations.py tests/test_fault_injection.py
-          tests/test_sandbox_lifecycle_docker.py
-          tests/test_profile_deletion_docker.py
-        timeout-minutes: 30
-        env:
-          KEEL_TEST_DOCKER: "1"
-      # Two-instance lifecycle acceptance: independent stores over one PostgreSQL database sharing this daemon.
-      - name: two-instance PostgreSQL and Docker acceptance
-        run: pytest -q -rs tests/test_sandbox_lifecycle_docker.py tests/test_fault_injection.py
+          tests/test_sandbox_lifecycle_docker.py tests/test_profile_deletion_docker.py
         timeout-minutes: 30
         env:
           KEEL_TEST_DOCKER: "1"

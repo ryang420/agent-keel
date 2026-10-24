@@ -54,7 +54,7 @@ class ProfileIncarnationMismatch(StoreError):
 
 
 class UniqueViolation(Exception):
-    """Raised by a Db adapter when a unique constraint rejects a write."""
+    """Raised by the database adapter when a unique constraint rejects a write."""
 
 
 class OwnershipError(Exception):

@@ -38,10 +38,11 @@ minutes.
 ## OpenAI-compatible (`openai`)
 
 Any server that implements the Responses API (`POST <base>/responses`, streaming) with bearer-key auth. It is
-registered when `KEEL_OPENAI_API_KEY` (or `OPENAI_API_KEY`) is set.
+registered when `KEEL_OPENAI_API_KEY` (or `OPENAI_API_KEY`) is set. Set `KEEL_DATABASE_URL` below to an existing
+PostgreSQL database with your credentials.
 
 ```bash
-KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 KEEL_DATABASE_URL=sqlite:///keel.sqlite3 \
+KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 KEEL_DATABASE_URL=postgresql://keel:password@localhost:5432/keel \
 KEEL_OPENAI_API_KEY=<your-key> \
 KEEL_OPENAI_BASE_URL=http://my-server:8000/v1 \
 KEEL_OPENAI_COMPAT=1 \

@@ -41,13 +41,11 @@ class ProfileDeletionStoreMixin:
         """Serialize profile admission and mutation across processes.
 
         PostgreSQL advisory transaction locks are shared by fence creation, the
-        purge, completion and every profile-owned writer. SQLite's
-        ``BEGIN IMMEDIATE`` already serializes writers; this is a no-op there.
+        purge, completion and every profile-owned writer.
         """
-        if self.db.dialect == "postgres":
-            await self.db.execute(
-                "SELECT pg_advisory_xact_lock(hashtext('keel.profile'), hashtext(?))",
-                profile_id)
+        await self.db.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('keel.profile'), hashtext(?))",
+            profile_id)
 
     async def _assert_deletion_authority(self, profile_id: str, authority: ProfileDeletionAuthority,
                                          *, phases: tuple[str, ...] = ("draining",)) -> None:

@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** PostgreSQL is now the only supported database, including local development. `KEEL_DATABASE_URL`
+  must use `postgresql://` or `postgres://`; SQLite URLs are rejected. Existing PostgreSQL databases continue to
+  upgrade in place through numbered migrations.
+- Database integration tests require `KEEL_TEST_POSTGRES_DSN` and create and drop unique per-test databases with a
+  `CREATEDB` user, leaving the supplied base database untouched. `docker-compose.test.yml` provides PostgreSQL 17;
+  `.venv/bin/python -m pytest -q -m 'not integration'` runs the unit subset without a database. Docker sandbox and
+  live-model suites remain opt-in.
+
 ## [0.3.0] - 2026-10-24
 
 M3 is accepted (`docs/design/2026-10-12-m3-reliability-memory-compression.md`, acceptance record at the end). No

@@ -2,8 +2,8 @@ from keel.store import open_store
 from keel.store.ownership import require_tenant_ownership
 
 
-async def test_memory_and_titles_survive_a_restart_on_their_own_profiles(tmp_path):
-    url = f"sqlite:///{tmp_path / 'keel.sqlite3'}"
+async def test_memory_and_titles_survive_a_restart_on_their_own_profiles(tmp_path, pg_dsn):
+    url = pg_dsn
     store = await open_store(url)
     await require_tenant_ownership(store.db, (1,), {})
     for profile_id, fact in (("p1", "FACT-P1"), ("p2", "FACT-P2")):

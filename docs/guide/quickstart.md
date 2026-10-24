@@ -19,10 +19,15 @@ To use an OpenAI-compatible provider instead, export `KEEL_OPENAI_API_KEY` befor
 it through (an empty key leaves the provider unregistered). Optionally export `KEEL_OPENAI_BASE_URL` (another
 compatible server) and `KEEL_OPENAI_COMPAT=1` (strict servers). The `~/.aws` mount is only needed for Bedrock.
 
-Without Docker you can run `pip install -e .` and then
-`KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 KEEL_DATABASE_URL=sqlite:///keel.sqlite3 python -m keel`;
-with `KEEL_SANDBOX=none` the agent
-answers without tools.
+To run keel directly, install it with `pip install -e .` and connect it to a running PostgreSQL server
+(including for local development):
+
+```bash
+KEEL_API_KEY=dev KEEL_API_KEY_TENANT=1 KEEL_DATABASE_URL=postgresql://keel:password@localhost:5432/keel \
+KEEL_SANDBOX=none python -m keel
+```
+
+Set the URL to your database credentials. With `KEEL_SANDBOX=none` the agent answers without tools.
 
 Check it is up:
 

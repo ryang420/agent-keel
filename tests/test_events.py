@@ -1,8 +1,6 @@
 import asyncio
-import os
 
 import asyncpg
-import pytest
 
 from keel.events import InMemoryEventBus, PostgresEventBus
 
@@ -59,9 +57,8 @@ async def test_a_stalled_notify_times_out_and_is_best_effort():
     assert waiter.is_set() and not bus._send_lock.locked()
 
 
-@pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"), reason="needs KEEL_TEST_POSTGRES_DSN")
-async def test_postgres_notify_reaches_another_instance():
-    dsn = os.environ["KEEL_TEST_POSTGRES_DSN"]
+async def test_postgres_notify_reaches_another_instance(pg_dsn):
+    dsn = pg_dsn
     listener, sender = PostgresEventBus(dsn), PostgresEventBus(dsn)
     await listener.start()
     await sender.start()
@@ -89,9 +86,8 @@ async def test_notify_without_a_database_does_not_raise_and_wakes_locally():
     await bus.close()
 
 
-@pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"), reason="needs KEEL_TEST_POSTGRES_DSN")
-async def test_notify_reconnects_after_the_send_connection_is_closed():
-    dsn = os.environ["KEEL_TEST_POSTGRES_DSN"]
+async def test_notify_reconnects_after_the_send_connection_is_closed(pg_dsn):
+    dsn = pg_dsn
     listener, sender = PostgresEventBus(dsn), PostgresEventBus(dsn)
     await listener.start()
     await sender.start()
@@ -194,9 +190,8 @@ async def test_a_listener_lost_after_close_is_not_reconnected():
     assert bus._reconnect is None
 
 
-@pytest.mark.skipif(not os.environ.get("KEEL_TEST_POSTGRES_DSN"), reason="needs KEEL_TEST_POSTGRES_DSN")
-async def test_the_listener_reconnects_after_its_backend_is_terminated():
-    dsn = os.environ["KEEL_TEST_POSTGRES_DSN"]
+async def test_the_listener_reconnects_after_its_backend_is_terminated(pg_dsn):
+    dsn = pg_dsn
     listener, sender = PostgresEventBus(dsn), PostgresEventBus(dsn)
     listener.RECONNECT_MIN = 0.05
     await listener.start()

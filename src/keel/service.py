@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from keel.api import Keel, create_app
 from keel.background import Background
 from keel.config import Settings
-from keel.events import InMemoryEventBus, PostgresEventBus
+from keel.events import PostgresEventBus
 from keel.providers.base import ProviderRegistry
 from keel.providers.bedrock import BedrockMantleProvider
 from keel.providers.openai import OpenAIProvider
@@ -47,7 +47,7 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     store = await open_store(settings.database_url, command_timeout=settings.db_command_timeout,
                              tenant_ids=tuple(credential.tenant_id for credential in settings.credentials),
                              tenant_backfill=settings.tenant_backfill)
-    bus = PostgresEventBus(settings.database_url) if settings.is_postgres else InMemoryEventBus()
+    bus = PostgresEventBus(settings.database_url)
     await bus.start()
     registry = providers or default_providers(settings)
     coordinator = None

@@ -3,7 +3,7 @@ import pytest
 from keel.config import ServiceCredential, Settings
 
 BASE = {"KEEL_API_KEY": "secret", "KEEL_API_KEY_TENANT": "1",
-        "KEEL_DATABASE_URL": "sqlite:///tmp/keel.sqlite3"}
+        "KEEL_DATABASE_URL": "postgresql://keel@localhost/keel_test"}
 
 
 def test_defaults_from_the_minimum_environment():
@@ -13,19 +13,19 @@ def test_defaults_from_the_minimum_environment():
     assert "secret" not in repr(settings)
     assert settings.workers == 4 and settings.max_running == 10
     assert settings.lease_seconds == 30.0 and settings.aws_region == "us-east-1"
-    assert settings.instance_id and not settings.is_postgres
+    assert settings.instance_id
 
 
-def test_overrides_and_postgres_detection():
+def test_overrides():
     settings = Settings.from_env({**BASE, "KEEL_DATABASE_URL": "postgresql://u:" + "p@db/keel",
                                   "KEEL_WORKERS": "2", "KEEL_MAX_RUNNING": "6",
                                   "KEEL_LEASE_SECONDS": "12", "AWS_REGION": "us-west-2"})
     assert (settings.workers, settings.max_running, settings.lease_seconds) == (2, 6, 12.0)
-    assert settings.aws_region == "us-west-2" and settings.is_postgres
+    assert settings.aws_region == "us-west-2"
 
 
 @pytest.mark.parametrize(("env", "message"), [
-    ({"KEEL_DATABASE_URL": "sqlite:///x"}, "KEEL_API_KEY"),
+    ({"KEEL_DATABASE_URL": "postgresql://keel@localhost/keel_test"}, "KEEL_API_KEY"),
     ({"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "1"}, "KEEL_DATABASE_URL"),
     ({**BASE, "KEEL_DATABASE_URL": "mysql://x"}, "KEEL_DATABASE_URL"),
     ({**BASE, "KEEL_WORKERS": "0"}, "KEEL_WORKERS"),
@@ -40,7 +40,7 @@ def test_bad_settings_name_the_variable(env, message):
 
 
 def test_sandbox_settings_have_defaults_and_validation():
-    base = {"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "1", "KEEL_DATABASE_URL": "sqlite:///x.db"}
+    base = {"KEEL_API_KEY": "k", "KEEL_API_KEY_TENANT": "1", "KEEL_DATABASE_URL": "postgresql://keel@localhost/keel_test"}
     settings = Settings.from_env(base)
     assert (settings.max_iterations, settings.sandbox, settings.sandbox_idle_seconds, settings.sandbox_mount_root,
             settings.docker, settings.deployment) == (60, "docker", 1800.0, None, "docker", "keel")
@@ -197,3 +197,9 @@ def test_sandbox_reap_timeout_has_finite_positive_default_and_override():
     for bad in ("0", "-1", "nan", "inf", "86400.5", "1e300"):
         with pytest.raises(ValueError, match="KEEL_SANDBOX_REAP_SECONDS"):
             Settings.from_env({**BASE, "KEEL_SANDBOX_REAP_SECONDS": bad})
+
+
+@pytest.mark.parametrize("url", ["sqlite:///keel.db", "sqlite:///:memory:"])
+def test_sqlite_database_urls_are_rejected(url):
+    with pytest.raises(ValueError, match="KEEL_DATABASE_URL"):
+        Settings.from_env({**BASE, "KEEL_DATABASE_URL": url})

@@ -23,7 +23,6 @@ dependencies = [
     "uvicorn>=0.30,<1",
     "httpx>=0.27,<1",
     "botocore>=1.34,<2",
-    "aiosqlite>=0.20,<1",
     "asyncpg>=0.29,<1",
 ]
 
@@ -46,3 +45,4 @@ keel = ["prompts/*.md", "prompts/tools/*.json", "sandbox/bin/*"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = ["integration: requires a disposable PostgreSQL database"]

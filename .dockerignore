@@ -10,4 +10,3 @@ tests
 docs
 build
 src/keel/sandbox/bin
-*.sqlite3

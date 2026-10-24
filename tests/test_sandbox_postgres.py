@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import os
 from dataclasses import dataclass
 
 import httpx
@@ -26,11 +25,9 @@ from keel.sandbox.base import SandboxError
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.store import open_store
 from tests.sandbox_support import (
-    LocalDocker, absence_verified_before_create, install_helper_assets, queue_run, reset_postgres_schema, wait_until,
+    LocalDocker, absence_verified_before_create, install_helper_assets, queue_run, wait_until,
 )
 
-DSN = os.environ.get("KEEL_TEST_POSTGRES_DSN")
-pytestmark = pytest.mark.skipif(DSN is None, reason="needs KEEL_TEST_POSTGRES_DSN")
 DEPLOYMENT, DAEMON = "dep", "daemon-1"
 LEASE = 30.0
 REPEATS = 6
@@ -80,19 +77,14 @@ class Cluster:
         return await self.c.store.db.database_now() + seconds
 
 
-async def reset_schema() -> None:
-    await reset_postgres_schema(DSN)
-
-
 @pytest.fixture
-async def cluster(tmp_path, monkeypatch):
+async def cluster(tmp_path, monkeypatch, pg_dsn):
     install_helper_assets(tmp_path / "bin", monkeypatch)
-    await reset_schema()
     backend = LocalDocker(daemon_id=DAEMON)
     instances = []
     try:
         for owner in ("instance-a", "instance-b", "instance-c"):
-            store = await open_store(DSN)
+            store = await open_store(pg_dsn)
             coordinator = SandboxCoordinator(store, backend, deployment=DEPLOYMENT, owner=owner, lease_seconds=LEASE,
                                              idle_seconds=10.0, reap_seconds=1.0)
             instances.append(Instance(store, coordinator))

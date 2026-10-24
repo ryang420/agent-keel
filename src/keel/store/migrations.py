@@ -8,10 +8,7 @@ from dataclasses import dataclass
 # Taken first in every migration's transaction, so instances starting together migrate once.
 # The key must equal 0.2.0's, so that a 0.2.0 instance and this one starting together also serialise.
 _PG_LOCK = "SELECT pg_advisory_xact_lock(7312100001)"
-_TYPES = {
-    "sqlite": {"real": "REAL", "serial": "INTEGER", "bigint": "INTEGER"},
-    "postgres": {"real": "DOUBLE PRECISION", "serial": "BIGSERIAL", "bigint": "BIGINT"},
-}
+_TYPES = {"real": "DOUBLE PRECISION", "serial": "BIGSERIAL", "bigint": "BIGINT"}
 
 
 class SchemaTooNew(Exception):
@@ -21,15 +18,11 @@ class SchemaTooNew(Exception):
 @dataclass(frozen=True)
 class Migration:
     version: int
-    template: str  # statements separated by ";", with {real}, {serial} and {bigint} filled per dialect
+    template: str  # statements separated by ";", with {real}, {serial} and {bigint} filled with PostgreSQL types
 
-    def statements(self, dialect: str) -> list[str]:
+    def statements(self) -> list[str]:
         sql = self.template
-        if dialect == "sqlite":
-            # SQLite only auto-increments an INTEGER PRIMARY KEY when it is declared exactly that way.
-            # Tenant ids are assigned by the operator, so only {serial} columns get AUTOINCREMENT.
-            sql = sql.replace("id {serial} PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
-        sql = sql.format(**_TYPES[dialect])
+        sql = sql.format(**_TYPES)
         return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 
@@ -198,11 +191,8 @@ LATEST_VERSION = MIGRATIONS[-1].version
 
 
 async def _table_exists(db, name: str) -> bool:
-    if db.dialect == "sqlite":
-        row = await db.fetchrow("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?", name)
-    else:
-        row = await db.fetchrow("SELECT 1 AS ok FROM information_schema.tables "
-                                "WHERE table_schema = current_schema() AND table_name = ?", name)
+    row = await db.fetchrow("SELECT 1 AS ok FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() AND table_name = ?", name)
     return row is not None
 
 
@@ -229,11 +219,10 @@ async def _set_version(db, version: int) -> None:
 
 async def migrate(db) -> int:
     """Bring the schema to LATEST_VERSION, one transaction per migration, each re-reading the version under the lock;
-    statements run one at a time because SQLite's executescript would commit the transaction."""
+    each version and its stamp commit atomically."""
     for migration in MIGRATIONS:
         async with db.transaction():
-            if db.dialect == "postgres":
-                await db.execute(_PG_LOCK)
+            await db.execute(_PG_LOCK)
             current = await schema_version(db)
             if current > LATEST_VERSION:
                 raise SchemaTooNew(f"The database schema is version {current}; this keel knows versions up to "
@@ -241,11 +230,11 @@ async def migrate(db) -> int:
             if current >= migration.version:
                 if await _stamped_version(db) is None:
                     # A 0.2.0 database, maybe partly created: 0.2.0 made its tables outside a transaction.
-                    for statement in migration.statements(db.dialect):
+                    for statement in migration.statements():
                         await db.execute(statement)
                     await _set_version(db, current)
                 continue
-            for statement in migration.statements(db.dialect):
+            for statement in migration.statements():
                 await db.execute(statement)
             await _set_version(db, migration.version)
     return LATEST_VERSION
