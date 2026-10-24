@@ -7,6 +7,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The `bedrock` provider serves Claude models: an id starting with `anthropic.` (for example
+  `anthropic.claude-opus-5-5`) goes to Bedrock Mantle's Anthropic Messages API at `/anthropic/v1/messages`, with
+  the same region and SigV4 credentials. It caches at `cache_control` breakpoints, replays each turn's original
+  content blocks so thinking stays valid, and sends `drop_block` for thinking whose conversation changed (compression,
+  compaction, new run instructions). Claude 4.6+ models get adaptive thinking and `reasoning_effort` as effort
+  (`none` is sent as `low`). Design: `docs/design/2026-10-23-bedrock-anthropic-messages.md`.
 - Complete profile deletion: authenticated `DELETE /v1/profiles/{profile_id}` fences a tenant-owned profile,
   cancels its queued and active runs, retires its sandboxes through verified exact container identities, and purges
   its sessions, messages, runs, events, blobs, memory and profile configuration. A same-operation retry resumes

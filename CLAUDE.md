@@ -2,7 +2,8 @@
 
 A server-side, multi-tenant agent runtime: an HTTP + SSE API, runs queued in Postgres (SQLite for local use and
 tests), an agent loop with eight tools in a per-profile Docker sandbox, skills, and pluggable model providers
-(Bedrock Mantle and OpenAI-compatible, both over the OpenAI Responses API). Public, MIT-licensed open-source project
+(Bedrock Mantle over the OpenAI Responses API, and for `anthropic.` ids the Anthropic Messages API;
+OpenAI-compatible over the Responses API). Public, MIT-licensed open-source project
 at https://github.com/ryang420/agent-keel.
 
 Start with `README.md`, then `docs/design/2026-10-11-architecture.md` (the whole design; its §13 lists the
@@ -34,7 +35,7 @@ The default run needs no Docker, database or network. Opt-in suites:
 - `KEEL_TEST_POSTGRES_DSN=postgresql://…` — store and event-bus tests on Postgres; drops and recreates keel's tables,
   so use a scratch database (e.g. a throwaway `postgres:16` container).
 - `KEEL_LIVE_BEDROCK=1`, `KEEL_LIVE_OPENAI=1` — call a real model. Use only the model ids the tests name
-  (`KEEL_LIVE_MODEL`, `KEEL_LIVE_OPENAI_MODEL`); never probe other Bedrock model ids or regions.
+  (`KEEL_LIVE_MODEL`, `KEEL_LIVE_CLAUDE_MODEL`, `KEEL_LIVE_OPENAI_MODEL`); never probe other Bedrock model ids or regions.
 
 CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an image build. A `v*` tag runs
 `release.yml`: tests, a multi-arch image to GHCR and a GitHub release from `CHANGELOG.md`.
