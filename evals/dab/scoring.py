@@ -18,7 +18,15 @@ class ScoringError(RuntimeError):
     """The pinned validator could not be imported."""
 
 
-def _load_validator(path: Path):
+def _load_validator(path: Path, repo: Path):
+    """Import a pinned validator with the DAB checkout importable.
+
+    Nine validators import helpers from ``common_scaffold``; upstream runs them with the repository root on
+    ``sys.path``, so the evaluator does the same. Gold and validator code stay outside every sandbox.
+    """
+    root = str(repo.resolve())
+    if root not in sys.path:
+        sys.path.insert(0, root)
     name = f"dab_validate_{path.parent.parent.name}_{path.parent.name}"
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -45,7 +53,7 @@ def score(case: Case, repo: Path, answer: str | None, *, tool_calls: int = 0, du
         return record
     query_dir = case.query_dir(repo)
     try:
-        module = _load_validator(query_dir / "validate.py")
+        module = _load_validator(query_dir / "validate.py", repo)
         passed, reason = module.validate(answer)
     except ScoringError as exc:
         record["validator_error"] = str(exc)

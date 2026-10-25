@@ -431,3 +431,19 @@ async def test_benchmark_services_restore_and_enforce_read_only():
         services.finish(postgres_case)
         services.finish(mongo_case)
         services.stop()
+
+
+def test_a_validator_can_import_dab_scaffold_helpers(tmp_path):
+    """Nine pinned validators import from common_scaffold; the evaluator puts the checkout on sys.path."""
+    repo = tmp_path / "repo"
+    query_dir = repo / "query_stockindex" / "query1"
+    query_dir.mkdir(parents=True)
+    (repo / "common_scaffold").mkdir()
+    (repo / "common_scaffold" / "__init__.py").write_text("")
+    (repo / "common_scaffold" / "helper.py").write_text("def match(answer):\n    return answer.strip() == '42'\n")
+    (query_dir / "validate.py").write_text(
+        "from common_scaffold.helper import match\n\ndef validate(answer):\n    return match(answer), 'via helper'\n")
+    (query_dir / "ground_truth.csv").write_text("42\n")
+    (query_dir / "query.json").write_text(json.dumps("q"))
+    record = scoring.score(case(), repo, "42")
+    assert record["official_validator_pass"] and record["reason"] == "via helper"

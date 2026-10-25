@@ -257,7 +257,8 @@ async def execute(cases: list[Case], *, paths: Paths, repo: Path, ledger: Ledger
                             image_digest=digest, mount_root=mount_root, provider=provider, model=model,
                             reasoning_effort=reasoning_effort, repetition=repetition, timeout_s=timeout_s,
                             keel=keel, env=env, services=tuple(services),
-                            service_network=bench.network if bench is not None else None))
+                            service_network=(bench.network if bench is not None and case.dataset.service_dbms
+                                             else None)))
                     finally:
                         if bench is not None:
                             bench.finish(case)

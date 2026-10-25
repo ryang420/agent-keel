@@ -125,6 +125,25 @@ genuine one: its answer names a `(None, None)` title/artist group as the revenue
 match fails. No prompt, model, membership or hint was changed to produce the higher score, and the report keeps the
 fallback count beside the result.
 
+## Full-membership pilot (one run per query)
+
+On 2026-10-25 all 54 frozen queries ran once each against the same pinned revision, image and model settings.
+Every query executed: no setup failure, timeout, budget stop or missing output. 2,027,313 tokens were charged
+against an 8,000,000 grant, and the serial run took about forty minutes.
+
+Pass@1 was **0.3917** (23 of 54): `stockindex` 1.0, `crmarenapro` 0.538, `GITHUB_REPOS` and `googlelocal` 0.5,
+`yelp` 0.429, `stockmarket` 0.4, `bookreview`, `music_brainz_20k`, `pancancer_atlas` and `patents` 0.333,
+`DEPS_DEV_V1` and `agnews` 0.0. Seventeen of the 54 finals carried no `ANSWER:` marker and used the v2 fallback;
+three cases carried the gold-in-public-input warning recorded above and no harness leak. Nine validators import
+helpers from DAB's `common_scaffold`, so scoring puts the pinned checkout root on `sys.path` as upstream does; before
+that fix those nine were evaluator errors, never model failures.
+
+For context only, the published DAB leaderboard places 0.3917 between row 42 (0.4464) and row 43 (0.3663), an
+insertion rank of 43 of 48. This is not an official result and not a submission: the leaderboard requires five runs
+per query, almost every published row used database hints, and many used a DAB-tuned prompt or the bundled
+scaffold, while this run used no hints, a generic prompt and Keel's own tools. The figure measures this runtime and
+model, not a comparable benchmark rank.
+
 ## Gate and non-goals
 
 Before execution of the full membership: review this document for material planning gaps and approve it, then write
