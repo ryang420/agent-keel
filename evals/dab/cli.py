@@ -74,6 +74,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if not args.skip_image:
         image_id = runner.image_id(args.image)
     prompt_hashes: dict[str, str] = {}
+    suspects: dict[str, list[str]] = {}
     problems: list[str] = []
     for case in cases:
         row = result[case.case_id]
@@ -84,7 +85,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             from .policy import isolation
 
             staged = isolation(case, paths.repo, Path(args.mount_root), f"validate-{abs(hash(case.case_id))}",
-                               image=args.image)
+                               image=args.image, services=tuple(args.services),
+                               service_network="validate-only" if case.dataset.service_dbms else None)
             prompt = build_prompt(case, paths.repo, staged.stores)
         except Exception as exc:  # noqa: BLE001 - validation reports a blocked case instead of crashing
             result[case.case_id] = {"status": inputs.BLOCKED, "reason": str(exc)}
@@ -98,8 +100,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
             problems.append(f"{case.case_id}: prompt leaks {list(prompt.leaks)}")
             continue
         prompt_hashes[case.case_id] = prompt.sha256
+        if prompt.suspects:
+            suspects[case.case_id] = list(prompt.suspects)
     budget = paths.budget.is_file()
+    from . import services as service_images
+
+    images = service_images.available()
+    missing = [kind for kind in args.services if not images.get(kind)]
+    if missing:
+        problems.append(f"missing service image for: {', '.join(missing)}")
     payload = {"protocol": PROTOCOL, "cases": result, "prompt_sha256": prompt_hashes,
+               "prompt_suspects": suspects, "service_images": images,
                "image": args.image, "image_id": image_id, "budget_granted": budget, "problems": problems}
     (paths.root / "validation.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
                                                 encoding="utf-8")
@@ -107,6 +118,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
           f"budget {'granted' if budget else 'not granted'}")
     for line in problems:
         print(f"  problem {line}")
+    for case_id, notes in suspects.items():
+        print(f"  warning {case_id}: {'; '.join(notes)}")
     blocked = [case.case_id for case in cases if result[case.case_id]["status"] != inputs.READY]
     if blocked:
         print(f"  not ready: {', '.join(blocked)}")
@@ -130,7 +143,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
         mount_root=Path(args.mount_root), admin_dsn=admin, provider=args.provider, model=args.model,
         reasoning_effort=args.reasoning_effort, repetition=args.repetition, max_output=args.max_output,
         timeout_s=args.timeout, docker=args.docker, openai_base_url=args.openai_base_url,
-        max_iterations=args.max_iterations))
+        max_iterations=args.max_iterations, services=tuple(args.services)))
     output = paths.runs() / "executed.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n", encoding="utf-8")

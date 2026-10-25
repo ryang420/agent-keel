@@ -31,6 +31,21 @@ export KEEL_OPENAI_API_KEY=...
 
 Never commit credentials, datasets, gold or reports. Everything under `.local/evals/` is ignored.
 
+## Service-backed datasets
+
+Seven of the twelve datasets need database servers (PostgreSQL and/or MongoDB). `execute` starts pinned
+`postgres:17` and `mongo:7` containers on an internal Docker network (`keel-dab-internal`, created with
+`--internal`), restores a fresh database per case from the pinned dump, and joins only that case's sandbox to the
+network. The sandbox receives `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` or `MONGO_URI`; the role is
+read-only (PostgreSQL `default_transaction_read_only` plus grants, MongoDB `read` role). Databases and users are
+dropped after each case, and the containers and network are removed when execution ends. Passwords are generated per
+process and redacted from artifacts.
+
+```bash
+python -m evals.dab prepare --all --services postgres --services mongo
+python -m evals.dab validate --all --services postgres --services mongo
+```
+
 ## Commands
 
 ```bash

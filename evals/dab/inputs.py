@@ -11,6 +11,8 @@ import hashlib
 import json
 import subprocess
 import tarfile
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,14 +68,32 @@ class Paths:
         return self
 
 
-def _download(url: str, dest: Path, *, timeout: float = 120.0) -> None:
-    """Stream a URL to a temporary sibling, then rename, so a partial download is never verified."""
+def _download(url: str, dest: Path, *, timeout: float = 300.0, attempts: int = 6) -> None:
+    """Stream a URL to ``<dest>.part`` with Range resumes, then rename into place.
+
+    A partial file survives a failed attempt and is resumed, so a multi-gigabyte mirror file does not restart from
+    zero after one slow read. The bytes are still verified against their pin by the caller.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     temporary = dest.with_name(dest.name + ".part")
-    with urllib.request.urlopen(url, timeout=timeout) as response, temporary.open("wb") as handle:
-        while chunk := response.read(1 << 20):
-            handle.write(chunk)
-    temporary.replace(dest)
+    for attempt in range(1, attempts + 1):
+        offset = temporary.stat().st_size if temporary.is_file() else 0
+        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"} if offset else {})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                append = bool(offset) and response.status == 206
+                if not append:
+                    offset = 0
+                with temporary.open("ab" if append else "wb") as handle:
+                    while chunk := response.read(1 << 20):
+                        handle.write(chunk)
+            temporary.replace(dest)
+            return
+        except (TimeoutError, urllib.error.URLError, OSError):
+            if attempt == attempts:
+                raise
+            time.sleep(min(30.0, 2.0 * attempt))
+    raise InputError(f"could not download {url}")
 
 
 def ensure_source(paths: Paths, revision: str) -> dict:
@@ -98,7 +118,10 @@ def _fetch_if_needed(paths: Paths, repo: Path, relative: str, pin: dict) -> str:
     path = repo / relative
     if path.is_file() and path.stat().st_size == pin["bytes"] and sha256_file(path) == pin["sha256"]:
         return "cached"
-    _download(MIRROR_URL.format(path=relative), path)
+    try:
+        _download(MIRROR_URL.format(path=relative), path)
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        raise InputError(f"{relative}: download failed: {exc}") from exc
     if path.stat().st_size != pin["bytes"] or sha256_file(path) != pin["sha256"]:
         raise InputError(f"{relative} does not match its pinned SHA-256 and byte count")
     return "mirror"

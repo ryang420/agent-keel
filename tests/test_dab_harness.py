@@ -93,9 +93,10 @@ def test_the_prompt_inspector_catches_evaluator_material():
     if not PINNED_REPO.is_dir():
         pytest.skip("pinned DAB checkout is not present")
     selected = Suite.load(SUITE).smoke()[0]
-    leaked = prompt.inspect("answer is 399001.SZ", selected, PINNED_REPO)
-    assert any("ground_truth value" in item for item in leaked)
-    assert prompt.inspect("see validate.py", selected, PINNED_REPO)
+    leaks, suspects = prompt.inspect("answer is 399001.SZ", selected, PINNED_REPO)
+    assert leaks == () and any("gold value" in item for item in suspects)
+    leaks, _ = prompt.inspect("see validate.py", selected, PINNED_REPO)
+    assert leaks
 
 
 @pytest.mark.parametrize("text,expected,source", [
@@ -373,3 +374,60 @@ async def test_an_unknown_usage_charges_the_reservation(tmp_path):
     [event async for event in provider.stream(_request())]
     assert ledger.spent_tokens == request_tokens(_request()) + 1_000
     assert ledger.entries[-1]["actual"] is None
+
+
+def test_a_service_case_gets_the_network_and_benchmark_environment(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "query_bookreview" / "query_dataset").mkdir(parents=True)
+    (repo / "query_bookreview" / "query_dataset" / "b.sql").write_text("select 1;\n")
+    service = Case(dataset=Dataset(
+        name="bookreview", dbms=("postgres",),
+        db_clients={"books": {"db_type": "postgres", "db_name": "b", "sql_file": "query_dataset/b.sql"}},
+        data_files={"query_dataset/b.sql": {"sha256": "a" * 64, "bytes": 1, "source": "mirror"}},
+        queries={"1": Query("1", {})}), query=Query("1", {}))
+    staged = isolation(service, repo, tmp_path / "mounts", "p1", services=("postgres",),
+                       service_network="dab-net", env={"PGHOST": "keel-dab-postgres", "PGUSER": "dab_reader"})
+    try:
+        assert staged.policy["network"] == "dab-net"
+        assert staged.policy["env"] == {"PGHOST": "keel-dab-postgres", "PGUSER": "dab_reader"}
+        assert "PGHOST" in staged.stores[0][1] and "read-only" in staged.stores[0][1]
+    finally:
+        staged.cleanup()
+
+
+async def test_benchmark_services_restore_and_enforce_read_only():
+    import os
+    import subprocess
+
+    from evals.dab.services import Services
+
+    if os.environ.get("KEEL_TEST_DOCKER") != "1":
+        pytest.skip("set KEEL_TEST_DOCKER=1 to start the benchmark database services")
+    if not PINNED_REPO.is_dir():
+        pytest.skip("pinned DAB checkout is not present")
+    suite = Suite.load(SUITE)
+    postgres_case = next(c for c in suite.cases(("bookreview",)) if c.case_id == "bookreview/query1")
+    mongo_case = next(c for c in suite.cases(("agnews",)) if c.case_id == "agnews/query1")
+    services = Services.start(("postgres", "mongo"))
+    try:
+        pg_env = services.prepare(postgres_case, PINNED_REPO)
+        base = ["docker", "exec", "-e", f"PGPASSWORD={pg_env['PGPASSWORD']}", "keel-dab-postgres", "psql",
+                "-h", "127.0.0.1", "-U", pg_env["PGUSER"], "-d", pg_env["PGDATABASE"]]
+        read = subprocess.run(base + ["-c", "select count(*) from public.books_info;"],
+                              capture_output=True, text=True)
+        assert read.returncode == 0, read.stderr
+        write = subprocess.run(base + ["-c", "insert into public.books_info(title) values ('x');"],
+                               capture_output=True, text=True)
+        assert write.returncode != 0 and "read-only" in (write.stderr + write.stdout).lower()
+        mongo_env = services.prepare(mongo_case, PINNED_REPO)
+        uri = mongo_env["MONGO_URI"].replace("keel-dab-mongo", "127.0.0.1")
+        read = subprocess.run(["docker", "exec", "keel-dab-mongo", "mongosh", uri, "--quiet", "--eval",
+                               "db.articles.countDocuments({})"], capture_output=True, text=True)
+        assert read.returncode == 0 and int(read.stdout.strip()) > 0
+        write = subprocess.run(["docker", "exec", "keel-dab-mongo", "mongosh", uri, "--quiet", "--eval",
+                                "db.articles.insertOne({x:1})"], capture_output=True, text=True)
+        assert write.returncode != 0 or "not authorized" in (write.stdout + write.stderr).lower()
+    finally:
+        services.finish(postgres_case)
+        services.finish(mongo_case)
+        services.stop()

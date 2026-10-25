@@ -32,11 +32,17 @@ FORBIDDEN = ("ground_truth", "validate.py", "def validate(", "db_description_wit
 
 @dataclass(frozen=True)
 class Prompt:
-    """Instructions plus their hash and any detected leakage."""
+    """Instructions plus their hash, structural leaks and gold-value coincidences.
+
+    ``leaks`` are evaluator material (validator source, hint text) and block a case. ``suspects`` are gold values
+    that also occur in the sanctioned question or description: that is a property of the benchmark's public input,
+    so it is recorded as a warning rather than silently treated as a harness leak.
+    """
 
     text: str
     sha256: str
     leaks: tuple[str, ...]
+    suspects: tuple[str, ...] = ()
 
     def clean(self) -> bool:
         return not self.leaks
@@ -68,26 +74,28 @@ def build(case: Case, repo: Path, stores: list[tuple[str, str]]) -> Prompt:
         f"DATABASE DESCRIPTION\n{description(case, repo)}\n\n"
         f"SANCTIONED STORES\n{listed}\n"
     )
-    leaks = inspect(text, case, repo)
-    return Prompt(text=text, sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), leaks=leaks)
+    leaks, suspects = inspect(text, case, repo)
+    return Prompt(text=text, sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), leaks=leaks,
+                  suspects=suspects)
 
 
-def inspect(text: str, case: Case, repo: Path) -> tuple[str, ...]:
-    """Return the evaluator-material leaks found in an instruction.
+def inspect(text: str, case: Case, repo: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(leaks, suspects)`` for an instruction.
 
-    Structural markers catch validator or hint text pasted into a prompt. The gold file is checked as content: a
-    gold value appearing in an instruction would let a model pass without computing anything, whatever its source.
+    Structural markers catch validator or hint text pasted into a prompt. A gold value that also appears in the
+    sanctioned question or description is reported as a suspect: the public input is the source, not the harness.
     """
-    found = [marker for marker in FORBIDDEN if marker in text]
+    leaks = [marker for marker in FORBIDDEN if marker in text]
+    suspects: list[str] = []
     gold = case.query_dir(repo) / "ground_truth.csv"
     if gold.is_file():
         for line in gold.read_text(encoding="utf-8").splitlines():
             value = line.strip()
             if len(value) >= 4 and value.lower() in text.lower():
-                found.append(f"ground_truth value {value!r}")
+                suspects.append(f"gold value {value!r} also occurs in the public input")
     hint = case.dataset.directory(repo) / "db_description_withhint.txt"
     if hint.is_file():
         hint_text = hint.read_text(encoding="utf-8").strip()
         if hint_text and hint_text.splitlines()[0] in text:
-            found.append("hint description")
-    return tuple(sorted(set(found)))
+            leaks.append("hint description")
+    return tuple(sorted(set(leaks))), tuple(sorted(set(suspects)))

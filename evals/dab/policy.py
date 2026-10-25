@@ -51,7 +51,7 @@ def _link(source: Path, target: Path) -> None:
 
 def isolation(case: Case, repo: Path, mount_root: Path, profile_id: str, *,
               image: str = DEFAULT_IMAGE, service_network: str | None = None,
-              services: tuple[str, ...] = ()) -> Isolation:
+              services: tuple[str, ...] = (), env: dict[str, str] | None = None) -> Isolation:
     """Stage one case for one profile and return its policy and store descriptions.
 
     Each sanctioned data file is linked into the profile's own directory, so no profile sees another's tree and the
@@ -81,9 +81,11 @@ def isolation(case: Case, repo: Path, mount_root: Path, profile_id: str, *,
         if kind in _FILESYSTEM:
             stores.append((name, f"{_FILESYSTEM[kind]} database file at {DATA}/{client['db_path']} (read-only)"))
         elif kind == "postgres":
-            stores.append((name, f"PostgreSQL database `{client['db_name']}` (read-only, connection in PGHOST etc.)"))
+            stores.append((name, f"PostgreSQL database `{client['db_name']}` (read-only); connect with PGHOST, "
+                                 "PGPORT, PGDATABASE, PGUSER and PGPASSWORD from the environment"))
         elif kind == "mongo":
-            stores.append((name, f"MongoDB database `{client['db_name']}` (read-only, connection in MONGO_URI)"))
+            stores.append((name, f"MongoDB database `{client['db_name']}` (read-only); connect with MONGO_URI "
+                                 "from the environment"))
         else:
             raise IsolationError(f"{case.case_id}: unknown db_type {kind!r}")
     policy = {
@@ -92,6 +94,8 @@ def isolation(case: Case, repo: Path, mount_root: Path, profile_id: str, *,
         "network": network,
         "mounts": [{"source": str(profile_dir), "target": DATA, "read_only": True}],
     }
+    if env:
+        policy["env"] = dict(env)
     return Isolation(mount_dir=profile_dir, policy=policy, stores=stores)
 
 

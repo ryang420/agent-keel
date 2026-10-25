@@ -29,6 +29,7 @@ from .budget import Ledger
 from .inputs import Paths, keel_state
 from .policy import DEFAULT_IMAGE, Isolation, isolation, profile_id_for
 from .prompt import ANSWER_MARKER, Prompt, build
+from .services import Services
 from .suite import Case
 
 TERMINAL = frozenset({"completed", "failed", "stopped"})
@@ -201,11 +202,15 @@ def _write(path: Path, text: str) -> None:
 
 
 def _meta(case: Case, repetition: int, prompt: Prompt, *, image: str, image_digest: str, policy: dict,
-          provider: str, model: str, reasoning_effort: str, keel: dict) -> dict:
+          provider: str, model: str, reasoning_effort: str, keel: dict, services: tuple[str, ...] = ()) -> dict:
+    view = dict(policy)
+    if view.get("env"):
+        view["env"] = {key: "<redacted>" for key in view["env"]}
     return {"protocol": PROTOCOL, "case": case.case_id, "repetition": repetition,
             "provider": provider, "model": model, "reasoning_effort": reasoning_effort,
             "prompt_sha256": prompt.sha256, "prompt_leaks": list(prompt.leaks),
-            "image": image, "image_id": image_digest, "sandbox": policy, "keel": keel}
+            "image": image, "image_id": image_digest, "sandbox": view, "keel": keel,
+            "services": list(services)}
 
 
 async def execute(cases: list[Case], *, paths: Paths, repo: Path, ledger: Ledger, image: str = DEFAULT_IMAGE,
@@ -213,7 +218,7 @@ async def execute(cases: list[Case], *, paths: Paths, repo: Path, ledger: Ledger
                   reasoning_effort: str = "low", repetition: int = 0, max_output: int = 8192,
                   timeout_s: float = 1800.0, docker: str = "docker",
                   openai_base_url: str | None = None, max_iterations: int = 60,
-                  sandbox: str = "docker", providers=None) -> list[dict]:
+                  sandbox: str = "docker", providers=None, services: tuple[str, ...] = ()) -> list[dict]:
     """Execute the selected cases serially and return one record per case.
 
     Records are written as artifacts before being returned, so a crash later still leaves the evidence. A case that
@@ -228,6 +233,7 @@ async def execute(cases: list[Case], *, paths: Paths, repo: Path, ledger: Ledger
     digest = image_id(image) if sandbox != "none" else None
     keel = keel_state(Path.cwd())
     records: list[dict] = []
+    bench = Services.start(tuple(services)) if services else None
     async with temporary_database(admin_dsn) as database_url:
         settings = _settings(database_url, mount_root=mount_root, docker=docker, max_iterations=max_iterations,
                              openai_base_url=openai_base_url, sandbox=sandbox, require_key=providers is None)
@@ -240,21 +246,35 @@ async def execute(cases: list[Case], *, paths: Paths, repo: Path, ledger: Ledger
                                          headers={"Authorization": "Bearer keel-dab-eval"}) as client:
                 for case in cases:
                     charging.switch(case.case_id)
-                    records.append(await _case(client, case, paths=paths, repo=repo, ledger=ledger, image=image,
-                                               image_digest=digest, mount_root=mount_root,
-                                               provider=provider, model=model,
-                                               reasoning_effort=reasoning_effort, repetition=repetition,
-                                               timeout_s=timeout_s, keel=keel))
+                    try:
+                        env = bench.prepare(case, repo) if bench is not None else {}
+                    except Exception as exc:  # noqa: BLE001 - a restore failure blocks one case, not the suite
+                        records.append({"case": case.case_id, "status": "setup_failed", "reason": str(exc)})
+                        continue
+                    try:
+                        records.append(await _case(
+                            client, case, paths=paths, repo=repo, ledger=ledger, image=image,
+                            image_digest=digest, mount_root=mount_root, provider=provider, model=model,
+                            reasoning_effort=reasoning_effort, repetition=repetition, timeout_s=timeout_s,
+                            keel=keel, env=env, services=tuple(services),
+                            service_network=bench.network if bench is not None else None))
+                    finally:
+                        if bench is not None:
+                            bench.finish(case)
     await _wait_for_cleanup()
+    if bench is not None:
+        bench.stop()
     return records
 
 
 async def _case(client: httpx.AsyncClient, case: Case, *, paths: Paths, repo: Path, ledger: Ledger, image: str,
                 image_digest: str, mount_root: Path, provider: str, model: str, reasoning_effort: str,
-                repetition: int, timeout_s: float, keel: dict) -> dict:
+                repetition: int, timeout_s: float, keel: dict, env: dict[str, str] | None = None,
+                services: tuple[str, ...] = (), service_network: str | None = None) -> dict:
     profile_id = profile_id_for(case, repetition)
     try:
-        staged: Isolation = isolation(case, repo, mount_root, profile_id, image=image)
+        staged: Isolation = isolation(case, repo, mount_root, profile_id, image=image, services=services,
+                                      service_network=service_network, env=env)
     except Exception as exc:  # noqa: BLE001 - isolation failures are blocked cases, not crashed suites
         return {"case": case.case_id, "status": "blocked", "reason": str(exc)}
     try:
@@ -280,7 +300,8 @@ async def _case(client: httpx.AsyncClient, case: Case, *, paths: Paths, repo: Pa
         _write(artifacts / "answer.txt", extracted.text or "")
         _write(artifacts / "meta.json", json.dumps(_meta(
             case, repetition, prompt, image=image, image_digest=image_digest, policy=staged.policy,
-            provider=provider, model=model, reasoning_effort=reasoning_effort, keel=keel), indent=2))
+            provider=provider, model=model, reasoning_effort=reasoning_effort, keel=keel,
+            services=services), indent=2))
         return {"case": case.case_id, "status": status, "answer": extracted.text,
                 "answer_source": extracted.source, "usage": usage or None,
                 "tool_calls": tool_calls(messages), "duration_s": outcome.get("duration_s"),
