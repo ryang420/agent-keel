@@ -85,6 +85,9 @@ are checked. JSON numbers preserve type, so booleans and floats do not pass as i
 An evaluator-only executor exports allowed regular files before releasing the source sandbox's active usage.
 Each export helper gets a coordinator execution ticket. Symlinks, special files, unexpected output names,
 files over 1 MiB or total submissions over 10 MiB are refused. Missing and empty artifacts differ.
+Rejections include bounded `export_issues` in `execution.json`, task records and reports: `nonregular_entry`
+identifies a directory/link/special file, `unexpected_entry` identifies an extra file, and `file_too_large`
+identifies its filename and size. Inventory is capped at 128 entries; helper failures never expose raw tracebacks.
 
 The script is then run against development and both hidden scenarios using fresh verification profiles and
 registered, supervised execution; no model is called during verification. For stateful steps only declared
@@ -128,3 +131,9 @@ copies of the retired sandbox filesystem. Audit terminal commands for additional
 inside coordinated sandboxes, with a provider that refuses model calls. Check input/gold hashes against the old
 run config and retain transcript/script hashes. These results bypass source submission layout and never replace
 or inflate the original strict delivery score. No live model rerun is part of this follow-up.
+
+`evals.artifacts.recovery.recover_script(messages)` returns candidate bytes, applied/skipped operation hashes and
+terminal commands requiring audit. It refuses missing/unpaired tool results, unverifiable write lengths and
+patches inconsistent with the reconstructed source. It relies on preserved transcript ordering because historical
+logs omit tool-call IDs. Recovery itself performs no execution; only the existing coordinated verifier runs the
+candidate. Keep diagnostic results in a separate directory and never replace old submissions or reports.

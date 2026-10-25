@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Artifact transcript recovery replays successful script writes/patches as text with provenance, for separate
+  no-model diagnostics; it does not change historical delivery scores or execute candidates on the host.
 - `evals/artifacts`: six synthetic executable data tasks with frozen inputs, typed output checks, bounded
   coordinated submission export, isolated no-model verification, explicit token grants and separate reports.
   Includes offline negative controls and opt-in PostgreSQL/Docker acceptance; no runtime memory changes.
@@ -16,6 +18,9 @@ All notable changes to this project are documented here. The format follows
   outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
 
 ### Changed
+- Artifact evaluation v2 specifies top-level output files and cache cleanup, uses an independent fixture root,
+  and reports bounded export issue codes with offending entry names/types. Historical reports retain their
+  recorded protocol. The evaluation image includes ripgrep and timezone data for live tool use.
 - **Breaking:** PostgreSQL is now the only supported database, including local development. `KEEL_DATABASE_URL`
   must use `postgresql://` or `postgres://`; SQLite URLs are rejected. Existing PostgreSQL databases continue to
   upgrade in place through numbered migrations.
