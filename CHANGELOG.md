@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
+  `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
+  per-case PostgreSQL and MongoDB restores on an internal network with read-only roles, and unit tests. It runs
+  outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
+
 ### Changed
 - **Breaking:** PostgreSQL is now the only supported database, including local development. `KEEL_DATABASE_URL`
   must use `postgresql://` or `postgres://`; SQLite URLs are rejected. Existing PostgreSQL databases continue to
