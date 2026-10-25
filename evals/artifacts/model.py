@@ -43,12 +43,24 @@ class TaskSpec:
 
     @property
     def prompt(self) -> str:
+        final = self.development.steps[-1]
+        required = sorted(final.expected) or (['error.json'] if final.error_code else [])
         return (
             'Deliver /work/output/solution.py using Python 3.12. Use only the supplied data.\n'
             'Interface: python solution.py --input-dir /input --output-dir /output\n'
             'During development inputs are at /input/0, /input/1, ... in execution order. Run every step.\n'
             'Write your development results into /work/output. For stateful steps preserve that output; '
             'for independent steps clear result files first, retaining solution.py.\n'
+            'Submission contract: all final files must be regular files directly inside /work/output, '
+            'not in results/, stateful/, independent/ or any other subdirectory.\n'
+            'Allowed top-level filenames: ' + ', '.join(('solution.py', *self.outputs)) + '.\n'
+            'Required final files: ' + ', '.join(('solution.py', *required)) + '. '
+            'Leave the last development step results at these exact paths; rejection steps must retain '
+            'prior state or error.json as specified below. Do not copy earlier success outputs over a final error.\n'
+            'Before finishing, remove ALL extra files and directories, including __pycache__, .pyc files, '
+            'temporary files and test results. python -m py_compile creates __pycache__; remove it afterward '
+            'or direct its cache outside /work/output. Use /work/tmp for scratch work. '
+            'Any unexpected file, directory, symlink or special file rejects the submission.\n'
             'The script will be rerun with different paths and unseen data. Use only Python standard library '
             '(including sqlite3 and zoneinfo); no internet, no evaluator files.\n'
             'CSV headers and JSON field names are exact. CSV row order is irrelevant; duplicates are not. '

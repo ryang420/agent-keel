@@ -37,7 +37,7 @@ def test_public_projection_excludes_hidden_inputs_and_expected_outputs(tmp_path)
     assert not list(public.rglob('*expected*'))
     assert not list(public.rglob('*verification*'))
     manifest = json.loads((tmp_path / 'manifest.json').read_text())
-    assert manifest['protocol'] == 'artifact-correctness-v1'
+    assert manifest['protocol'] == 'artifact-correctness-v2'
     for task in tasks():
         dev = task.development.steps[0].inputs
         assert all(dev != s.steps[0].inputs for s in task.verification)

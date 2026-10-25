@@ -5,7 +5,7 @@ from collections import Counter
 from . import PROTOCOL
 
 
-def build(records: list[dict], selected: list[str]) -> dict:
+def build(records: list[dict], selected: list[str], *, protocol: str = PROTOCOL) -> dict:
     by_name = {r['task']: r for r in records}
     if len(by_name) != len(records) or set(by_name) - set(selected) or len(set(selected)) != len(selected):
         raise ValueError('unknown or duplicate task records')
@@ -19,7 +19,7 @@ def build(records: list[dict], selected: list[str]) -> dict:
             'evaluator_error' not in step.get('failures', []) for step in outcomes)
     complete = bool(rows) and all(r.get('status') == 'executed' and len(r.get('scenarios', [])) == 3 and
                                  all(scenario_complete(s) for s in r['scenarios']) for r in rows)
-    return {'protocol': PROTOCOL, 'selected': len(selected), 'passed': passed, 'complete': complete,
+    return {'protocol': protocol, 'selected': len(selected), 'passed': passed, 'complete': complete,
             'strict_pass_rate': passed / len(selected) if selected else None,
             'states': dict(Counter(r.get('status', 'planned') for r in rows)), 'rows': rows,
             'verification_states': dict(Counter(s.get('execution', {}).get('status', 'unknown') for s in steps)),
@@ -30,7 +30,7 @@ def build(records: list[dict], selected: list[str]) -> dict:
 
 def markdown(report: dict) -> str:
     rate = report['strict_pass_rate']
-    lines = ['# Data-artifact evaluation', '', f"Protocol: `{PROTOCOL}`.", '',
+    lines = ['# Data-artifact evaluation', '', f"Protocol: `{report['protocol']}`.", '',
              f"Selected: {report['selected']}; passed: {report['passed']}; complete: {report['complete']}.",
              f"Strict selected-task rate: {rate:.4f}." if rate is not None else 'No tasks selected.', '',
              '| task | status | strict pass | development | hidden | replay |', '|---|---|---|---|---|---|']

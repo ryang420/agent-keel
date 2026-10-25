@@ -155,7 +155,7 @@ async def verify_scenario(rt, task, scenario, script: bytes, previous: dict, roo
             all(o['passed'] for o in outcomes), 'steps': outcomes}
 
 
-async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='python:3.12-slim', providers=None,
+async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='keel-artifact-eval:1', providers=None,
                   model='gpt-6-luna', provider='openai') -> list[dict]:
     from dataclasses import replace
 

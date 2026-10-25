@@ -1,6 +1,6 @@
 # Data-artifact correctness evaluation
 
-Protocol `artifact-correctness-v1` checks six small synthetic data tasks through Keel's own runtime:
+Protocol `artifact-correctness-v2` checks six small synthetic data tasks through Keel's own runtime:
 cleaning, joins, incremental upsert, replay idempotence, schema evolution and reusable revenue reporting.
 It is separate from DAB; it changes no `src/keel` runtime code and does not measure cross-session memory.
 
@@ -11,11 +11,11 @@ From the repository root:
 ```bash
 .venv/bin/python -m evals.artifacts prepare
 .venv/bin/python -m evals.artifacts validate --skip-image
-docker pull python:3.12-slim
+docker build -t keel-artifact-eval:1 evals/artifacts
 .venv/bin/python -m evals.artifacts validate
 ```
 
-The default root is ignored `.local/evals/artifacts/`. `inputs/<task>/development/` contains visible step inputs;
+The default root is ignored `.local/evals/artifacts-v2/`. `inputs/<task>/development/` contains visible step inputs;
 the public task instructions are under `public/`. Verification inputs and `expected/` remain evaluator-only.
 `manifest.json` fixes the bytes before inference. Validation fails on changed inputs or unexpected files in
 these trees. Changing fixture code requires a fresh root and a new documented protocol revision for comparisons.
@@ -70,6 +70,13 @@ development artifacts in that directory. The script interface is:
 python solution.py --input-dir /input --output-dir /output
 ```
 
+Final results must be regular files directly in `/work/output`, alongside `solution.py`. Each prompt lists both
+allowed filenames and the required final files. Subdirectories such as `results/`, `stateful/` or `independent/`
+are not submissions. Use `/work/tmp` for scratch work; remove all caches, temporary files and extra directories
+before finishing. `python -m py_compile` creates `__pycache__`, which must be removed or redirected outside the
+submission directory. A final rejection step must leave the prescribed error or unchanged state, not earlier
+success outputs. Links and special files remain forbidden.
+
 Schemas, rejection codes, state format, step reset/preservation rules and required filenames are included in
 each task prompt. Verification varies paths, IDs, values and boundary cases. Monetary values are integer cents;
 null is distinct from zero. CSV header names/order are explicit, row order is ignored and row multiplicities
@@ -104,3 +111,20 @@ execution states and named check failures are retained in the JSON report.
 
 The original DAB scores stay unchanged. The previous trace analysis motivates these tasks but does not establish
 that a given defect has been fixed. Code improvements need paired reruns under the same protocol and model.
+
+## Protocol history and diagnostics
+
+v2 clarifies top-level placement, required final filenames and cache cleanup; task inputs and numerical checkers
+are unchanged. Its default root is `.local/evals/artifacts-v2`; existing v1 roots and scores must stay untouched.
+Reports read their protocol from the saved run configuration, so an explicit historical `report --root
+.local/evals/artifacts --run-id ...` retains the v1 label.
+
+The default live image is built from this directory's Dockerfile and includes ripgrep and timezone data. Missing
+ripgrep in the stock Python image can trigger uncertain execution before the tool fallback completes; it is not
+a model-quality failure. Every run records the actual image digest. No-model tests may still use the base image.
+
+Recovered scripts are diagnostic candidates derived from successful transcript writes/patches, not verified
+copies of the retired sandbox filesystem. Audit terminal commands for additional edits. Run them unchanged only
+inside coordinated sandboxes, with a provider that refuses model calls. Check input/gold hashes against the old
+run config and retain transcript/script hashes. These results bypass source submission layout and never replace
+or inflate the original strict delivery score. No live model rerun is part of this follow-up.

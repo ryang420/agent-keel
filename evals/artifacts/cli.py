@@ -17,8 +17,8 @@ from .report import build, markdown
 from .runner import execute
 from .tasks import tasks
 
-DEFAULT_ROOT = '.local/evals/artifacts'
-DEFAULT_IMAGE = 'python:3.12-slim'
+DEFAULT_ROOT = '.local/evals/artifacts-v2'
+DEFAULT_IMAGE = 'keel-artifact-eval:1'
 
 
 def main(argv=None) -> int:
@@ -62,7 +62,7 @@ def main(argv=None) -> int:
         config = json.loads((run_root / 'config.json').read_text())
         records_path = run_root / 'records.json'
         records = json.loads(records_path.read_text()) if records_path.exists() else []
-        report = build(records, config['selected'])
+        report = build(records, config['selected'], protocol=config['protocol'])
     else:
         if args.max_tokens <= 0:
             raise SystemExit('positive --max-tokens is required')

@@ -52,7 +52,7 @@ def test_budget_uses_artifact_protocol(tmp_path):
     ledger = Ledger.grant(tmp_path / 'budget.json', 100)
     ledger.settle('joins', ledger.reserve('joins', 10), None)
     saved = json.loads(ledger.path.read_text())
-    assert saved['protocol'] == 'artifact-correctness-v1'
+    assert saved['protocol'] == 'artifact-correctness-v2'
     assert saved['entries'][0]['actual'] is None
 
 
@@ -89,3 +89,14 @@ def test_artifact_budget_can_be_reopened(tmp_path):
     ledger.settle('joins', ledger.reserve('joins', 10), 8)
     reopened = Ledger.open(ledger.path)
     assert reopened.remaining == 92 and reopened.entries == ledger.entries
+
+
+def test_historical_report_retains_recorded_protocol(tmp_path, monkeypatch):
+    monkeypatch.setattr('evals.artifacts.report.PROTOCOL', 'artifact-correctness-v2')
+    root = tmp_path/'runs'/'historical'
+    root.mkdir(parents=True)
+    (root/'config.json').write_text(json.dumps({'protocol': 'artifact-correctness-v1', 'selected': ['joins']}))
+    assert main(['report', '--root', str(tmp_path), '--run-id', 'historical']) == 1
+    report = json.loads((root/'report.json').read_text())
+    assert report['protocol'] == 'artifact-correctness-v1'
+    assert '`artifact-correctness-v1`' in (root/'report.md').read_text()
