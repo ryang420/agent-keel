@@ -100,3 +100,11 @@ def test_historical_report_retains_recorded_protocol(tmp_path, monkeypatch):
     report = json.loads((root/'report.json').read_text())
     assert report['protocol'] == 'artifact-correctness-v1'
     assert '`artifact-correctness-v1`' in (root/'report.md').read_text()
+
+
+def test_report_explains_rejected_submission_entries():
+    from evals.artifacts.report import markdown
+    report = build([{'task': 'cleaning', 'status': 'export_error', 'passed': False, 'source': {
+        'export_issues': [{'code': 'nonregular_entry', 'name': '__pycache__', 'type': 'directory'}]}}], ['cleaning'])
+    output = markdown(report)
+    assert '__pycache__' in output and 'nonregular_entry' in output and 'directory' in output

@@ -1,6 +1,7 @@
 """Strict artifact outcomes; no fabricated score for a partially executed suite."""
 
 from collections import Counter
+import json
 
 from . import PROTOCOL
 
@@ -42,4 +43,8 @@ def markdown(report: dict) -> str:
         lines.append(f"| {row['task']} | {row['status']} | {row.get('passed', False)} | {dev} | {hidden} | {replay} |")
     lines += ['', *['- ' + note for note in report['notes']], '']
     lines += ['Verification execution states: ' + str(report['verification_states']), '']
+    for row in report['rows']:
+        issues = row.get('source', {}).get('export_issues', [])
+        if issues:
+            lines += [f"Export diagnostics for {row['task']}:", '', '```json', json.dumps(issues, indent=2), '```', '']
     return '\n'.join(lines)

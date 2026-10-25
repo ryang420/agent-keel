@@ -95,7 +95,7 @@ async def run_job(rt, job: Job, *, prompt: str, inputs: dict[str, bytes], root: 
         if 'budget' in (run.get('error') or '').lower():
             status = 'budget_exhausted'
         result = {'status': status, 'files': job.files, 'exit_code': job.exit_code,
-                  'usage': run.get('usage'), 'run': run, 'error': job.error,
+                  'usage': run.get('usage'), 'run': run, 'error': job.error, 'export_issues': job.export_issues,
                   'tool_calls': sum(len(m.message.tool_calls) for m in messages),
                   'tool_errors': _tool_errors(messages)}
         (root / 'messages.json').write_bytes(json_bytes([

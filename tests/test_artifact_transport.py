@@ -86,3 +86,35 @@ async def test_export_rejects_malformed_envelope():
             return SimpleNamespace(exit_code=0, output='not JSON')
     with pytest.raises(ExportError):
         await export_submission(Broken(), object(), ())
+
+
+async def test_export_reports_all_offending_entries_without_reading_them(tmp_path):
+    (tmp_path/'solution.py').write_text('pass')
+    (tmp_path/'__pycache__').mkdir()
+    (tmp_path/'results').mkdir()
+    (tmp_path/'extra.txt').write_text('scratch')
+    (tmp_path/'escape.csv').symlink_to('/etc/passwd')
+    facade = LocalFacade(tmp_path)
+    with pytest.raises(ExportError) as caught:
+        await export_submission(facade, object(), ('data.csv',))
+    assert caught.value.issues == [
+        {'code': 'nonregular_entry', 'name': '__pycache__', 'type': 'directory'},
+        {'code': 'nonregular_entry', 'name': 'escape.csv', 'type': 'symlink'},
+        {'code': 'unexpected_entry', 'name': 'extra.txt', 'type': 'file'},
+        {'code': 'nonregular_entry', 'name': 'results', 'type': 'directory'}]
+    assert len(facade.calls) == 1  # inventory only; never read rejected content
+
+
+async def test_export_size_error_identifies_offending_file(tmp_path):
+    (tmp_path/'solution.py').write_bytes(b'x' * 1048577)
+    with pytest.raises(ExportError) as caught:
+        await export_submission(LocalFacade(tmp_path), object(), ())
+    assert caught.value.issues == [{'code': 'file_too_large', 'name': 'solution.py', 'type': 'file', 'size': 1048577}]
+
+
+async def test_export_bounds_inventory_before_returning_diagnostics(tmp_path):
+    for index in range(129):
+        (tmp_path/f'{index}.txt').write_text('')
+    with pytest.raises(ExportError) as caught:
+        await export_submission(LocalFacade(tmp_path), object(), ())
+    assert caught.value.issues == [{'code': 'too_many_entries'}]

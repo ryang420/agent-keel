@@ -168,3 +168,47 @@ async def test_real_state_carry_rejection_and_reset(pg_dsn, tmp_path):
     assert len(result['steps']) == 6
     assert result['steps'][4]['execution']['exit_code'] == 2
     assert fake.requests == []
+
+
+async def test_export_rejection_keeps_entry_diagnostics_after_release(monkeypatch):
+    async def broken(*args):
+        raise ExportError('rejected', issues=[{'code': 'nonregular_entry', 'name': '__pycache__', 'type': 'directory'}])
+    monkeypatch.setattr('evals.artifacts.runtime.export_submission', broken)
+    executor = ArtifactExecutor(None, None, ProviderRegistry(),
+                                coordinator=SimpleNamespace(release=AsyncMock(return_value=True)))
+    job = executor.jobs['p'] = Job(())
+    await executor._release(SimpleNamespace(profile_id='p', id='r'),
+                            SimpleNamespace(sandbox=object(), use=object()))
+    assert job.export_issues == [{'code': 'nonregular_entry', 'name': '__pycache__', 'type': 'directory'}]
+    assert job.done.is_set()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(os.environ.get('KEEL_TEST_DOCKER') != '1', reason='requires opt-in Docker')
+async def test_real_export_rejection_persists_structured_details(pg_dsn, tmp_path):
+    import json
+    from dataclasses import replace
+    from evals.artifacts.runner import run_job
+    from evals.dab.runner import _settings
+    from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
+
+    def call(name, args, identifier):
+        return [ToolCallReady(ToolCall(identifier, name, json.dumps(args))), Completed(Usage(10, 2, 0, 0))]
+    fake = FakeProvider(name='fake', script=[
+        call('write_file', {'path': '/work/output/solution.py', 'content': 'pass'}, 'code'),
+        call('terminal', {'command': 'mkdir /work/output/__pycache__'}, 'cache'),
+        [TextDelta('Done'), Completed(Usage(10, 2, 0, 0))]])
+    registry = ProviderRegistry()
+    registry.register(fake)
+    settings = replace(_settings(pg_dsn, mount_root=tmp_path/'mounts', docker='docker', max_iterations=10,
+                                 openai_base_url=None, require_key=False),
+                       deployment='artifact-export-' + tmp_path.name, lease_seconds=120)
+    async with runtime(settings, registry) as rt:
+        outcome = await run_job(rt, Job(()), prompt='Create the requested script and cache.', inputs={},
+                                root=tmp_path/'result', image='python:3.12-slim', provider='fake', model='m')
+    assert outcome['status'] == 'export_error'
+    assert outcome['cleanup']['status'] == 'retired'
+    expected = [{'code': 'nonregular_entry', 'name': '__pycache__', 'type': 'directory'}]
+    assert outcome['export_issues'] == expected
+    saved = json.loads((tmp_path/'result/execution.json').read_text())
+    assert saved['export_issues'] == expected

@@ -13,7 +13,7 @@ from keel.runner import RunExecutor
 from keel.service import build
 from keel.tools.base import redact
 
-from .transport import export_submission
+from .transport import ExportError, export_submission
 
 
 @dataclass
@@ -24,6 +24,7 @@ class Job:
     files: dict[str, bytes] = field(default_factory=dict)
     exit_code: int | None = None
     error: str | None = None
+    export_issues: list[dict] = field(default_factory=list)
     stdout: str = ''
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -60,8 +61,12 @@ class ArtifactExecutor(RunExecutor):
                 else:
                     try:
                         job.files = await export_submission(self.coordinator, state.sandbox, job.allowed)
+                    except ExportError as exc:
+                        job.error = 'export_error:ExportError'
+                        job.export_issues = exc.issues
                     except Exception as exc:
                         job.error = f'export_error:{type(exc).__name__}'
+                        job.export_issues = [{'code': 'exporter_exception', 'type': type(exc).__name__}]
         finally:
             try:
                 await super()._release(run, state)
