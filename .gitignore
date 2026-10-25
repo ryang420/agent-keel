@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .superpowers/
+.claude/
 .local/
 build/
 src/keel/sandbox/bin/
