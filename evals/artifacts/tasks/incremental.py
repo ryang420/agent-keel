@@ -32,6 +32,16 @@ def _steps(seed):
     changes = [states[0], [row('y', 1, seed), states[1][-1]],
                [row('x', 1, seed), states[2][0], states[2][0]],
                [row('x', 3, 99 * seed)]]
+    # Same event ID under a different account must remain independent.
+    other = [a + '-other', 'x', 1, ts, '2026-01-01', 11 * seed, 'upsert']
+    changes[0] = [*changes[0], other]
+    for state in states:
+        state.append(other)
+    # Same version: the newer timestamp wins, even when it arrives before an older row.
+    newer = row('z', 1, 9 * seed)
+    newer[3] = '2026-01-02T00:00:00Z'
+    changes[2] += [newer, row('z', 1, 5 * seed)]
+    states[2] = [newer if r[1] == 'z' else r for r in states[2]]
     return tuple(Step({'initial.csv': csv_bytes(COLUMNS, initial), 'changes.csv': csv_bytes(COLUMNS, batch)},
                       expected(states[min(i, 2)]), preserve_output=i > 0,
                       error_code='conflicting_update' if i == 3 else None)

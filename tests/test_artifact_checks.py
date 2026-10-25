@@ -89,3 +89,10 @@ def test_bool_is_not_an_integer_and_json_row_order_is_irrelevant():
     state['rows'].reverse()
     files['state.json'] = json_bytes(state)
     assert check_step(step, files, 0).passed
+
+
+def test_deeply_nested_submission_fails_without_crashing_checker():
+    step = tasks()[1].development.steps[0]
+    files = supplied(step)
+    files['overall.json'] = b'[' * 2000 + b'0' + b']' * 2000
+    assert 'invalid:overall.json' in check_step(step, files, 0).failures

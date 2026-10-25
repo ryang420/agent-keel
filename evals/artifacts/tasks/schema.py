@@ -26,7 +26,9 @@ def _steps(seed):
                   [f'r{seed}-n', '2026-01-03', -1, 'unknown']]),
             step(2, ['id', 'date', 'amount_decimal'], [['bad', '2026-01-01', '1.005']], error='invalid_amount', row=1),
             step(2, ['id', 'date', 'amount_decimal', 'amount_cents'], [], error='conflicting_fields'),
-            step(9, ['id', 'date', 'amount_cents'], one, error='unsupported_schema'))
+            step(9, ['id', 'date', 'amount_cents'], one, error='unsupported_schema'),
+            step(2, ['id', 'date', 'amount_decimal'], [[f'r{seed}-optional', '2026-01-04', '0.10']],
+                 [[f'r{seed}-optional', '2026-01-04', 10, 'unknown']]))
 
 
 def build(seed=23):

@@ -55,3 +55,25 @@ def test_hidden_revenue_has_unseen_row_counts():
     task = next(t for t in tasks() if t.name == 'revenue')
     counts = [len(s.steps[0].inputs['orders.csv'].splitlines()) for s in (task.development, *task.verification)]
     assert len(set(counts)) == 3
+
+
+def test_secondary_order_compound_keys_and_optional_channel_are_exercised():
+    import csv
+    import io
+    for task in tasks():
+        for scenario in (task.development, *task.verification):
+            if task.name == 'cleaning':
+                rows = list(csv.DictReader(io.StringIO(scenario.steps[0].inputs['events.csv'].decode())))
+                assert any(a['event_id'] == b['event_id'] and a['version'] == b['version'] and
+                           a['updated_at'] != b['updated_at'] and a['updated_at'] != 'bad' and
+                           b['updated_at'] != 'bad' for a in rows for b in rows)
+            if task.name == 'incremental':
+                rows = [r for s in scenario.steps for r in csv.DictReader(io.StringIO(s.inputs['changes.csv'].decode()))]
+                assert any(a['event_id'] == b['event_id'] and a['account_id'] != b['account_id']
+                           for a in rows for b in rows)
+                assert any(a['account_id'] == b['account_id'] and a['event_id'] == b['event_id'] and
+                           a['version'] == b['version'] and a['updated_at'] != b['updated_at']
+                           for a in rows for b in rows)
+            if task.name == 'schema':
+                assert any(json.loads(s.inputs['schema.json'])['version'] == 2 and not s.error_code and
+                           b'channel' not in s.inputs['records.csv'].splitlines()[0] for s in scenario.steps)

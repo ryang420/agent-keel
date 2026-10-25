@@ -22,7 +22,13 @@ root, mode, name = sys.argv[1:]
 fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
 try:
     for component in root.strip('/').split('/'):
-        next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except FileNotFoundError:
+            if mode == 'list':
+                print('{}')
+                sys.exit(0)
+            raise
         os.close(fd)
         fd = next_fd
     if mode == 'list':

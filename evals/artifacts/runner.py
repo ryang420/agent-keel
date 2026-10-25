@@ -10,14 +10,30 @@ import uuid
 
 from evals.dab.accounting import Charging
 from evals.dab.inputs import keel_state
-from evals.dab.runner import _budgeted, _retire_profile, _settings, image_id, temporary_database
+from evals.dab.runner import _retire_profile, _settings, image_id, temporary_database
+from keel.providers.base import ProviderRegistry
 from keel.sandbox.base import profile_mount_root
 from keel.service import default_providers
 
 from . import PROTOCOL
 from .checks import check_step
+from .budget import LimitedProvider
 from .model import json_bytes
 from .runtime import Job, runtime
+
+
+def _tool_errors(messages):
+    errors = 0
+    for item in messages:
+        if item.message.role != 'tool':
+            continue
+        try:
+            value = json.loads(item.message.text)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and (value.get('error') or value.get('exit_code') not in (None, 0)):
+            errors += 1
+    return errors
 
 
 def policy(root: Path, profile: str, inputs: dict[str, bytes], image: str) -> tuple[dict, Path]:
@@ -38,11 +54,11 @@ def policy(root: Path, profile: str, inputs: dict[str, bytes], image: str) -> tu
 
 async def run_job(rt, job: Job, *, prompt: str, inputs: dict[str, bytes], root: Path, image: str,
                   model: str = 'gpt-6-luna', provider: str = 'openai', timeout: float = 900) -> dict:
+    root.mkdir(parents=True, exist_ok=False)
     profile = 'artifact-' + uuid.uuid4().hex
     sandbox_policy, folder = policy(Path(rt.executor.mount_root), profile, inputs, image)
     rt.executor.jobs[profile] = job
     started = time.monotonic()
-    root.mkdir(parents=True, exist_ok=False)
     result = {'status': 'setup_failed', 'files': {}, 'usage': None}
     try:
         response = await rt.client.put('/v1/profiles/' + profile, json={
@@ -81,7 +97,7 @@ async def run_job(rt, job: Job, *, prompt: str, inputs: dict[str, bytes], root: 
         result = {'status': status, 'files': job.files, 'exit_code': job.exit_code,
                   'usage': run.get('usage'), 'run': run, 'error': job.error,
                   'tool_calls': sum(len(m.message.tool_calls) for m in messages),
-                  'tool_errors': sum(m.message.role == 'tool' and '"exit_code": 1' in m.message.text for m in messages)}
+                  'tool_errors': _tool_errors(messages)}
         (root / 'messages.json').write_bytes(json_bytes([
             {'id': m.id, 'role': m.message.role, 'text': m.message.text,
              'tool_calls': [{'name': c.name, 'arguments': c.arguments} for c in m.message.tool_calls]}
@@ -97,13 +113,17 @@ async def run_job(rt, job: Job, *, prompt: str, inputs: dict[str, bytes], root: 
     finally:
         try:
             cleanup = await _retire_profile(rt.client, profile)
-            result['cleanup'] = cleanup
-            if cleanup['status'] not in ('absent', 'retired'):
-                result['status'] = 'cleanup_failed'
-        finally:
+        except Exception as exc:
+            cleanup = {'status': 'failed', 'error': type(exc).__name__}
+        result['cleanup'] = cleanup
+        if cleanup['status'] in ('absent', 'retired'):
             shutil.rmtree(folder)
-            rt.executor.jobs.pop(profile, None)
+        else:
+            result['status'] = 'cleanup_failed'
+        rt.executor.jobs.pop(profile, None)
     result['duration_s'] = time.monotonic() - started
+    result['prompt_sha256'] = hashlib.sha256(prompt.encode()).hexdigest()
+    result['input_sha256'] = {name: hashlib.sha256(data).hexdigest() for name, data in inputs.items()}
     (root / 'execution.json').write_bytes(json_bytes({k: v for k, v in result.items() if k != 'files'}))
     return result
 
@@ -130,18 +150,29 @@ async def verify_scenario(rt, task, scenario, script: bytes, previous: dict, roo
         carried = files
         if outcome['status'] != 'executed':
             break
-    return {'name': scenario.name, 'passed': len(outcomes) == len(scenario.steps) and
+    return {'name': scenario.name, 'planned_steps': len(scenario.steps),
+            'passed': len(outcomes) == len(scenario.steps) and
             all(o['passed'] for o in outcomes), 'steps': outcomes}
 
 
-async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='keel-dab-eval:1', providers=None,
+async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='python:3.12-slim', providers=None,
                   model='gpt-6-luna', provider='openai') -> list[dict]:
     from dataclasses import replace
 
     root.mkdir(parents=True, exist_ok=False)
     image_digest = image_id(image)
+    image = image_digest  # All source/replay containers use the exact recorded image bytes.
+    frozen = {task.name: {'prompt': hashlib.sha256(task.prompt.encode()).hexdigest(), 'scenarios': {
+        scenario.name: [{'inputs': {name: hashlib.sha256(data).hexdigest() for name, data in step.inputs.items()},
+                         'expected': {name: hashlib.sha256(data).hexdigest() for name, data in step.expected.items()},
+                         'error_code': step.error_code, 'error_row': step.error_row,
+                         'preserve_output': step.preserve_output} for step in scenario.steps]
+        for scenario in (task.development, *task.verification)}} for task in tasks}
     metadata = {'protocol': PROTOCOL, 'keel': keel_state(Path.cwd()), 'image': image_digest,
-                'model': model, 'reasoning_effort': 'low', 'selected': [t.name for t in tasks]}
+                'provider': provider, 'model': model, 'returned_model': None, 'reasoning_effort': 'low',
+                'selected': [t.name for t in tasks], 'fixtures': frozen,
+                'limits': {'cpus': 1, 'memory_mb': 512, 'pids_limit': 128, 'verification_timeout_s': 60,
+                           'task_timeout_s': 900, 'iterations': 60}}
     (root / 'config.json').write_bytes(json_bytes(metadata))
     records = []
     async with temporary_database(admin_dsn) as dsn:
@@ -149,10 +180,15 @@ async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='keel-dab-
                                      max_iterations=60, openai_base_url=None, require_key=providers is None),
                            deployment='artifacts-' + uuid.uuid4().hex[:12], lease_seconds=120)
         charging = Charging(ledger)
-        registry = _budgeted(providers or default_providers(settings), charging, max_output=8192)
+        inner = providers or default_providers(settings)
+        registry = ProviderRegistry()
+        for name in inner.names():
+            registry.register(LimitedProvider(inner.get(name), charging, max_output=8192))
         async with runtime(settings, registry) as rt:
             for task in tasks:
                 charging.switch(task.name)
+                first_entry = len(ledger.entries)
+                first_spent = ledger.spent_tokens
                 inputs = {f'{i}/{name}': data for i, step in enumerate(task.development.steps)
                           for name, data in step.inputs.items()}
                 job = Job(task.outputs)
@@ -160,8 +196,10 @@ async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='keel-dab-
                                        image=image, model=model, provider=provider)
                 record = {'task': task.name, 'status': source['status'], 'passed': False,
                           'source': {k: v for k, v in source.items() if k != 'files'}, 'scenarios': []}
+                if any(e.get('outcome') == 'budget_exhausted' for e in ledger.entries[first_entry:]):
+                    record['status'] = 'budget_exhausted'
                 script = source['files'].get('solution.py')
-                if source['status'] == 'executed' and script:
+                if record['status'] == 'executed' and script:
                     source_outputs = {k: v for k, v in source['files'].items() if k != 'solution.py'}
                     final_step = task.development.steps[-1]
                     record['source_final_pass'] = check_step(
@@ -173,8 +211,11 @@ async def execute(tasks, *, admin_dsn: str, ledger, root: Path, image='keel-dab-
                         record['scenarios'].append(result)
                     record['passed'] = record['source_final_pass'] and all(s['passed'] for s in record['scenarios'])
                     record['artifact_sha256'] = {k: hashlib.sha256(v).hexdigest() for k, v in source['files'].items()}
-                elif source['status'] == 'executed':
+                elif record['status'] == 'executed':
                     record['status'] = 'artifact_missing'
+                record['accounting'] = {'charged_tokens': ledger.spent_tokens - first_spent,
+                                        'cumulative_charged_tokens': ledger.spent_tokens,
+                                        'calls': ledger.entries[first_entry:]}
                 records.append(record)
                 (root / 'records.json').write_bytes(json_bytes(records))
     return records

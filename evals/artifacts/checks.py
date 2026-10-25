@@ -84,11 +84,11 @@ def check_step(step: Step, files: dict[str, bytes], exit_code: int) -> CheckResu
         try:
             parser = _csv if name.endswith('.csv') else lambda data: _canonical(_json(data))
             reference = parser(gold)
-        except (ValueError, UnicodeError, csv.Error, StopIteration) as exc:
+        except (ValueError, UnicodeError, csv.Error, StopIteration, RecursionError) as exc:
             raise ValueError(f'invalid evaluator fixture {name}') from exc
         try:
             predicted = parser(files[name])
-        except (ValueError, UnicodeError, csv.Error, StopIteration):
+        except (ValueError, UnicodeError, csv.Error, StopIteration, RecursionError):
             failures.append(f'invalid:{name}')
             continue
         if predicted != reference:

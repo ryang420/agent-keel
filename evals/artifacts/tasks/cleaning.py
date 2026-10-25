@@ -22,8 +22,9 @@ def _steps(seed):
             [key(3), 'x', ts, 1, 'paid'], [key(4), 1, 'bad', 1, 'paid'],
             [key(5), 1, ts, '1.5', 'paid'], [key(6), 1, ts, 1, 'bad']]
     stable = [[key(n), 1, ts, n * seed, 'paid'] for n in range(10, 22)]
-    rows += stable
-    expected = [rows[1], rows[2], rows[4], *stable]
+    later = [key(7), 1, '2026-01-02T00:00:00Z', -2 * seed, 'paid']
+    rows += [later, [key(7), 1, ts, seed, 'paid'], *stable]
+    expected = [rows[1], rows[2], rows[4], later, *stable]
     rejects = [[6, 'conflicting_update'], [7, 'conflicting_update'], [8, 'invalid_key'],
                [9, 'invalid_version'], [10, 'invalid_timestamp'], [11, 'invalid_amount'], [12, 'invalid_status']]
     # Rotate both source rows and source-number gold in held-out worlds.
