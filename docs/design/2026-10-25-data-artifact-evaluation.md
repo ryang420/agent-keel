@@ -1,6 +1,6 @@
 # Data-artifact correctness evaluation
 
-Date: 2026-10-25. Status: proposed; scope selected, implementation awaiting design approval.
+Date: 2026-10-25. Status: approved by the owner on 2026-10-25; implementation planning in progress.
 
 ## Intent and scope
 
