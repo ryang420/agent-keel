@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `evals/artifacts`: six synthetic executable data tasks with frozen inputs, typed output checks, bounded
+  coordinated submission export, isolated no-model verification, explicit token grants and separate reports.
+  Includes offline negative controls and opt-in PostgreSQL/Docker acceptance; no runtime memory changes.
 - `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
   `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
   per-case PostgreSQL and MongoDB restores on an internal network with read-only roles, and unit tests. It runs

@@ -86,6 +86,7 @@ jobs:
       - run: >-
           pytest -q -rs tests/test_docker_sandbox.py tests/test_docker_operations.py tests/test_fault_injection.py
           tests/test_sandbox_lifecycle_docker.py tests/test_profile_deletion_docker.py
+          tests/test_artifact_runner.py
         timeout-minutes: 30
         env:
           KEEL_TEST_DOCKER: "1"

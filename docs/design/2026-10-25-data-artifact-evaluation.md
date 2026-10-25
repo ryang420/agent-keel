@@ -1,6 +1,9 @@
 # Data-artifact correctness evaluation
 
-Date: 2026-10-25. Status: approved by the owner on 2026-10-25; implementation planning in progress.
+Date: 2026-10-25. Status: approved and implemented; live-model pilot has not been run.
+
+Implementation and commands: [`evals/artifacts/README.md`](../../evals/artifacts/README.md).
+Offline checks and opt-in PostgreSQL/Docker acceptance validate the evaluator, not model quality.
 
 ## Intent and scope
 
