@@ -49,3 +49,9 @@ def test_task_contracts_cover_boundary_rules():
     assert 'tombstone' in by_name['incremental'].instructions
     assert "error.json" in by_name['schema'].outputs
     assert 'Asia/Shanghai' in by_name['revenue'].instructions
+
+
+def test_hidden_revenue_has_unseen_row_counts():
+    task = next(t for t in tasks() if t.name == 'revenue')
+    counts = [len(s.steps[0].inputs['orders.csv'].splitlines()) for s in (task.development, *task.verification)]
+    assert len(set(counts)) == 3

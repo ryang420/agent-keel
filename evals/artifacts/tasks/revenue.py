@@ -21,14 +21,19 @@ def _steps(seed):
               [f'o{seed}-3', '2026-01-02T16:00:00Z', seed, 'USD', 1, 'paid'],
               [f'o{seed}-4', '2026-01-01T00:00:00Z', seed, 'EUR', 0, 'paid'],
               [f'o{seed}-5', '2026-01-01T00:00:00Z', seed, 'USD', 0, 'pending']]
+    extras = seed % 3 + 1
+    orders += [[f'o{seed}-extra-{n}', '2026-01-01T12:00:00Z', seed, 'USD', 0, 'paid']
+               for n in range(extras)]
     r = [[f'r{seed}-1', orders[0][0], seed, '2026-02-01T00:00:00Z'],
          [f'r{seed}-2', orders[0][0], seed, '2026-02-02T00:00:00Z'],
          [f'r{seed}-3', orders[1][0], 3 * seed, '2026-02-03T00:00:00Z'],
          [f'r{seed}-4', orders[2][0], seed, '2026-02-04T00:00:00Z']]
     columns = ['date', 'gross_cents', 'refund_cents', 'net_cents', 'order_count', 'refund_count']
-    expected = {'revenue_daily.csv': csv_bytes(columns, [['2026-01-01', 5 * seed, 2 * seed, 3 * seed, 1, 2],
+    expected = {'revenue_daily.csv': csv_bytes(columns, [['2026-01-01', (5 + extras) * seed, 2 * seed,
+                                                        (3 + extras) * seed, 1 + extras, 2],
                                                         ['2026-01-02', 3 * seed, 3 * seed, 0, 1, 1]]),
-                'summary.json': json_bytes(dict(zip(columns[1:], [8 * seed, 5 * seed, 3 * seed, 2, 3])))}
+                'summary.json': json_bytes(dict(zip(columns[1:], [(8 + extras) * seed, 5 * seed,
+                                                                 (3 + extras) * seed, 2 + extras, 3])))}
     def inputs(refunds):
         return {'orders.csv': csv_bytes(ORDERS, orders), 'refunds.csv': csv_bytes(REFUNDS, refunds)}
     return (Step(inputs([*r, r[0]]), expected),
