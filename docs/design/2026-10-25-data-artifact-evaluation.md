@@ -1,6 +1,7 @@
 # Data-artifact correctness evaluation
 
-Date: 2026-10-25. Status: approved and implemented; live-model pilot has not been run.
+Date: 2026-10-25. Status: approved and implemented. The current submission contract is v2;
+see [the contract follow-up](2026-10-25-artifact-contract-followup.md). Pilot records remain local.
 
 Implementation and commands: [`evals/artifacts/README.md`](../../evals/artifacts/README.md).
 Offline checks and opt-in PostgreSQL/Docker acceptance validate the evaluator, not model quality.
