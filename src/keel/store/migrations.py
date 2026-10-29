@@ -201,12 +201,13 @@ CREATE TABLE memory_changes (
     id {serial} PRIMARY KEY, profile_id TEXT NOT NULL, target TEXT NOT NULL, entry_id TEXT NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('add', 'replace', 'remove')), old_text TEXT, new_text TEXT,
     source_kind TEXT NOT NULL CHECK (source_kind IN ('foreground', 'review', 'consumer', 'legacy')),
-    run_id TEXT, session_id TEXT, message_id {bigint}, tool_call_id TEXT,
+    run_id TEXT, session_id TEXT, message_id {bigint}, tool_call_id TEXT, mutation_key TEXT,
     revision {bigint} NOT NULL, created_at {real} NOT NULL);
 CREATE INDEX memory_changes_entry ON memory_changes (profile_id, entry_id, id);
 CREATE INDEX memory_changes_session ON memory_changes (profile_id, session_id);
 CREATE TABLE memory_mutations (
-    profile_id TEXT NOT NULL, mutation_key TEXT NOT NULL, result TEXT NOT NULL, created_at {real} NOT NULL,
+    profile_id TEXT NOT NULL, mutation_key TEXT NOT NULL, session_id TEXT, result TEXT NOT NULL,
+    created_at {real} NOT NULL,
     PRIMARY KEY (profile_id, mutation_key));
 INSERT INTO memory_entries (id, profile_id, target, position, text, version, state, created_at, updated_at)
     SELECT md5(m.profile_id || '/' || m.target || '/' || e.ord::text), m.profile_id, m.target, e.ord::integer - 1,

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from keel.store.base import MemorySource
 from keel.tools.base import ToolContext, ToolOutcome, error_result, tool, tool_json
 
@@ -29,7 +32,11 @@ async def memory(args: dict, ctx: ToolContext) -> ToolOutcome:
         message_id = await ctx.store.run_user_message_id(ctx.session_id, ctx.run_id)
     source = MemorySource(ctx.memory_source, run_id=ctx.run_id or None, session_id=ctx.session_id or None,
                           message_id=message_id, tool_call_id=ctx.tool_call_id or None)
-    key = f"{ctx.memory_source}:{ctx.run_id}:{ctx.tool_call_id}" if ctx.run_id and ctx.tool_call_id else None
+    key = None
+    if ctx.run_id and ctx.tool_call_id:
+        payload = json.dumps({"target": target, "ops": ops}, sort_keys=True, ensure_ascii=False)
+        digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        key = f"{ctx.memory_source}:{ctx.run_id}:{ctx.tool_call_id}:{digest}"
     result = await ctx.store.apply_memory(ctx.profile_id, target, limit, ops, source=source, mutation_key=key,
                                          profile_incarnation=ctx.profile_incarnation)
     if result.get("success") and ctx.session_id:

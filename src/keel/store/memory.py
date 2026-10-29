@@ -49,13 +49,15 @@ class MemoryStoreMixin:
             before = [Slot(row["id"], row["text"], row["version"]) for row in rows]
             after, result, changes = apply_slots(before, ops, limit, lambda: uuid.uuid4().hex)
             if changes:
-                result["revision"] = await self._commit_memory(profile_id, target, before, after, changes, source)
+                result["revision"] = await self._commit_memory(profile_id, target, before, after, changes, source,
+                                                              mutation_key)
             else:
                 result["revision"] = await self._memory_revision(profile_id, target)
             if result["success"] and mutation_key is not None:
                 await self.db.execute(
-                    "INSERT INTO memory_mutations (profile_id, mutation_key, result, created_at) VALUES (?, ?, ?, ?)",
-                    profile_id, mutation_key, json.dumps(result, ensure_ascii=False), self.clock())
+                    "INSERT INTO memory_mutations (profile_id, mutation_key, session_id, result, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    profile_id, mutation_key, source.session_id, json.dumps(result, ensure_ascii=False), self.clock())
             return result
 
     async def _memory_revision(self, profile_id: str, target: str) -> int:
@@ -64,7 +66,8 @@ class MemoryStoreMixin:
         return row["revision"] if row else 0
 
     async def _commit_memory(self, profile_id: str, target: str, before: list[Slot], after: list[Slot],
-                             changes: list[Change], source: MemorySource) -> int:
+                             changes: list[Change], source: MemorySource,
+                             mutation_key: str | None = None) -> int:
         now = self.clock()
         revision = await self._memory_revision(profile_id, target) + 1
         await self.db.execute(
@@ -98,10 +101,10 @@ class MemoryStoreMixin:
                 continue  # added and removed within the batch: no row was ever stored
             await self.db.execute(
                 "INSERT INTO memory_changes (profile_id, target, entry_id, action, old_text, new_text, source_kind, "
-                "run_id, session_id, message_id, tool_call_id, revision, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "run_id, session_id, message_id, tool_call_id, mutation_key, revision, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 profile_id, target, change.entry_id, change.action, change.old_text, change.new_text, source.kind,
-                source.run_id, source.session_id, source.message_id, source.tool_call_id, revision, now)
+                source.run_id, source.session_id, source.message_id, source.tool_call_id, mutation_key, revision, now)
         return revision
 
     async def memory_entries(self, profile_id: str) -> dict[str, list[str]]:

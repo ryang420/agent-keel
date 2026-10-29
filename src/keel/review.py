@@ -50,7 +50,8 @@ async def _review(executor, run) -> None:
     messages.append(Message("user", (TextPart(prompts.text("memory_review")),)))
     ctx = ToolContext(store=executor.store, profile_id=run.profile_id,
                       profile_incarnation=run.profile_incarnation, session_id=run.session_id,
-                      run_id=run.id, memory_source="review", memory_chars=executor.memory_chars, user_chars=executor.user_chars)
+                      run_id=run.id, memory_source="review", memory_chars=executor.memory_chars,
+                      user_chars=executor.user_chars)
     tools = prompts.tool_definitions(("memory",))
     for _ in range(REVIEW_ITERATIONS):
         request = ModelRequest(provider=run.provider, model=run.model, system=session.system_prompt,

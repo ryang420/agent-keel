@@ -376,6 +376,8 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
             await self.db.execute(
                 "UPDATE memory_changes SET run_id = NULL, session_id = NULL, message_id = NULL, tool_call_id = NULL "
                 "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            await self.db.execute(
+                "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute("DELETE FROM sessions WHERE id = ?", session_id)
         return True
 

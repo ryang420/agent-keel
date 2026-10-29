@@ -24,8 +24,8 @@ from keel.models import part_to_dict, ImagePart, TextPart
 from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict, profile_mount_root
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
-    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileTenantMismatch,
-    MemorySource, SessionBusy, SessionNotFound, TitleInUse,
+    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch,
+    ProfileTenantMismatch, MemorySource, SessionBusy, SessionNotFound, TitleInUse,
 )
 from keel.titles import sanitize_title
 from keel.verify import VerifyError, verify_model
@@ -638,9 +638,12 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         item = await store.memory_item(profile.id, entry_id)
         if item is None:
             raise ApiError(404, "memory_not_found", "No such memory entry.")
-        result = await store.apply_memory(profile.id, item.target, memory_limits(request)[item.target],
-                                          [{**op, "entry_id": entry_id}], source=MemorySource("consumer"),
-                                          profile_incarnation=profile.incarnation)
+        try:
+            result = await store.apply_memory(profile.id, item.target, memory_limits(request)[item.target],
+                                              [{**op, "entry_id": entry_id}], source=MemorySource("consumer"),
+                                              profile_incarnation=profile.incarnation)
+        except ProfileIncarnationMismatch:
+            raise ApiError(404, "profile_not_found", "No such profile.") from None
         if not result["success"]:
             code = result.get("code")
             if code == "not_found":
@@ -648,7 +651,13 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             if code == "version_conflict":
                 raise ApiError(409, "version_conflict", result["error"])
             raise ApiError(400, "invalid_input", result["error"])
-        return await store.memory_item(profile.id, entry_id)
+        if op["action"] == "remove":
+            return None
+        # A replace keeps the entry's id; read it back once and treat a concurrent removal as not found.
+        current = await store.memory_item(profile.id, entry_id)
+        if current is None:
+            raise ApiError(404, "memory_not_found", "No such memory entry.")
+        return current
 
     def version_arg(value) -> int:
         if isinstance(value, bool) or not isinstance(value, int):

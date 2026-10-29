@@ -9,6 +9,7 @@ from keel.events import InMemoryEventBus
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
+from keel.store.base import ProfileIncarnationMismatch
 
 PROFILE = {"models": [{"provider": "fake", "model": "m"}], "sandbox": {}, "soul": "", "skills": [], "memory": True}
 
@@ -73,3 +74,34 @@ async def test_another_tenant_sees_neither_the_profile_nor_the_entry(client):
     assert (await http.put("/v1/profiles/p2", json=PROFILE, headers=other)).status_code == 200
     foreign = await http.delete(f"/v1/profiles/p2/memory/{item.id}?expected_version=1", headers=other)
     assert foreign.status_code == 404 and foreign.json()["error"]["code"] == "memory_not_found"
+
+
+async def test_patch_answers_404_when_the_entry_vanishes_after_the_write(client, monkeypatch):
+    http, store = client
+    await store.apply_memory("p1", "user", 1375, [{"action": "add", "content": "likes tea"}])
+    [item] = await store.memory_items("p1")
+    real, calls = store.memory_item, []
+
+    async def vanishing(profile_id, entry_id):
+        calls.append(entry_id)
+        return await real(profile_id, entry_id) if len(calls) == 1 else None
+
+    monkeypatch.setattr(store, "memory_item", vanishing)
+    response = await http.patch(f"/v1/profiles/p1/memory/{item.id}",
+                                json={"text": "likes coffee", "expected_version": 1})
+    assert response.status_code == 404 and response.json()["error"]["code"] == "memory_not_found"
+
+
+async def test_a_stale_profile_incarnation_answers_404_profile_not_found(client, monkeypatch):
+    http, store = client
+    await store.apply_memory("p1", "user", 1375, [{"action": "add", "content": "likes tea"}])
+    [item] = await store.memory_items("p1")
+
+    async def stale(profile_id, incarnation):
+        raise ProfileIncarnationMismatch(profile_id)
+
+    monkeypatch.setattr(store, "_check_profile_incarnation", stale)
+    patch = await http.patch(f"/v1/profiles/p1/memory/{item.id}", json={"text": "x", "expected_version": 1})
+    delete = await http.delete(f"/v1/profiles/p1/memory/{item.id}?expected_version=1")
+    for response in (patch, delete):
+        assert response.status_code == 404 and response.json()["error"]["code"] == "profile_not_found"

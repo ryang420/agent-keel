@@ -10,12 +10,12 @@ ADD_TEA = [{"action": "add", "content": "likes tea"}]
 async def ledger(store, profile_id="p1"):
     return await store.db.fetch(
         "SELECT entry_id, action, old_text, new_text, source_kind, run_id, session_id, message_id, tool_call_id, "
-        "revision FROM memory_changes WHERE profile_id = ? ORDER BY id", profile_id)
+        "mutation_key, revision FROM memory_changes WHERE profile_id = ? ORDER BY id", profile_id)
 
 
 async def test_a_write_creates_a_stable_entry_a_revision_and_a_ledger_row(store):
     source = MemorySource("foreground", run_id="r1", session_id="s1", message_id=7, tool_call_id="c1")
-    result = await store.apply_memory("p1", "user", 200, ADD_TEA, source=source)
+    result = await store.apply_memory("p1", "user", 200, ADD_TEA, source=source, mutation_key="foreground:r1:c1:abc")
     assert result["success"] is True and result["revision"] == 1
     [item] = await store.memory_items("p1")
     assert (item.target, item.text, item.version, item.source_kind) == ("user", "likes tea", 1, "foreground")
@@ -23,6 +23,7 @@ async def test_a_write_creates_a_stable_entry_a_revision_and_a_ledger_row(store)
     assert result["items"] == [{"id": item.id, "text": "likes tea", "version": 1}]
     [row] = await ledger(store)
     assert (row["entry_id"], row["action"], row["new_text"], row["revision"]) == (item.id, "add", "likes tea", 1)
+    assert row["mutation_key"] == "foreground:r1:c1:abc"
 
 
 async def test_replace_by_id_keeps_the_id_and_records_old_and_new_text(store):
@@ -97,9 +98,30 @@ async def test_run_user_message_id_is_the_runs_latest_user_message(store):
 async def test_deleting_a_session_detaches_provenance_but_keeps_the_fact(store):
     await store.ensure_session("p1", "s1")
     await store.apply_memory("p1", "user", 200, ADD_TEA,
-                             source=MemorySource("foreground", run_id="r1", session_id="s1", message_id=3))
+                             source=MemorySource("foreground", run_id="r1", session_id="s1", message_id=3),
+                             mutation_key="foreground:r1:c1:abc")
     assert await store.delete_session("p1", "s1") is True
     [item] = await store.memory_items("p1")
     assert item.text == "likes tea" and (item.run_id, item.session_id, item.message_id) == (None, None, None)
     [row] = await ledger(store)
     assert row["new_text"] == "likes tea" and row["source_kind"] == "foreground"
+    assert await store.db.fetchrow("SELECT 1 AS n FROM memory_mutations WHERE profile_id = 'p1'") is None
+
+
+async def test_the_memory_tool_key_distinguishes_different_calls_with_one_id(store):
+    from keel.models import Message, TextPart
+    from keel.tools.base import ToolContext
+    from keel.tools.memory import memory
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    await store.ensure_session("p1", "s1")
+    run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                 reasoning_effort=None, input_parts=[], instructions=None)
+    await store.append_message("s1", run.id, Message("user", (TextPart("hi"),)))
+    ctx = ToolContext(store=store, profile_id="p1", session_id="s1", run_id=run.id, tool_call_id="c1",
+                      memory_chars=2200, user_chars=1375)
+    await memory({"action": "add", "content": "likes tea"}, ctx)
+    await memory({"action": "add", "content": "uses uv"}, ctx)
+    replay = await memory({"action": "add", "content": "uses uv"}, ctx)
+    assert (await store.memory_entries("p1"))["memory"] == ["likes tea", "uses uv"]
+    assert '"replayed": true' in replay.content

@@ -58,12 +58,12 @@ Errors have one shape, with a machine-readable code:
 - `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
 - `skills`: the names of the skills to enable.
 - `memory`: a boolean. When true, the model is offered a `memory` tool (with or without a sandbox) and the system
-  prompt includes a snapshot of stored facts. The tool's `list` action shows entries
-  with ids and versions, and a change can name an entry by `entry_id` with an `expected_version`. A write does not change this session's stored prompt: it is visible in
-  the next session's prompt, and after a compaction. Every `KEEL_MEMORY_REVIEW_TURNS` completed runs (10 by default)
-  of that profile, a background review may save facts. The review does not add messages or events to the session, and
-  one already running for that profile is skipped. Omitted, the field is false, including on update. `null`, or
-  anything other than a boolean, is 400 `invalid_input`.
+  prompt includes a snapshot of stored facts. The tool's `list` action shows entries with ids and versions, and a
+  change can name an entry by `entry_id` with an `expected_version`. A write does not change this session's stored
+  prompt: it is visible in the next session's prompt, and after a compaction. Every `KEEL_MEMORY_REVIEW_TURNS` completed
+  runs (10 by default) of that profile, a background review may save facts. The review does not add messages or
+  events to the session, and one already running for that profile is skipped. Omitted, the field is false, including
+  on update. `null`, or anything other than a boolean, is 400 `invalid_input`.
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 
@@ -187,8 +187,9 @@ run, session and message of the changes it produced but keeps the facts.
 `PATCH /v1/profiles/{profile_id}/memory/{entry_id}` with `{"text": "…", "expected_version": 1}` replaces the text
 and returns the entry at its new version. `DELETE /v1/profiles/{profile_id}/memory/{entry_id}?expected_version=1`
 removes it. Both answer 404 `memory_not_found` for an unknown entry, 409 `version_conflict` when the entry has
-changed since that version, and 400 `invalid_input` when the text is empty, looks like a secret or an instruction,
-or would exceed the target's character budget. Sessions already open keep the memory snapshot in their stored
+changed since that version, 409 `profile_deletion_busy` while the profile is being deleted, and 400 `invalid_input`
+for a missing or non-integer `expected_version`. PATCH also answers 400 `invalid_input` when the text is empty,
+looks like a secret or an instruction, or would exceed the target's character budget. Sessions already open keep the memory snapshot in their stored
 prompt until they compact; new sessions see the change. Removing an entry stops it being used; it does not erase
 the conversations it came from.
 
