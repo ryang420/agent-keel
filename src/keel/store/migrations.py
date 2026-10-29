@@ -184,9 +184,44 @@ ALTER TABLE profiles ADD COLUMN incarnation TEXT;
 ALTER TABLE runs ADD COLUMN profile_incarnation TEXT;
 """
 
+# Memory entries (cross-session memory design §2): each JSON list item becomes a stable row in its old order,
+# duplicates included, with legacy provenance and no invented source. The old table goes in the same transaction.
+_V8 = """
+CREATE TABLE memory_entries (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL,
+    target TEXT NOT NULL CHECK (target IN ('memory', 'user')),
+    position INTEGER NOT NULL, text TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'removed')),
+    created_at {real} NOT NULL, updated_at {real} NOT NULL);
+CREATE INDEX memory_entries_live ON memory_entries (profile_id, target, state, position);
+CREATE TABLE memory_revisions (
+    profile_id TEXT NOT NULL, target TEXT NOT NULL, revision {bigint} NOT NULL,
+    PRIMARY KEY (profile_id, target));
+CREATE TABLE memory_changes (
+    id {serial} PRIMARY KEY, profile_id TEXT NOT NULL, target TEXT NOT NULL, entry_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('add', 'replace', 'remove')), old_text TEXT, new_text TEXT,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('foreground', 'review', 'consumer', 'legacy')),
+    run_id TEXT, session_id TEXT, message_id {bigint}, tool_call_id TEXT,
+    revision {bigint} NOT NULL, created_at {real} NOT NULL);
+CREATE INDEX memory_changes_entry ON memory_changes (profile_id, entry_id, id);
+CREATE INDEX memory_changes_session ON memory_changes (profile_id, session_id);
+CREATE TABLE memory_mutations (
+    profile_id TEXT NOT NULL, mutation_key TEXT NOT NULL, result TEXT NOT NULL, created_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, mutation_key));
+INSERT INTO memory_entries (id, profile_id, target, position, text, version, state, created_at, updated_at)
+    SELECT md5(m.profile_id || '/' || m.target || '/' || e.ord::text), m.profile_id, m.target, e.ord::integer - 1,
+           e.value, 1, 'active', m.updated_at, m.updated_at
+    FROM memories m CROSS JOIN LATERAL jsonb_array_elements_text(m.entries::jsonb) WITH ORDINALITY AS e(value, ord);
+INSERT INTO memory_revisions (profile_id, target, revision)
+    SELECT DISTINCT profile_id, target, 1 FROM memory_entries;
+INSERT INTO memory_changes (profile_id, target, entry_id, action, new_text, source_kind, revision, created_at)
+    SELECT profile_id, target, id, 'add', text, 'legacy', 1, created_at FROM memory_entries ORDER BY position;
+DROP TABLE memories
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

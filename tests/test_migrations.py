@@ -16,8 +16,9 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memories, run_events, "
-              "runs, messages, sessions, profiles, tenants, blobs")
+ALL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, "
+              "memory_changes, memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, "
+              "tenants, blobs")
 
 # keel 0.2.0's schema as released (src/keel/store/sql.py at v0.2.0). Kept apart from migration 1, which must
 # reproduce it, so that an edit to migration 1 fails the schema comparison below.
@@ -86,6 +87,14 @@ async def empty_database(url: str) -> str:
     """Reset this test's isolated PostgreSQL database for fresh-schema comparison."""
     await run_script(url, f"DROP TABLE IF EXISTS {ALL_TABLES}")
     return url
+
+
+async def restore_legacy_memories(db) -> None:
+    """Undo migration 8 on a database that is being rewound to an older schema version."""
+    for table in ("memory_mutations", "memory_changes", "memory_revisions", "memory_entries"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
+                     "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
 
 
 async def database_table_names(db) -> set[str]:
@@ -372,9 +381,6 @@ async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
         assert (session.context_tokens, session.context_message_id, session.compaction_failed_at) == (None, None, None)
         assert session.turns_since_memory == 0
         assert session.pruned_id is None
-        await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
-                               "p1", "user", "[]", 1.0)
-        assert (await store.db.fetchrow("SELECT entries FROM memories WHERE profile_id = ?", "p1"))["entries"] == "[]"
     finally:
         await store.close()
 
@@ -395,6 +401,7 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
     await store.db.execute("DROP INDEX IF EXISTS profiles_tenant")
@@ -449,6 +456,7 @@ async def test_a_v4_database_gains_the_coordination_tables(db_url):
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
     await store.close()
@@ -593,3 +601,32 @@ async def test_coordination_time_is_read_at_call_time_inside_a_transaction(db_ur
         assert after - before >= 0.03
     finally:
         await store.close()
+
+
+async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monkeypatch):
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:7])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 7)
+    store = await open_store(db_url)
+    await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[], tenant_id=1)
+    await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
+                           "p1", "user", json.dumps(["likes tea", "likes tea", "works late"]), 5.0)
+    await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
+                           "p1", "memory", "[]", 5.0)
+    await store.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == 8
+        # Order and duplicates survive exactly; the rendered snapshot is unchanged.
+        assert await upgraded.memory_entries("p1") == {"memory": [], "user": ["likes tea", "likes tea", "works late"]}
+        items = await upgraded.memory_items("p1")
+        assert [(item.target, item.version, item.source_kind, item.run_id) for item in items] == [
+            ("user", 1, "legacy", None)] * 3
+        assert len({item.id for item in items}) == 3
+        revision = await upgraded.db.fetchrow(
+            "SELECT revision FROM memory_revisions WHERE profile_id = ? AND target = ?", "p1", "user")
+        assert revision["revision"] == 1
+        assert "memories" not in await database_table_names(upgraded.db)
+    finally:
+        await upgraded.close()
