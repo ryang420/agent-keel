@@ -332,8 +332,8 @@ class RunExecutor:
                               cwd=(session.cwd if session and session.cwd else policy.workdir),
                               skills=tuple(skills), on_exec=self._exec_recorder(run, state), store=self.store,
                               profile_id=run.profile_id, profile_incarnation=run.profile_incarnation,
-                              session_id=run.session_id, memory_chars=self.memory_chars,
-                              user_chars=self.user_chars)
+                              session_id=run.session_id, run_id=run.id,
+                              memory_chars=self.memory_chars, user_chars=self.user_chars)
         names: list[str] = []
         if ctx is not None:
             names.extend(prompts.TOOL_ORDER)
@@ -342,7 +342,7 @@ class RunExecutor:
         if ctx is None and names:
             cwd = session.cwd if session and session.cwd else "/"
             ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id,
-                              profile_incarnation=run.profile_incarnation, session_id=run.session_id,
+                              profile_incarnation=run.profile_incarnation, session_id=run.session_id, run_id=run.id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
         saved_cwd = ctx.cwd if ctx else None
 

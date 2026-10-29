@@ -100,6 +100,8 @@ async def test_the_tenth_completed_run_starts_a_review_that_does_not_touch_the_s
     await wait_for_background(background)
 
     assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
+    [item] = await store.memory_items("p1")
+    assert item.source_kind == "review" and item.run_id == run.id
     assert [message.message.role for message in await store.messages("s1")] == ["user", "assistant"]
     assert (await store.get_run("p1", run.id)).status == "completed"
     assert [event.type for event in await store.events_after(run.id, 0)] == events
