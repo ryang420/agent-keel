@@ -58,6 +58,15 @@ class Change:
     new_text: str | None
 
 
+_TEXT_FIELDS = ("content", "new_text", "old_text")
+
+
+def _non_string_field(op: dict) -> str | None:
+    """The first text field of `op` that is present, not None and not a string, or None."""
+    return next((name for name in _TEXT_FIELDS if op.get(name) is not None and not isinstance(op[name], str)),
+                None)
+
+
 def _find(entries: list[str], old_text: str) -> int | str:
     exact = [i for i, entry in enumerate(entries) if entry == old_text]
     matches = exact or [i for i, entry in enumerate(entries) if old_text in entry]
@@ -110,6 +119,8 @@ def apply_slots(slots: list[Slot], ops: list[dict], limit: int,
         where = f"operation {pos}" if len(ops) > 1 else "the entry"
         if not isinstance(op, dict):
             return slots, _fail(slots, limit, "invalid", f"{where} must be an object."), []
+        if field := _non_string_field(op):
+            return slots, _fail(slots, limit, "invalid", f"{where}: {field} must be a string."), []
         action = op.get("action")
         content = (op.get("content") or op.get("new_text") or "").strip()
         if action == "add":
