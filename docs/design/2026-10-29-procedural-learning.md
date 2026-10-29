@@ -1,6 +1,6 @@
 # Procedural learning: profile-private skills learned across sessions
 
-Date: 2026-10-29. Status: proposed; approach selected, design awaiting approval.
+Date: 2026-10-29. Status: approved 2026-10-29; implemented after the cross-session memory design.
 
 Depends on: `docs/design/2026-10-24-cross-session-memory.md` (cited as "memory §N"), which must be implemented
 first. This design reuses its durable review queue and leases (memory §4), its mutation ledger and provenance
