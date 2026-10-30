@@ -155,6 +155,9 @@ class Settings:
     event_retention_days: int = 7
     background_limit: int = 4
     memory_review_turns: int = 10
+    memory_review_idle_seconds: float = 60.0
+    memory_review_max_age_seconds: float = 600.0
+    memory_review_workers: int = 1
     memory_chars: int = 2200
     user_chars: int = 1375
     sandbox: str = "docker"
@@ -218,6 +221,9 @@ class Settings:
             event_retention_days=_positive_int(env, "KEEL_EVENT_RETENTION_DAYS", 7),
             background_limit=_positive_int(env, "KEEL_BACKGROUND_LIMIT", 4),
             memory_review_turns=_positive_int(env, "KEEL_MEMORY_REVIEW_TURNS", 10),
+            memory_review_idle_seconds=_positive_float(env, "KEEL_MEMORY_REVIEW_IDLE_SECONDS", 60.0),
+            memory_review_max_age_seconds=_positive_float(env, "KEEL_MEMORY_REVIEW_MAX_AGE_SECONDS", 600.0),
+            memory_review_workers=_positive_int(env, "KEEL_MEMORY_REVIEW_WORKERS", 1),
             memory_chars=_positive_int(env, "KEEL_MEMORY_CHARS", 2200),
             user_chars=_positive_int(env, "KEEL_USER_CHARS", 1375),
             sandbox=sandbox,

@@ -83,10 +83,11 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
 - Open work: cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`) and, on top of it,
   procedural learning (`docs/design/2026-10-29-procedural-learning.md`), both approved 2026-10-29. Memory
   entries, the change ledger, memory tool v2 and the memory API (migration 8), the history index,
-  `session_search` and per-session tool lists (migration 9) are merged (`[Unreleased]`); next are the durable
-  review queue, then memory acceptance, then the learning plans (learned skills, observations and feedback, dream,
-  learning acceptance).
+  `session_search` and per-session tool lists (migration 9), and the durable review queue (migration 10: leased
+  background memory reviews, review API) are merged (`[Unreleased]`); next are memory acceptance, then the learning
+  plans (learned skills, observations and feedback, dream, learning acceptance).
 - M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
-  hands a running command's cleanup to the executor's cancel path.
+  hands a running command's cleanup to the executor's cancel path; finished memory review jobs are never pruned, and
+  the review queue scans `memory_reviews` without a dirty-row index.

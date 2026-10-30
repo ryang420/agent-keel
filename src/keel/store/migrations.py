@@ -242,9 +242,38 @@ INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at)
     FROM messages m JOIN sessions s ON s.id = m.session_id GROUP BY s.profile_id
 """
 
+# Durable memory review (cross-session memory design §4): per-session review state written with a run's completion,
+# jobs that claim an immutable source range, and a generation per session so a deleted and recreated session id
+# never inherits old work. The old per-session turn counter is retired; existing history is not queued.
+_V10 = """
+ALTER TABLE sessions ADD COLUMN generation TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text);
+ALTER TABLE sessions DROP COLUMN turns_since_memory;
+CREATE TABLE memory_reviews (
+    profile_id TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL, profile_incarnation TEXT NOT NULL,
+    reviewed_through {bigint} NOT NULL, queued_through {bigint} NOT NULL, dirty_through {bigint} NOT NULL,
+    pending_turns INTEGER NOT NULL, first_dirty_at {real}, last_completed_at {real} NOT NULL,
+    provider TEXT NOT NULL, model TEXT NOT NULL,
+    PRIMARY KEY (profile_id, session_id));
+CREATE TABLE memory_review_jobs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL,
+    profile_incarnation TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'discarded')),
+    provider TEXT NOT NULL, model TEXT NOT NULL, source_from {bigint} NOT NULL, source_through {bigint} NOT NULL,
+    cursor_message {bigint} NOT NULL, cursor_offset INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at {real} NOT NULL, lease_owner TEXT, lease_token TEXT, lease_expires_at {real},
+    error_code TEXT, error TEXT, usage TEXT NOT NULL DEFAULT '[]',
+    created_at {real} NOT NULL, updated_at {real} NOT NULL, finished_at {real});
+CREATE UNIQUE INDEX memory_review_jobs_open ON memory_review_jobs (profile_id, session_id)
+    WHERE status IN ('pending', 'running', 'failed');
+CREATE UNIQUE INDEX memory_review_jobs_running ON memory_review_jobs (profile_id) WHERE status = 'running';
+CREATE INDEX memory_review_jobs_due ON memory_review_jobs (status, next_attempt_at);
+CREATE INDEX memory_review_jobs_profile ON memory_review_jobs (profile_id, created_at)
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9),
+    Migration(10, _V10))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

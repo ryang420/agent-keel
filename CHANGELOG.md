@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Durable background memory review (schema migration 10): a completed run marks its session's new text, which is
+  reviewed after 10 completed runs, a minute idle, or ten minutes of activity, by a worker loop with database leases,
+  one review per profile at a time, staged edits committed atomically with the job, and bounded retries.
+  `GET /v1/profiles/{p}/memory/reviews` and `POST …/reviews/{id}/retry` inspect and requeue reviews. Settings:
+  `KEEL_MEMORY_REVIEW_IDLE_SECONDS`, `KEEL_MEMORY_REVIEW_MAX_AGE_SECONDS`, `KEEL_MEMORY_REVIEW_WORKERS`.
 - `session_search`: memory-enabled profiles can search and read their earlier conversations (lexical, English and
   Chinese), with a background index backfill (schema migration 9). Migration 9 adds the search index, so every
   instance must run this version before messages are written again (no mixed-version rollout): an older binary
@@ -18,9 +23,13 @@ All notable changes to this project are documented here. The format follows
   outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
 
 ### Changed
+- Memory review no longer runs as a best-effort task that a busy or restarting instance could drop, and a foreground
+  memory write no longer postpones it. `KEEL_MEMORY_REVIEW_TURNS` is now one of three eligibility rules, and
+  `KEEL_BACKGROUND_LIMIT` covers titles only. Migration 10 drops the old per-session turn counter; every instance
+  must run this version before runs start again (no mixed-version rollout).
 - A session's tool list is fixed with its prompt and changes only at a compaction; sessions started before this
-  release have no stored list: their tools follow the profile, without `session_search`, until they compact. Tools now declare whether they need a sandbox, and a call to a tool
-  the session was not offered is refused.
+  release have no stored list: their tools follow the profile, without `session_search`, until they compact.
+  Tools now declare whether they need a sandbox, and a call to a tool the session was not offered is refused.
 - Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
   user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
   memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,

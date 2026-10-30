@@ -1,4 +1,4 @@
-"""Best-effort tasks that must not belong to a run: a title, a memory review. They are cancelled only at shutdown."""
+"""Best-effort tasks that must not belong to a run, such as a title. They are cancelled only at shutdown."""
 
 from __future__ import annotations
 

@@ -1,241 +1,277 @@
-"""A background review may save memory. It never writes the session it read."""
+"""Durable memory review end to end: a completed run queues its range, a worker reviews it with a staged memory and
+commits once; failures retry or stop; nothing is written to the session (cross-session memory design §4)."""
 
 import asyncio
 import json
-import sys
-
-import pytest
+import re
 
 from keel.background import Background
 from keel.events import InMemoryEventBus
-from keel.models import (
-    Completed, ImagePart, Message, ReasoningItem, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
-)
-from keel.providers.base import ModelError, ProviderRegistry
+from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
+from keel.providers.base import Capabilities, ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
-from keel.review import run_review
+from keel.review import MemoryReviewer, ReviewSettings, chunk_tokens
 from keel.runner import RunExecutor
 
 OK = [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]
-TEA = json.dumps({"action": "add", "target": "user", "content": "The user likes tea"})
-REVIEW_SAVE = [ToolCallReady(ToolCall("c1", "memory", TEA)), Completed(Usage(1, 1, 0, 0))]
-REVIEW_DONE = [TextDelta("Nothing to save."), Completed(Usage(1, 1, 0, 0))]
-REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n"
-    "\n"
-    "Memory has TWO distinct stores — pick the right one for each fact:\n"
-    "- target \"user\": who the user is — persona, preferences, communication and work style, personal details "
-    "they revealed, and expectations about how you should behave.\n"
-    "- target \"memory\": facts about the environment you operate in — tool quirks, project conventions, config "
-    "gotchas, paths and endpoints that matter.\n"
-    "\n"
-    "One fact goes to ONE store, never both. If nothing is worth saving, just say 'Nothing to save.' and stop."
-)
+TEA = json.dumps({"action": "add", "target": "user", "content": "The user prefers tea"})
+SAVE = [ToolCallReady(ToolCall("c1", "memory", TEA)), Completed(Usage(10, 2, 0, 0))]
+DONE = [TextDelta("Nothing to save."), Completed(Usage(12, 1, 0, 0))]
+SETTINGS = ReviewSettings(turns=1)
 
 
 async def no_sleep(seconds):
     pass
 
 
-@pytest.fixture(autouse=True)
-def _clear_review_claims():
-    """The in-flight set is process-wide. A failed test must not leave the next one unable to review."""
-    yield
-    review = sys.modules.get("keel.review")
-    if review is not None:
-        review._running.clear()
-
-
-def executor_for(store, provider, *, turns=1, background=None):
+async def setup(store, clock, provider, *, memory=True, text="I prefer tea"):
+    store.coordination_clock = clock
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=memory)
     registry = ProviderRegistry()
     registry.register(provider)
-    background = background or Background()
-    executor = RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep, background=background,
-                           memory_review_turns=turns)
-    return executor, background
-
-
-async def start(store, session="s1", text="hello"):
-    await store.ensure_session("p1", session)
-    await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m",
-                           reasoning_effort="low", input_parts=[{"type": "text", "text": text}],
-                           instructions=None)
-    return await store.claim_run("w1", 9_999_999)
-
-
-async def pin_title(store, session):
-    """A user title skips the background rename, so the scripted provider serves the review only."""
-    await store.set_title("p1", session, f"Kept {session}", "user")
-
-
-async def wait_for_background(background):
-    tasks = [task for task in background._tasks]
-    if not tasks:
-        return
-    _, pending = await asyncio.wait(tasks, timeout=2)
-    assert not pending
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep, background=Background())
+    await store.ensure_session("p1", "s1")
+    await store.set_title("p1", "s1", "Kept", "user")  # no background title call
+    await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m", reasoning_effort="low",
+                           input_parts=[{"type": "text", "text": text}], instructions=None)
+    run = await store.claim_run("w1", 9_999_999)
+    await executor.execute(run)
+    return MemoryReviewer(store, registry, SETTINGS, sleep=no_sleep), run
 
 
 def review_requests(provider):
-    return [request for request in provider.requests
-            if request.messages and request.messages[-1].text.startswith("Review the conversation")]
+    return [request for request in provider.requests if request.system.startswith("You maintain")]
 
 
-async def test_the_tenth_completed_run_starts_a_review_that_does_not_touch_the_session(store):
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
-                               memory=True)
-    await store.ensure_session("p1", "s1")
-    for _ in range(9):
-        assert await store.note_memory_turn("s1", 10) is False
-    assert await store.note_memory_turn("s1", 10) is True
-    assert (await store.get_session("p1", "s1")).turns_since_memory == 0
-
-    provider = FakeProvider()
-    provider.script = [OK, REVIEW_SAVE, REVIEW_DONE]
-    executor, background = executor_for(store, provider, turns=1)
-    run = await start(store)
-    await pin_title(store, "s1")
-    await executor.execute(run)
-    events = [event.type for event in await store.events_after(run.id, 0)]
-    await wait_for_background(background)
-
-    assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
+async def test_a_completed_run_is_reviewed_once_by_the_worker_without_touching_the_session(store, clock):
+    provider = FakeProvider(script=[OK, SAVE, DONE])
+    reviewer, run = await setup(store, clock, provider)
+    events = await store.events_after(run.id, 0)
+    assert await reviewer.run_once("w1")
     [item] = await store.memory_items("p1")
-    assert item.source_kind == "review" and item.run_id == run.id
-    assert [message.message.role for message in await store.messages("s1")] == ["user", "assistant"]
-    assert (await store.get_run("p1", run.id)).status == "completed"
-    assert [event.type for event in await store.events_after(run.id, 0)] == events
-    review = review_requests(provider)
-    assert len(review) == 1
-    assert review[0].messages[-1].text == REVIEW_PROMPT
-    assert [tool["name"] for tool in review[0].tools] == ["memory"]
-    assert review[0].system == (await store.get_session("p1", "s1")).system_prompt
-    assert review[0].cache_scope == "s1" and review[0].reasoning_effort == "low"
+    assert (item.text, item.source_kind, item.session_id) == ("The user prefers tea", "review", "s1")
+    [job] = await store.list_reviews("p1")
+    assert job.status == "done" and job.usage[0]["requests"] == 2
+    assert job.usage[0]["usage"]["input_tokens"] == 22
+    assert [stored.message.role for stored in await store.messages("s1")] == ["user", "assistant"]
+    assert await store.events_after(run.id, 0) == events
+    [first, second] = review_requests(provider)
+    assert [tool["name"] for tool in first.tools] == ["memory"]
+    assert first.max_output_tokens == 2000 and first.cache_scope == "" and first.reasoning_effort == "low"
+    assert "<message id=" in first.messages[0].text and "I prefer tea" in first.messages[0].text
+    assert await reviewer.run_once("w1") is False
 
 
-class _OverlappingReviews(FakeProvider):
-    """Sleeps only on a review. FakeProvider's script is a queue, so it cannot tell a review from a user turn."""
-
-    def __init__(self):
-        super().__init__()
-        self.reviews = 0
-
-    async def stream(self, request):
-        self.requests.append(request)
-        if request.messages and request.messages[-1].text.startswith("Review the conversation"):
-            self.reviews += 1
-            await asyncio.sleep(0.2)
-            yield TextDelta("Nothing to save.")
-            yield Completed(Usage(1, 1, 0, 0))
-            return
-        yield TextDelta("ok")
-        yield Completed(Usage(1, 1, 0, 0))
-
-
-async def test_a_review_already_running_for_the_profile_is_skipped(store):
-    provider = _OverlappingReviews()
-    executor, background = executor_for(store, provider, turns=1)
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
-                               memory=True)
-    first, second = await start(store, "s1"), await start(store, "s2")
-    await asyncio.gather(executor.execute(first), executor.execute(second))
-    await wait_for_background(background)
-    assert provider.reviews == 1
-    assert (await store.get_run("p1", first.id)).status == "completed"
-    assert (await store.get_run("p1", second.id)).status == "completed"
-
-
-async def test_a_failing_review_leaves_the_run_completed(store):
-    provider = FakeProvider()
-    provider.script = [OK, [ModelError("bad_request", "down")]]
-    executor, background = executor_for(store, provider, turns=1)
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
-                               memory=True)
-    run = await start(store)
-    await pin_title(store, "s1")
-    await executor.execute(run)
-    await wait_for_background(background)
-    done = await store.get_run("p1", run.id)
-    assert done.status == "completed" and done.error_code is None
-    assert (await store.memory_entries("p1")) == {"memory": [], "user": []}
-    assert review_requests(provider)
-    assert [message.message.role for message in await store.messages("s1")] == ["user", "assistant"]
-
-
-async def test_a_run_that_uses_the_memory_tool_still_counts_as_one(store):
-    """The tool zeros the counter during the run. The increment is after the run, so the run still counts as 1
-    and a counter that was about to review does not."""
-    provider = FakeProvider()
-    provider.script = [[ToolCallReady(ToolCall("c1", "memory", TEA)), Completed(Usage(1, 1, 0, 0))], OK]
-    executor, background = executor_for(store, provider, turns=10)
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
-                               memory=True)
-    run = await start(store)
-    await store.db.execute("UPDATE sessions SET turns_since_memory = 9 WHERE id = ?", "s1")
-    await pin_title(store, "s1")
-    await executor.execute(run)
-    await wait_for_background(background)
-    assert (await store.get_session("p1", "s1")).turns_since_memory == 1
+async def test_nothing_is_reviewed_without_memory(store, clock):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider, memory=False)
+    assert await reviewer.run_once("w1") is False
     assert review_requests(provider) == []
 
 
-async def test_a_dropped_review_does_not_stick_the_profile(store):
-    provider = FakeProvider()
-    provider.script = [OK, OK, REVIEW_SAVE, REVIEW_DONE]
-    registry = ProviderRegistry()
-    registry.register(provider)
-    bus = InMemoryEventBus()
-    dropped = RunExecutor(store, bus, registry, sleep=no_sleep, background=Background(limit=0),
-                          memory_review_turns=1)
-    later, background = executor_for(store, provider, turns=1)
+async def test_an_unfinished_proposal_commits_nothing_and_retries(store, clock):
+    loop = [ToolCallReady(ToolCall("c", "memory", TEA)), Completed(Usage(1, 1, 0, 0))]
+    provider = FakeProvider(script=[OK, loop, loop, loop, loop])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "iteration_limit")
+
+
+async def test_an_unknown_tool_name_is_refused_inside_the_review(store, clock):
+    sneaky = [ToolCallReady(ToolCall("c", "terminal", '{"command": "id"}')), Completed(Usage(1, 1, 0, 0))]
+    provider = FakeProvider(script=[OK, sneaky, DONE])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    [_, second] = review_requests(provider)
+    assert "Unknown tool" in second.messages[-1].text
+    assert (await store.list_reviews("p1"))[0].status == "done"
+
+
+async def test_a_model_removed_from_the_profile_fails_without_retry(store, clock):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "other"}], sandbox={}, soul="",
+                               skills=[], memory=True)
+    assert await reviewer.run_once("w1")
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("failed", "model_unavailable")
+
+
+async def test_a_provider_error_is_recorded_and_retried(store, clock):
+    provider = FakeProvider(script=[OK] + [[ModelError("server_error", "down")]] * 3)  # three retried calls
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "model_server_error") and job.attempts == 1
+
+
+async def test_a_deadline_ends_the_attempt(store, clock, monkeypatch):
+    import keel.review as review
+
+    monkeypatch.setattr(review, "DEADLINE_S", 0.05)
+    provider = FakeProvider(script=[OK, ["hang"]])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "deadline")
+
+
+async def test_a_survivor_retries_a_job_whose_worker_died(store, clock):
+    provider = FakeProvider(script=[OK, ["hang"], SAVE, DONE])
+    reviewer, _ = await setup(store, clock, provider)
+    task = asyncio.create_task(reviewer.run_once("w1"))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if review_requests(provider):
+            break
+    assert review_requests(provider), "the review never reached the model"
+    task.cancel()  # shutdown mid-review: the worker never commits
+    await asyncio.gather(task, return_exceptions=True)
+    [job] = await store.list_reviews("p1")
+    assert job.status == "pending" and job.attempts == 0  # shutdown released it
+    other = MemoryReviewer(store, reviewer.providers, SETTINGS, sleep=no_sleep)
+    assert await other.run_once("w2")
+    assert [item.text for item in await store.memory_items("p1")] == ["The user prefers tea"]
+
+
+async def test_a_stale_job_from_a_recreated_profile_writes_nothing(store, clock):
+    provider = FakeProvider(script=[OK, SAVE, DONE])
+    reviewer, _ = await setup(store, clock, provider)
+    clock.now += 60
+    claimed = await store.claim_review("w1", 30.0, turns=1, idle_seconds=60.0, max_age_seconds=600.0)
+    record = await store.begin_profile_deletion("p1", 1, "op-1")
+    record = await store.advance_profile_deletion(record, "draining")
+    await store.purge_profile_data(record)
+    await store.complete_profile_deletion("p1", 1, "op-1")
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
-                               memory=True)
-    first = await start(store, "s1")
-    await pin_title(store, "s1")
-    await dropped.execute(first)
-    second = await start(store, "s2")
-    await pin_title(store, "s2")
-    await later.execute(second)
-    await wait_for_background(background)
-    assert (await store.get_run("p1", first.id)).status == "completed"
-    assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
+                               memory=True, tenant_id=1)
+    assert await store.review_owner_gone(claimed) == "profile_gone"
+    assert await store.commit_review(claimed, {}, end=(0, 0), done=True, evidence=None, usage=None) == "lost"
+    assert await store.memory_items("p1") == []
 
 
-async def test_a_review_sends_the_assembled_history_with_loaded_images(store):
-    """After compaction the model sees head, summary and tail, with image bytes loaded. The review sends that
-    same history and leaves the stored transcript alone, including empty image bytes."""
-    provider = FakeProvider()
-    reasoning = ReasoningItem("fake", "m", "reasoning", {"encrypted_content": "e"})
-    provider.script = [
-        [ReasoningReady(reasoning), ToolCallReady(ToolCall("c1", "memory", TEA)), Completed(Usage(1, 1, 0, 0))],
-        REVIEW_DONE,
-    ]
-    executor, _background = executor_for(store, provider, turns=1)
-    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
-                               memory=True)
-    await store.ensure_session("p1", "s1")
-    blob = await store.put_blob("p1", "s1", "image/png", "aGVsbG8=")
-    head = await store.append_message("s1", None, Message("user", (TextPart("hello"),)))
-    await store.append_message("s1", None, Message("user", (TextPart("forgotten middle"),)))
-    tail = await store.append_message(
-        "s1", None, Message("user", (TextPart("see this"), ImagePart("image/png", blob_id=blob))))
-    await store.compact_session("s1", summary="A red square.", head_id=head.id, tail_id=tail.id,
-                                system_prompt="SYSTEM PROMPT")
-    before = [(item.id, item.message) for item in await store.messages("s1")]
-    run = await start(store)
-    await run_review(executor, run)
+async def test_a_lost_lease_cancels_the_attempt_and_a_later_claim_retries_the_job(store, clock):
+    provider = FakeProvider(script=[OK, ["hang"]])
+    _, run = await setup(store, clock, provider)
+    reviewer = MemoryReviewer(store, ProviderRegistry(), ReviewSettings(turns=1, lease_seconds=0.3), sleep=no_sleep)
+    reviewer.providers.register(provider)
 
-    review = review_requests(provider)
-    assert review
-    texts = [message.text for message in review[0].messages]
-    assert any("A red square." in text for text in texts)
-    assert not any("forgotten middle" in text for text in texts)
-    images = [part for message in review[0].messages for part in message.parts if isinstance(part, ImagePart)]
-    assert [part.data_b64 for part in images] == ["aGVsbG8="]
-    assert len(provider.requests) == 2
-    assistant = next(message for message in provider.requests[1].messages if message.role == "assistant")
-    assert assistant.reasoning == (reasoning,)
-    after = [(item.id, item.message) for item in await store.messages("s1")]
-    assert after == before
-    stored_image = after[-1][1].parts[1]
-    assert isinstance(stored_image, ImagePart) and stored_image.data_b64 == "" and stored_image.blob_id == blob
+    async def refused(claim, lease_seconds):
+        return False
+
+    store.renew_review = refused
+    assert await asyncio.wait_for(reviewer.run_once("w1"), 5)
+    assert await store.memory_items("p1") == []
+    clock.now += 60
+    claimed = await store.claim_review("w2", 30.0, turns=1, idle_seconds=60.0, max_age_seconds=600.0)
+    assert claimed is not None
+    [job] = await store.list_reviews("p1")
+    assert job.error_code == "lease_expired" and job.id == claimed.job.id and job.attempts == 2
+    assert not [t for t in asyncio.all_tasks() if t.get_name().startswith("keel-review-")]
+
+
+async def test_a_failed_lease_renewal_is_logged_and_the_review_still_completes(store, clock):
+    provider = FakeProvider(script=[OK, [0.35] + SAVE, DONE])
+    _, run = await setup(store, clock, provider)
+    reviewer = MemoryReviewer(store, ProviderRegistry(), ReviewSettings(turns=1, lease_seconds=0.3), sleep=no_sleep)
+    reviewer.providers.register(provider)
+    real, calls = store.renew_review, []
+
+    async def flaky(claim, lease_seconds):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("database blip")
+        return await real(claim, lease_seconds)
+
+    store.renew_review = flaky
+    assert await asyncio.wait_for(reviewer.run_once("w1"), 5)
+    assert len(calls) >= 2
+    assert [item.text for item in await store.memory_items("p1")] == ["The user prefers tea"]
+    assert (await store.list_reviews("p1"))[0].status == "done"
+
+
+def test_the_chunk_shrinks_for_a_small_context_window():
+    assert chunk_tokens(128_000) == 2000
+    assert chunk_tokens(6000) == 1000 < chunk_tokens(128_000)
+    assert chunk_tokens(100) == 500
+
+
+def small_window(provider, size):
+    provider._capabilities = Capabilities(size, True, False, True, "none")
+
+
+async def test_a_request_that_does_not_fit_the_window_retries_later_without_calling_the_model(store, clock):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+    small_window(provider, 2500)
+    assert await reviewer.run_once("w1")
+    assert review_requests(provider) == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "budget")
+
+
+async def test_the_cumulative_input_cap_ends_the_attempt_and_commits_nothing(store, clock, monkeypatch):
+    import keel.review as review
+    from keel.compress import text_tokens
+    from keel import prompts
+
+    base = text_tokens(prompts.text("memory_review")) + text_tokens(json.dumps(prompts.tool_definitions(("memory",))))
+    monkeypatch.setattr(review, "INPUT_TOKENS", base * 3 // 2)
+    provider = FakeProvider(script=[OK, SAVE, DONE])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    assert len(review_requests(provider)) == 1
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "budget")
+
+
+async def test_a_retried_attempt_reviews_a_smaller_chunk(store, clock):
+    failing = [[ModelError("server_error", "down")]] * 3
+    provider = FakeProvider(script=[OK] + failing + [DONE])
+    reviewer, _ = await setup(store, clock, provider, text="word " * 6000)
+    assert await reviewer.run_once("w1")
+    clock.now += 3600
+    assert await reviewer.run_once("w1")
+    spans = [int(re.search(r"chars=0-(\d+)/", request.messages[0].text).group(1))
+             for request in (review_requests(provider)[0], review_requests(provider)[-1])]
+    assert spans[1] < spans[0] and abs(spans[1] * 2 - spans[0]) <= spans[0] * 0.1
+
+
+async def test_a_job_whose_session_was_replaced_before_the_review_is_discarded_unread(store, clock):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+    await store.db.execute("UPDATE sessions SET generation = ? WHERE id = ?", "other", "s1")
+    assert await reviewer.run_once("w1")
+    assert review_requests(provider) == []
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("discarded", "session_gone")
+
+
+async def test_a_cut_off_response_commits_nothing_and_keeps_the_cursor(store, clock):
+    cut = [TextDelta("partial"), Completed(Usage(1, 1, 0, 0), "incomplete")]
+    provider = FakeProvider(script=[OK, cut])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code, job.cursor_message) == ("pending", "incomplete", 0)
+    state = await store.db.fetchrow("SELECT reviewed_through FROM memory_reviews WHERE session_id = 's1'")
+    assert state["reviewed_through"] == 0
+
+
+async def test_a_profile_purged_after_the_owner_check_discards_the_job(store, clock, monkeypatch):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+
+    async def gone(profile_id):
+        return None
+
+    monkeypatch.setattr(store, "get_profile", gone)
+    assert await reviewer.run_once("w1")
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("discarded", "profile_gone")

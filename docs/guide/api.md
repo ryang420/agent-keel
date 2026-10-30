@@ -63,10 +63,17 @@ Errors have one shape, with a machine-readable code:
 - `memory`: a boolean. When true, the model is offered a `memory` tool and a `session_search` tool (both with or
   without a sandbox) and the system prompt includes a snapshot of stored facts. The tool's `list` action shows entries
   with ids and versions, and a change can name an entry by `entry_id` with an `expected_version`. A write does not
-  change this session's stored prompt: it is visible in the next session's prompt, and after a compaction. Every
-  `KEEL_MEMORY_REVIEW_TURNS` completed runs (10 by default) of that profile, a background review may save facts. The
-  review does not add messages or events to the session, and one already running for that profile is skipped. Omitted,
-  the field is false, including on update. `null`, or anything other than a boolean, is 400 `invalid_input`.
+  change this session's stored prompt: it is visible in the next session's prompt, and after a compaction.
+  A completed run (including one cut off at the iteration cap) marks its new user and assistant text for a
+  background review. A session becomes eligible after `KEEL_MEMORY_REVIEW_TURNS` completed runs (10), 60 seconds
+  after its last completed run, or 10 minutes after its first unreviewed one. Failed and cancelled runs do not make
+  a session eligible; their text is reviewed with the next completed run's. The review is durable: it survives a
+  restart and runs on one instance at a time per profile. It reads only the new text, plus a little earlier text for
+  context. It never adds messages or events to the session. Its result is eventual: a session started right after a
+  run may not see it yet. Turning memory on starts reviews from the next completed run; older conversations are
+  searchable but never reviewed. Turning memory off and on again discards the profile's queued, failed and running
+  reviews. Omitted, the field is false, including on update. `null`, or anything other than a boolean, is
+  400 `invalid_input`.
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 
@@ -195,6 +202,32 @@ for a missing or non-integer `expected_version`. PATCH also answers 400 `invalid
 looks like a secret or an instruction, or would exceed the target's character budget. Sessions already open keep the
 memory snapshot in their stored prompt until they compact; new sessions see the change. Removing an entry stops it
 being used; it does not erase the conversations it came from.
+
+### `GET /v1/profiles/{p}/memory/reviews`
+
+Background memory reviews, newest first. Query: `status` (`pending`, `running`, `done`, `failed`, `discarded`) and
+`limit` (1-100, default 20). No conversation text is returned.
+
+```json
+{"reviews": [{"id": "3f2a…", "session_id": "s1", "status": "failed", "attempts": 3, "error_code": "deadline",
+  "error": "The review did not finish in time.", "provider": "bedrock", "model": "…",
+  "source": {"after_message_id": 120, "through_message_id": 131}, "cursor": {"message_id": 120, "offset": 0},
+  "usage": [{"attempt": 3, "outcome": "deadline", "requests": 2,
+             "usage": {"input_tokens": 5210, "output_tokens": 180,
+                       "cache_read_tokens": null, "cache_write_tokens": null}}],
+  "created_at": 1761800000.0, "updated_at": 1761800300.0, "finished_at": 1761800300.0}]}
+```
+
+A job reviews the session's text after `after_message_id` up to `through_message_id`; `cursor` is how far it has
+got. `usage` lists the last 20 attempts; an unknown count is `null`. A `failed` job is retried automatically up to
+three attempts, then waits for an operator; while it waits, that session gets no new review. `discarded` means its
+profile, session or memory switch changed underneath it.
+
+### `POST /v1/profiles/{p}/memory/reviews/{id}/retry`
+
+Requeue a `failed` review with fresh attempts and return it. Retrying a `pending` or `running` review returns it
+unchanged. `404 review_not_found`; `409 review_not_retryable` for `done` or `discarded`; `409 review_source_gone`
+when its conversation was deleted or replaced.
 
 With `memory` on, new sessions are also offered `session_search`. It searches and reads the profile's earlier
 conversations: user and assistant text only, secrets redacted, never across profiles. A session keeps the tools it

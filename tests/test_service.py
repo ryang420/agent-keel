@@ -45,9 +45,9 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path, pg_dsn):
         assert backend is None and keel.executor.coordinator is None and pool.coordinator is None
         assert keel.executor.background is keel.background
         assert keel.executor.compactor.threshold == 0.5
-        assert (keel.executor.memory_chars, keel.executor.user_chars, keel.executor.memory_review_turns) == (
-            100, 50, 3)
+        assert (keel.executor.memory_chars, keel.executor.user_chars) == (100, 50)
         assert pool.event_retention_s == 7 * 86_400
+        assert pool.reviewer is not None and pool.reviewer.settings.turns == 3
     finally:
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")

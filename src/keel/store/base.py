@@ -53,6 +53,14 @@ class ProfileIncarnationMismatch(StoreError):
     """A delayed writer belongs to an older incarnation of a deterministic profile id."""
 
 
+class ReviewNotRetryable(StoreError):
+    """Only a failed memory review can be retried."""
+
+
+class ReviewSourceGone(StoreError):
+    """The session a memory review read no longer exists in that generation."""
+
+
 class UniqueViolation(Exception):
     """Raised by the database adapter when a unique constraint rejects a write."""
 
@@ -93,9 +101,9 @@ class Session:
     context_tokens: int | None = None
     context_message_id: int | None = None
     compaction_failed_at: float | None = None
-    turns_since_memory: int = 0
     pruned_id: int | None = None
     tools: tuple[str, ...] | None = None
+    generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +161,37 @@ class MemoryItem:
     run_id: str | None
     session_id: str | None
     message_id: int | None
+
+
+@dataclass(frozen=True)
+class ReviewJob:
+    """A memory review job as operators see it: bounds, status and usage, never transcript text."""
+    id: str
+    profile_id: str
+    session_id: str
+    status: str  # "pending", "running", "done", "failed" or "discarded"
+    provider: str
+    model: str
+    source_from: int  # exclusive
+    source_through: int  # inclusive
+    cursor_message: int
+    cursor_offset: int
+    attempts: int
+    error_code: str | None
+    error: str | None
+    usage: list[dict]
+    created_at: float
+    updated_at: float
+    finished_at: float | None
+
+
+@dataclass(frozen=True)
+class ReviewClaim:
+    """A leased job. The token fences every later write: a worker whose lease lapsed cannot commit."""
+    job: ReviewJob
+    token: str
+    generation: str
+    profile_incarnation: str
 
 
 @dataclass(frozen=True)

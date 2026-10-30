@@ -436,3 +436,21 @@ async def test_the_backfill_loop_indexes_pending_history_and_stops_on_close(pool
     finally:
         await asyncio.wait_for(pool.close(drain_seconds=0.1), 2)
     assert pool._tasks == []
+
+
+async def test_the_pool_runs_memory_review_loops_and_releases_on_close(pool_parts):
+    store, _, bus, executor = pool_parts
+    calls = []
+
+    class Reviewer:
+        async def run_once(self, owner):
+            calls.append(owner)
+            await asyncio.sleep(3600)
+
+    pool = WorkerPool(store, bus, executor, owner="w1", workers=0, reviewer=Reviewer(), review_workers=2)
+    await pool.start()
+    await asyncio.sleep(0.05)
+    assert calls == ["w1", "w1"]
+    assert sorted(t.get_name() for t in pool._tasks if t.get_name().startswith("keel-memory-review")) == [
+        "keel-memory-review-0", "keel-memory-review-1"]
+    await asyncio.wait_for(pool.close(), 5)
