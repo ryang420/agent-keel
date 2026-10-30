@@ -329,7 +329,7 @@ async def test_memory_is_offered_without_a_sandbox(setup):
     run = await start(store)
     await store.db.execute("UPDATE sessions SET turns_since_memory = 4 WHERE id = ?", "s1")
     await executor.execute(run)
-    assert tuple(tool["name"] for tool in provider.requests[0].tools) == ("memory",)
+    assert tuple(tool["name"] for tool in provider.requests[0].tools) == ("memory", "session_search")
     assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
     session = await store.get_session("p1", "s1")
     assert session.turns_since_memory == 0
@@ -354,7 +354,7 @@ async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(s
     executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep)
     await start(store, claim=False)
     await executor.execute(await executor.claim_next())
-    assert [tool["name"] for tool in provider.requests[0].tools] == [*prompts.TOOL_ORDER, "memory"]
+    assert [tool["name"] for tool in provider.requests[0].tools] == [*prompts.TOOL_ORDER, "memory", "session_search"]
 
 
 async def test_a_tool_that_was_not_offered_is_refused_by_the_run(store, tmp_path, monkeypatch):
@@ -460,3 +460,49 @@ async def test_the_memory_list_action_returns_ids_and_versions_without_writing(s
     assert listed["memory"]["items"] == [{"id": item.id, "text": "uses uv", "version": 1}]
     assert listed["user"]["items"] == [] and listed["memory"]["usage"] == "7/2200"
     assert len(await store.db.fetch("SELECT id FROM memory_changes")) == 1
+
+
+async def test_a_new_memory_session_offers_memory_and_session_search_and_stores_them(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    provider.script = [[TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store))
+    assert [tool["name"] for tool in provider.requests[0].tools] == ["memory", "session_search"]
+    session = await store.get_session("p1", "s1")
+    assert session.tools == ("memory", "session_search")
+    assert prompts.text("history") in session.system_prompt
+
+
+async def test_a_session_keeps_its_tools_when_the_profile_changes(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    provider.script = [[TextDelta("ok"), Completed(Usage(1, 1, 0, 0))],
+                       [ToolCallReady(ToolCall("c1", "memory", json.dumps(
+                           {"action": "add", "target": "user", "content": "x"}))), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store))
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=False)
+    await executor.execute(await start(store, "again"))
+    assert [tool["name"] for tool in provider.requests[1].tools] == ["memory", "session_search"]
+    tool_result = [m.message for m in await store.messages("s1") if m.message.role == "tool"][-1]
+    assert "Memory is not available." in tool_result.text
+    assert (await store.memory_entries("p1"))["user"] == []
+
+
+async def test_a_session_from_before_the_upgrade_keeps_the_plan_one_tool_set(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    await store.ensure_session("p1", "s1")
+    await store.set_session_prompt("s1", "an old prompt", "fake", "m")  # tools stays NULL
+    provider.script = [[ToolCallReady(ToolCall("c1", "session_search", '{"query": "x"}')),
+                        Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store))
+    assert [tool["name"] for tool in provider.requests[0].tools] == ["memory"]
+    tool_result = [m.message for m in await store.messages("s1") if m.message.role == "tool"][-1]
+    assert "Unknown tool: session_search" in tool_result.text
+    assert (await store.get_session("p1", "s1")).system_prompt == "an old prompt"

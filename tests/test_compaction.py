@@ -331,3 +331,16 @@ async def test_the_reported_input_tokens_anchor_the_next_estimate(parts):
     stored = await store.messages("s1")
     session = await store.get_session("p1", "s1")
     assert (session.context_tokens, session.context_message_id) == (1_234, stored[0].id)
+
+
+async def test_a_compaction_activates_the_current_tool_set(parts):
+    store, model, executor, _ = parts
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    await seed(store, 8)
+    await store.set_session_prompt("s1", "an old prompt", "fake", "m")  # stored before tool lists existed
+    model.script = [answer()]
+    await executor.execute(await start(store))
+    session = await store.get_session("p1", "s1")
+    assert session.summary == "SUMMARY" and session.tools == ("memory", "session_search")
+    assert [tool["name"] for tool in model.requests[-1].tools] == ["memory", "session_search"]
