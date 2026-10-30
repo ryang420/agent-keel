@@ -152,9 +152,9 @@ async def test_two_instances_never_run_two_reviews_for_one_profile_or_duplicate_
 
 
 async def test_a_committed_review_is_never_applied_twice(store, clock):
-    """§7 row 10, committed half (a crash before commit is covered by the fault-injection tests): once a review
-    committed, a worker that dies afterwards leaves nothing to redo: no job is claimable
-    and the fact is stored once."""
+    """§7 row 10, committed half (a crash before commit is covered by the fault-injection tests): the commit and the
+    job's done status are one transaction, so a worker that dies afterwards leaves nothing to redo: no job is
+    claimable and the fact is stored once."""
     store.coordination_clock = clock
     await memory_profile(store)
     provider = FakeProvider(script=[OK, save("Works in UTC"), NOTHING])

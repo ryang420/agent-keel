@@ -185,3 +185,11 @@ def test_the_gate_needs_every_scenario_exactly_once():
     assert missing["complete"] is False and missing["passed"] is False
     duplicated = summarize(passing + [passing[0]], scenarios)["memory"]["gate"]
     assert duplicated["complete"] is False and duplicated["passed"] is False
+
+
+def test_an_errored_outcome_fails_the_gate_with_one_error():
+    scenarios = load_suite(SUITE)
+    outcomes = [Outcome(s.id, "memory", True, (), False, False) for s in scenarios]
+    outcomes[0] = Outcome(scenarios[0].id, "memory", False, ("error: review_failed",), False, False)
+    gate = summarize(outcomes, scenarios)["memory"]["gate"]
+    assert gate["errors"] == 1 and gate["passed"] is False

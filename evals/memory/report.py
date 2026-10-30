@@ -19,12 +19,19 @@ def write(out: Path, summary: dict, outcomes, meta: dict) -> None:
     lines = [f"# Memory evaluation ({meta['protocol']})", "",
              f"- Model: `{meta['provider']}` / `{meta['model']}`", f"- keel: {meta['keel_version']}",
              *([f"- Region: {meta['region']}"] if meta.get("region") else []),
-             f"- Started: {meta['started']}", f"- Scenarios: {meta['scenarios']}", "",
+             f"- Started: {meta['started']}", f"- Scenarios: {meta['scenarios']}",
+             f"- Suite sha256: `{meta.get('suite_sha256', 'unknown')}`", f"- Commit: `{meta.get('commit', 'unknown')}`", "",
              "| Arm | Preference | Recall | English | Chinese | Overall |", "|---|---|---|---|---|---|"]
     for arm, data in summary.items():
         groups, languages = data["groups"], data["languages"]
         lines.append(f"| {arm} | {_pct(groups['preference'])} | {_pct(groups['recall'])} | "
                      f"{_pct(languages['en'])} | {_pct(languages['zh'])} | {_pct(data['overall'])} |")
+    lines += ["", "Recall passes by evidence (searched = the probe called session_search; memorised = the stored memory "
+                  "held part of the answer):"]
+    for arm, data in summary.items():
+        evidence = data["recall_evidence"]
+        lines.append(f"- {arm}: {evidence['passed']} recall passes, {evidence['searched']} used search, "
+                     f"{evidence['memorised']} had the answer memorised")
     if "memory" in summary and meta.get("gate_applicable", True):
         gate = summary["memory"]["gate"]
         verdict = "PASSED" if gate["passed"] else "FAILED"

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import keel
@@ -41,6 +43,20 @@ def _model(args) -> str:
     return model
 
 
+def _region() -> str | None:
+    env = os.environ
+    return (env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "").strip() or None
+
+
+def _commit() -> str:
+    try:
+        result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10,
+                                cwd=Path(__file__).resolve().parents[2], check=True)
+        return result.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 - best effort audit field
+        return "unknown"
+
+
 def _settings(dsn: str) -> Settings:
     """Mirrors Settings.from_env for the model-facing fields; the rest is fixed for an in-process evaluation."""
     env = os.environ
@@ -52,7 +68,7 @@ def _settings(dsn: str) -> Settings:
         raise SystemExit("KEEL_OPENAI_CONTEXT_WINDOW must be a positive integer")
     return Settings(
         credentials=(ServiceCredential(1, "memory-eval"),), database_url=dsn, sandbox="none",
-        aws_region=(env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1").strip(),
+        aws_region=_region() or "us-east-1",  # only reached for bedrock when a region is set
         openai_api_key=(env.get("KEEL_OPENAI_API_KEY") or env.get("OPENAI_API_KEY") or "").strip() or None,
         openai_base_url=base_url, openai_compat=(env.get("KEEL_OPENAI_COMPAT") or "").strip().lower()
         in ("1", "true", "yes"), openai_context_window=int(window))
@@ -67,6 +83,8 @@ async def _run(args) -> int:
         wanted = set(args.scenarios.split(","))
         scenarios = [s for s in scenarios if s.id in wanted]
     model = _model(args)
+    if args.provider == "bedrock" and not _region():
+        raise SystemExit("set AWS_REGION or AWS_DEFAULT_REGION for --provider bedrock; no region is assumed")
     started = datetime.now(UTC)
     out = Path(args.root) / "runs" / started.strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True, exist_ok=True)
@@ -82,7 +100,8 @@ async def _run(args) -> int:
             await store.close()
             await providers.aclose()
     meta = {"protocol": PROTOCOL, "provider": args.provider, "model": model, "keel_version": keel.__version__,
-            "started": started.isoformat(), "scenarios": len(scenarios), "gate_applicable": not subset}
+            "started": started.isoformat(), "scenarios": len(scenarios), "gate_applicable": not subset,
+            "suite_sha256": hashlib.sha256(Path(args.suite).read_bytes()).hexdigest(), "commit": _commit()}
     if args.provider == "bedrock":
         meta["region"] = settings.aws_region
     outcomes = [Outcome(**{**item, "failures": tuple(item["failures"])})
@@ -113,20 +132,21 @@ async def _bench(args) -> int:
     (out / "bench.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     search, append = result["search_ms"], result["append_ms"]
     classes = "\n".join(
-        f"  - {name}: {c['count']} queries, hit rate {c['hit_rate']:.2f}, p50 {c['p50']:.1f} ms, p95 {c['p95']:.1f} ms, "
-        f"max {c['max']:.1f} ms" for name, c in result["search_by_class"].items())
+        f"  - {name}: {c['count']} queries, hit rate {c['hit_rate']:.2f}, p50 {c['p50']:.1f} ms, "
+        f"p95 {c['p95']:.1f} ms, max {c['max']:.1f} ms" for name, c in result["search_by_class"].items())
     (out / "bench.md").write_text(
         f"# Search benchmark\n\n- {result['messages']} messages in one profile, {result['others']} in others\n"
         f"- Search tables total (text + tokens + indexes): {result['index_bytes'] / 2**20:.1f} MiB; backfill "
         f"{result['backfill_messages_per_s']:.0f} msg/s (batch {result['backfill_batch']})\n"
         f"- Append (indexed and raw alternate per iteration; the indexed path includes its transaction and the "
         f"session counter update): indexed mean {result['append_stats']['indexed']['mean']:.2f} / median "
-        f"{result['append_stats']['indexed']['median']:.2f} / p95 {result['append_stats']['indexed']['p95']:.2f} ms; raw mean "
+        f"{result['append_stats']['indexed']['median']:.2f} / p95 {result['append_stats']['indexed']['p95']:.2f} ms; "
+        f"raw mean "
         f"{result['append_stats']['raw']['mean']:.2f} / median {result['append_stats']['raw']['median']:.2f} / p95 "
         f"{result['append_stats']['raw']['p95']:.2f} ms; overhead (means) +{append['overhead']:.2f} ms\n"
         f"- session_search (warm cache: data just written, after VACUUM ANALYZE of the search tables): overall p50 "
         f"{search['p50']:.1f} ms, p95 {search['p95']:.1f} ms, max {search['max']:.1f} ms over {search['count']} "
-        f"queries; target: every class p95 < {result['target_p95_ms']} ms, latin and han hit rate > 0.5, absent "
+        f"queries (query terms: latin 1-5 words, han 2-4 characters); target: every class p95 < {result['target_p95_ms']} ms, latin and han hit rate > 0.5, absent "
         f"hit rate 0: {'met' if result['met'] else 'NOT met'}\n{classes}\n- Machine: {result['machine']}\n",
         encoding="utf-8")
     print(f"report: {out / 'bench.md'}")

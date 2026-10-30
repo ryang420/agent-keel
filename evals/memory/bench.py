@@ -46,7 +46,8 @@ def _han(rng: random.Random, count: int) -> str:
 
 
 def synthetic_text(rng: random.Random) -> str:
-    """A message of 5–60 words: about 30% Chinese, the rest from a 400-word Latin vocabulary."""
+    """A message of 5–60 Latin words (Zipf-weighted draws from a 400-word vocabulary) or, 30% of the time, 8–80 Han
+    characters (also Zipf-weighted)."""
     if rng.random() < 0.3:
         return _han(rng, rng.randint(8, 80))
     return " ".join(_latin(rng, rng.randint(5, 60)))
@@ -56,7 +57,7 @@ def _query(rng: random.Random, index: int) -> tuple[str, str]:
     """(class, query); classes cycle 5:3:2 so every class is present even in a small run."""
     slot = index % 10
     if slot < 5:
-        return "latin", " ".join(_latin(rng, rng.randint(1, 3)))
+        return "latin", " ".join(_latin(rng, rng.randint(1, 5)))
     if slot < 8:
         return "han", _han(rng, rng.randint(2, 4))
     return "absent", f"absentword{rng.randint(0, 10**6)}"
@@ -99,7 +100,8 @@ async def _search(ctx: ToolContext, query: str) -> tuple[float, bool]:
     started = time.perf_counter()
     outcome = await run_tool("session_search", json.dumps({"query": query}, ensure_ascii=False), ctx)
     elapsed = (time.perf_counter() - started) * 1000
-    assert not outcome.error, outcome.content  # a failing search invalidates the benchmark
+    if outcome.error:  # a failing search invalidates the benchmark
+        raise RuntimeError(f"session_search failed during the benchmark: {outcome.content[:200]}")
     return elapsed, bool(json.loads(outcome.content)["hits"])
 
 

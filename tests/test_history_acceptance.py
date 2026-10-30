@@ -78,6 +78,7 @@ async def test_compacted_messages_stay_searchable_and_search_leaves_the_session_
     assert not error and [h["message_id"] for h in result["hits"]] == [old.id]
     assert await store.get_session("p1", "long") == before
     assert before.summary == "earlier work" and before.system_prompt == "compacted prompt"
+    assert before.pruned_id >= old.id
 
 
 async def test_a_long_message_reads_back_exactly_in_bounded_chunks(store):

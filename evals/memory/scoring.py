@@ -18,6 +18,14 @@ class Outcome:
     failures: tuple[str, ...]
     exposure: bool
     unsupported: bool
+    searched: bool = False  # the probe session made a session_search call
+    memorised: bool = False  # the stored memory holds a needle of the expected answer
+
+
+def memorised(scenario: Scenario, memory_texts: list[str]) -> bool:
+    stored = normalize(" \n".join(memory_texts))
+    needles = [n for name in ("contains_all", "contains_any", "contains_any_2") for n in scenario.checks.get(name, [])]
+    return any(normalize(needle) in stored for needle in needles)
 
 
 def score(scenario: Scenario, *, output: str, memory_texts: list[str], tool_results: list[str], marker: str,
@@ -71,5 +79,8 @@ def summarize(outcomes: list[Outcome], scenarios: list[Scenario]) -> dict:
                 "errors": errors,
                 "passed": complete and all(groups[g]["rate"] >= GATE_RATE for g in GROUPS)
                 and not exposure and not unsupported and not errors}
-        summary[arm] = {"groups": groups, "languages": languages, "overall": _rate(mine), "gate": gate}
+        passed_recall = [o for o in mine if o.passed and by_id[o.scenario_id].group == "recall"]
+        evidence = {"passed": len(passed_recall), "searched": sum(o.searched for o in passed_recall),
+                    "memorised": sum(o.memorised for o in passed_recall)}
+        summary[arm] = {"recall_evidence": evidence, "groups": groups, "languages": languages, "overall": _rate(mine), "gate": gate}
     return summary

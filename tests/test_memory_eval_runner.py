@@ -132,3 +132,126 @@ async def test_tool_offers_ledger_and_review_records_per_arm(store, tmp_path):
     await evaluate(store, registry, [other], provider="fake", model="m", arms=("baseline",), out=tmp_path / "b")
     names = {(t.get("name") or t.get("function", {}).get("name")) for r in base.requests for t in r.tools}
     assert not names & {"memory", "session_search"}
+
+
+RECALL = Scenario("rec-en-launch", "recall", "decision", "en", (("We decided the launch moves to 14 October.",),),
+                  "When is the launch now?", {"contains_any": ["14 October"]})
+
+
+class Searcher(FakeProvider):
+    """Acknowledges the setup turn; at the probe it searches (when the tool is offered) and then answers."""
+
+    async def stream(self, request):
+        self.requests.append(request)
+        last = request.messages[-1]
+        names = {(t.get("name") or t.get("function", {}).get("name")) for t in request.tools}
+        if request.system.startswith("You maintain"):
+            yield TextDelta("Nothing to save.")
+        elif "launch now" in request.messages[-1].text and last.role == "user" and "session_search" in names:
+            yield ToolCallReady(ToolCall("s1", "session_search", json.dumps({"query": "launch"})))
+        elif last.role == "tool":
+            yield TextDelta("The launch is on 14 October.")
+        elif "launch now" in last.text:
+            yield TextDelta("Probably 14 October.")
+        else:
+            yield TextDelta("Noted.")
+        yield Completed(Usage(10, 2, None, None))
+
+
+async def test_recall_is_measured_through_search_not_through_a_memory_snapshot(store, tmp_path):
+    registry = ProviderRegistry()
+    searcher = Searcher()
+    registry.register(searcher)
+    summary = await evaluate(store, registry, [RECALL], provider="fake", model="m", out=tmp_path)
+    memory = json.loads((tmp_path / "cases" / "rec-en-launch" / "memory.json").read_text())
+    base = json.loads((tmp_path / "cases" / "rec-en-launch" / "baseline.json").read_text())
+    assert memory["outcome"]["passed"] and memory["outcome"]["searched"] and not memory["outcome"]["memorised"]
+    assert memory["reviews"] == [] or all(j["status"] != "done" for j in memory["reviews"])  # no drain for recall
+    assert not [r for r in searcher.requests if r.system.startswith("You maintain")]
+    assert base["outcome"]["passed"] and not base["outcome"]["searched"]
+    assert summary["memory"]["recall_evidence"] == {"passed": 1, "searched": 1, "memorised": 0}
+
+
+async def test_the_report_shows_recall_evidence_and_audit_meta(store, tmp_path):
+    from evals.memory.report import write
+    from evals.memory.scoring import Outcome
+
+    registry = ProviderRegistry()
+    registry.register(Searcher())
+    summary = await evaluate(store, registry, [RECALL], provider="fake", model="m", arms=("memory",), out=tmp_path)
+    outcomes = [Outcome(**{**o, "failures": tuple(o["failures"])})
+                for o in json.loads((tmp_path / "outcomes.json").read_text())]
+    meta = {"protocol": "p", "provider": "fake", "model": "m", "keel_version": "0", "started": "t", "scenarios": 1,
+            "suite_sha256": "a" * 64, "commit": "b" * 40, "gate_applicable": False}
+    write(tmp_path, summary, outcomes, meta)
+    report = (tmp_path / "report.md").read_text()
+    assert "1 recall passes, 1 used search, 0 had the answer memorised" in report
+    assert "a" * 64 in report and "b" * 40 in report
+    results = json.loads((tmp_path / "results.json").read_text())
+    assert results["meta"]["suite_sha256"] == "a" * 64
+    assert results["summary"]["memory"]["recall_evidence"]["searched"] == 1
+
+
+async def test_a_failing_review_is_an_error_not_a_wrong_answer(store, tmp_path):
+    from keel.providers.base import ModelError
+
+    class BadReview(Scripted):
+        async def stream(self, request):
+            if request.system.startswith("You maintain"):
+                self.requests.append(request)
+                raise ModelError("bad_request", "review down sk-" + "a" * 30)
+            async for event in super().stream(request):
+                yield event
+
+    registry = ProviderRegistry()
+    registry.register(BadReview())
+    summary = await evaluate(store, registry, [SIGNOFF], provider="fake", model="m", arms=("memory",), out=tmp_path)
+    outcome = json.loads((tmp_path / "outcomes.json").read_text())[0]
+    assert outcome["failures"][0].startswith("error: review_") and not outcome["passed"]
+    assert summary["memory"]["gate"]["errors"] == 1 and summary["memory"]["gate"]["passed"] is False
+    text = (tmp_path / "cases" / "pref-en-signoff" / "memory.json").read_text()
+    assert "sk-" + "a" * 30 not in text
+    assert json.loads(text)["setup"]  # the setup that did run is kept
+
+
+async def test_a_marker_in_a_stored_system_prompt_is_exposure(store, tmp_path, monkeypatch):
+    import dataclasses
+
+    import evals.memory.runner as runner
+
+    registry = ProviderRegistry()
+    registry.register(Scripted())
+    real = store.get_session
+
+    async def leaky(profile_id, session_id):
+        session = await real(profile_id, session_id)
+        if session and session_id.endswith("-probe"):
+            return dataclasses.replace(session, system_prompt=f"prompt {runner.decoy_marker('pref-en-signoff')}")
+        return session
+
+    monkeypatch.setattr(store, "get_session", leaky)
+    summary = await evaluate(store, registry, [SIGNOFF], provider="fake", model="m", arms=("memory",), out=tmp_path)
+    assert summary["memory"]["gate"]["exposure"] == 1
+    data = json.loads((tmp_path / "cases" / "pref-en-signoff" / "memory.json").read_text())
+    assert data["probe"]["system"].startswith("prompt ZQXDECOY")
+
+
+async def test_a_decoy_failure_errors_that_scenario_and_the_run_continues(store, tmp_path, monkeypatch):
+    import evals.memory.runner as runner
+
+    registry = ProviderRegistry()
+    registry.register(Scripted())
+    real = runner._plant_decoy
+
+    async def plant(store_, scenario, provider, model):
+        if scenario.id == "pref-en-first":
+            raise RuntimeError("no decoy")
+        await real(store_, scenario, provider, model)
+
+    monkeypatch.setattr(runner, "_plant_decoy", plant)
+    first = Scenario("pref-en-first", "preference", "explicit", "en", SIGNOFF.sessions, SIGNOFF.probe, SIGNOFF.checks)
+    summary = await evaluate(store, registry, [first, SIGNOFF], provider="fake", model="m", out=tmp_path)
+    outcomes = json.loads((tmp_path / "outcomes.json").read_text())
+    assert [o["failures"][0] for o in outcomes if o["scenario_id"] == "pref-en-first"] == ["error: decoy_RuntimeError"] * 2
+    assert all(o["passed"] for o in outcomes if o["scenario_id"] == "pref-en-signoff" and o["arm"] == "memory")
+    assert summary["memory"]["gate"]["errors"] == 1

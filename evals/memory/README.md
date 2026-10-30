@@ -19,7 +19,7 @@ behaviour. Runs and reports live under the gitignored `.local/evals/memory/` tre
 | preference | correction | 4 | After a correction, only the corrected fact applies |
 | recall | decision | 8 | An old, never-memorised decision is found through `session_search` |
 | recall | distractor | 4 | The right decision is found among other, unrelated sessions |
-| recall | absence | 4 | No matching history: the answer says so and invents nothing |
+| recall | absence | 4 | No matching history: the answer says honestly it found nothing |
 
 The loader rejects a malformed suite: unknown group, kind or language, a kind outside its group, duplicate ids, empty
 sessions or probes, unknown checks, and needles that are empty after normalisation.
@@ -29,8 +29,11 @@ sessions or probes, unknown checks, and needles that are empty after normalisati
 For every scenario and arm (`memory`, `baseline`):
 
 1. A fresh profile, named for the scenario and arm. The memory arm has memory on; the baseline has it off.
-2. The setup sessions run in order, one user turn per run. In the memory arm the review queue is drained after each
-   setup session, so the memory is written before the next session starts.
+2. The setup sessions run in order, one user turn per run. For preference scenarios in the memory arm the review
+   queue is drained after each setup session, so the memory is written before the next session starts. Recall
+   scenarios are not drained: their facts are old and unmemorised, so recall is measured through `session_search`,
+   not through a memory snapshot. The case record and the report show, for recall passes, how many probes used
+   `session_search` (`searched`) and how many had the answer in the stored memory (`memorised`).
 3. The probe is asked in a fresh session. Session titles are pinned so no background title call runs.
 4. The answer is scored by deterministic, case-insensitive substring checks. There are no regexes and no model judge.
 5. Afterwards the profile's memory is switched off, so later drains never review its probe session.
@@ -41,11 +44,14 @@ names are `contains_all`, `contains_any`, `contains_any_2` (a second any-of), `n
 (the stored memory must not hold the needle; used for unsupported preferences in the exception scenarios).
 
 **Exposure.** Each scenario also gets a decoy profile in the same tenant, holding a unique marker in a message and in
-a memory entry. If the marker appears in the probe's answer or in any tool result of the probe session, the case
-fails with an exposure.
+a memory entry. If the marker appears in the probe's answer, in a tool result of any setup or probe session, or in the
+stored system prompt of any of those sessions, the case fails with an exposure. The probe's system prompt is kept in
+the case file as `probe.system`.
 
 **Errors.** A provider failure, timeout or crash is recorded as a failed case with `error:` and the exception type,
-never scored as a wrong answer. The case is still checked for exposure and unsupported entries where the data can be
+never scored as a wrong answer. So is a memory review that did not finish: after each drain every review job of the
+profile must be `done` without an error code, otherwise the case is an `error: review_<status or code>`. A decoy that
+cannot be planted errors that scenario's arms and the run continues. Error text is redacted before it is written. The case is still checked for exposure and unsupported entries where the data can be
 read.
 
 **Baseline.** The same scenarios with memory off, run against the same model, show what the memory adds. The baseline
@@ -68,7 +74,9 @@ for a subset or baseline-only run, when any case errored.
 
 ## Reviewing scenarios
 
-The owner reviews `suite.json` before a gated run. A scenario is never changed after its results have been seen: a
+The owner reviews `suite.json` before a gated run, and before accepting a gated result inspects, by hand, the stored
+memory and change ledger (in the case files) of the four exception cases. A passing score does not show that nothing
+unsupported was written, so these are read, not trusted. A scenario is never changed after its results have been seen: a
 changed scenario gets a new id and the run is repeated.
 
 ## Commands
@@ -82,13 +90,15 @@ python -m evals.memory bench                                         # no model 
 
 `run` creates and drops a private database. `--model` defaults to `KEEL_LIVE_OPENAI_MODEL` or `KEEL_LIVE_MODEL`
 (per provider); no model is guessed. Other options: `--arm memory|baseline|both` (default both), `--scenarios a,b`,
-`--suite`, `--root`, `--database-admin-dsn`.
+`--suite`, `--root`, `--database-admin-dsn`. A Bedrock run requires `AWS_REGION` or `AWS_DEFAULT_REGION`; no region is
+assumed.
 
 ## Credentials and artifacts
 
 Credentials, endpoint and region come from the environment (`KEEL_OPENAI_API_KEY`, `KEEL_OPENAI_BASE_URL`,
 `KEEL_OPENAI_COMPAT`, `KEEL_OPENAI_CONTEXT_WINDOW`, `AWS_REGION` and the usual AWS variables) and are never written to
-artifacts. The report records the model, the provider, the keel version and, for Bedrock, the region.
+artifacts. The report and `results.json` record the model, the provider, the keel version, the sha256 of the suite file, the git
+commit (`unknown` when git is unavailable) and, for Bedrock, the region.
 
 Everything goes under `.local/evals/memory/`, which is gitignored:
 
@@ -103,7 +113,7 @@ Everything goes under `.local/evals/memory/`, which is gitignored:
 `bench` makes no model calls. In a private database it bulk-inserts synthetic English and Chinese messages (100,000 in
 one profile, 20,000 across two others, by default), then indexes them with the real backfill. Words and characters
 are drawn with Zipf-like weights, so a few terms are very common and posting lists are realistic. It runs
-`VACUUM ANALYZE` on the search tables, then times `session_search` for 500 queries by default (`--messages`,
+`VACUUM ANALYZE` on the search tables, then times `session_search` for 500 queries by default (Latin queries of 1-5 words, Han queries of 2-4 characters) (`--messages`,
 `--others`, `--queries`).
 
 It records the search tables' bytes (text, tokens and indexes), backfill throughput, append overhead (indexed against

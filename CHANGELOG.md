@@ -17,7 +17,7 @@ All notable changes to this project are documented here. The format follows
   instance must run this version before messages are written again (no mixed-version rollout): an older binary
   would leave the messages it writes unindexed; a downgrade is not supported.
 - `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
-- `evals/memory`: an evaluation-only harness for cross-session memory (protocol `memory-eval-v1`): 32 reviewed
+- `evals/memory`: an evaluation-only harness for cross-session memory (protocol `memory-eval-v1`): 32
   English and Chinese scenarios scored against a memory-off baseline with the design's release gate (a gated arm must
   also be complete and error-free), and a 100,000-message lexical search benchmark with per-class latency. Deterministic
   acceptance tests cover the design's §7 matrix in CI.
