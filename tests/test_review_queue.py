@@ -206,15 +206,64 @@ async def test_retry_refuses_a_job_whose_session_was_replaced(queue, clock):
 
 async def test_list_is_newest_first_bounded_and_filterable(queue, clock):
     await memory_profile(queue)
+    ids = []
     for session in ("a", "b", "c"):
         await completed(queue, session)
-        clock.now += 1
-    clock.now += 60
-    claimed = await claim(queue)
-    await queue.fail_review(claimed, "budget", "too big", retry=False)
-    await claim(queue)  # queues the rest
+        clock.now += 60
+        claimed = await claim(queue)
+        ids.append(claimed.job.id)
+        if session == "a":
+            await queue.fail_review(claimed, "budget", "too big", retry=False)
+        else:
+            await queue.release_review(claimed)
+            await queue.fail_review(await claim(queue), "budget", "too big", retry=False)
+        clock.now += 10
     jobs = await queue.list_reviews("p1")
-    assert [job.created_at for job in jobs] == sorted((job.created_at for job in jobs), reverse=True)
-    assert len(await queue.list_reviews("p1", limit=1)) == 1
-    assert [job.status for job in await queue.list_reviews("p1", status="failed")] == ["failed"]
+    assert [job.id for job in jobs] == ids[::-1]
+    assert [job.id for job in await queue.list_reviews("p1", limit=1)] == [ids[2]]
+    assert {job.status for job in await queue.list_reviews("p1", status="failed")} == {"failed"}
+    assert await queue.list_reviews("p1", status="pending") == []
     assert await queue.list_reviews("p2") == []
+
+
+async def test_a_lapsed_worker_cannot_settle_the_job(queue, clock):
+    await memory_profile(queue)
+    await completed(queue)
+    clock.now += 60
+    lapsed = await claim(queue, "w1")
+    clock.now += LEASE + 1
+
+    async def unchanged():
+        row = await queue.db.fetchrow("SELECT status, attempts, error_code FROM memory_review_jobs WHERE id = ?",
+                                      lapsed.job.id)
+        return (row["status"], row["attempts"], row["error_code"])
+
+    before = await unchanged()
+    assert await queue.fail_review(lapsed, "deadline", "late", retry=True) is None
+    await queue.release_review(lapsed)
+    await queue.discard_review(lapsed, "session_gone")
+    assert await unchanged() == before
+    other = await claim(queue, "w2")  # another worker now holds it
+    assert other.job.id == lapsed.job.id
+    held = await unchanged()
+    assert await queue.fail_review(lapsed, "deadline", "late", retry=False) is None
+    await queue.release_review(lapsed)
+    await queue.discard_review(lapsed, "session_gone")
+    assert await unchanged() == held == ("running", 2, "lease_expired")
+
+
+async def test_a_running_review_does_not_survive_memory_being_turned_off_and_on(queue, clock):
+    await memory_profile(queue)
+    await completed(queue)
+    clock.now += 60
+    old = await claim(queue)
+    await memory_profile(queue, memory=False)
+    await memory_profile(queue)
+    await completed(queue)
+    assert not await queue.renew_review(old, LEASE)
+    assert await queue.fail_review(old, "deadline", "late", retry=True) is None
+    [stale] = await queue.list_reviews("p1")
+    assert (stale.status, stale.error_code) == ("discarded", "restarted")
+    clock.now += 60
+    new = await claim(queue, "w2")
+    assert new.job.id != old.job.id and new.job.status == "running"

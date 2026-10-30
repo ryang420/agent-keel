@@ -64,10 +64,16 @@ class ReviewStoreMixin:
 
     async def _restart_reviews(self, profile_id: str) -> None:
         """Memory was just turned on: forget unreviewed ranges and queued or failed jobs from before, so review
-        starts again from the next completed run. A running job is left to its lease; its commit is discarded."""
+        starts again from the next completed run. A running job is discarded too: its lease is cleared, so its
+        worker's later writes are refused and lease expiry cannot revive it."""
         await self.db.execute("DELETE FROM memory_reviews WHERE profile_id = ?", profile_id)
         await self.db.execute(
             "DELETE FROM memory_review_jobs WHERE profile_id = ? AND status IN ('pending', 'failed')", profile_id)
+        await self.db.execute(
+            "UPDATE memory_review_jobs SET status = 'discarded', error_code = 'restarted', "
+            "error = 'Memory was turned off and on while the review ran.', lease_owner = NULL, lease_token = NULL, "
+            "lease_expires_at = NULL, updated_at = ?, finished_at = CAST(? AS DOUBLE PRECISION) "
+            "WHERE profile_id = ? AND status = 'running'", self.clock(), self.clock(), profile_id)
 
     async def claim_review(self, owner: str, lease_seconds: float, *, turns: int, idle_seconds: float,
                            max_age_seconds: float) -> ReviewClaim | None:
