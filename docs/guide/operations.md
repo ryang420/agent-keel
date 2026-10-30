@@ -121,6 +121,27 @@ SELECT profile_id, done_through, ceiling FROM history_backfill WHERE done_throug
 
 Every instance must run this release: an older instance writes messages the index never sees.
 
+## Memory reviews
+
+Memory-enabled profiles review new conversation text in the background (cross-session memory design §4). The work is
+in PostgreSQL: `memory_reviews` keeps each session's reviewed and unreviewed range, and `memory_review_jobs` holds the
+jobs. Each instance runs `KEEL_MEMORY_REVIEW_WORKERS` review loops (default 1) beside its run workers. A job holds a
+lease on database time, renewed every third of `KEEL_LEASE_SECONDS`; a worker that stops renewing loses the job to
+another instance and cannot write afterwards. At most one review runs per profile across all instances.
+
+A job tries at most three times (backoff 30 s, then 60 s). A model that is no longer enabled for the profile
+(`model_unavailable`) and provider errors that are not transient fail at once. A review whose input would exceed its
+budget ends the attempt with `budget` and is retried, each retry of the same chunk reviewing half as much new text
+(down to 250 tokens). Inspect jobs with `GET /v1/profiles/{p}/memory/reviews` and requeue a failed one with
+`POST …/reviews/{id}/retry`. A failed job holds back its session's later reviews until it is retried; other sessions
+are unaffected. Each attempt's token usage is on the job.
+
+Deleting a session removes its review state and jobs; deleting a profile removes all of them and fences any review
+still running. Turning memory off and on again discards the profile's queued, failed and running reviews (a running
+one cannot write afterwards) and starts again from the next completed run. Migration 10 queues nothing for existing
+conversations. Like migration 9, it needs every instance on this version before runs start again (no mixed-version
+rollout): an older binary still counts turns in a column that no longer exists.
+
 ## Complete profile deletion
 
 A consumer may ask the service to remove one profile completely through the delete/complete contract in
