@@ -53,23 +53,31 @@ class HistoryStoreMixin:
         if pending is None:
             return None
         profile_id = pending["profile_id"]
-        async with self.db.transaction():
-            await self.lock_profile(profile_id)
-            state = await self.db.fetchrow(
-                "SELECT done_through, ceiling FROM history_backfill WHERE profile_id = ?", profile_id)
-            if state is None or state["done_through"] >= state["ceiling"]:
-                return 0
-            rows = await self.db.fetch(
-                "SELECT m.id, m.session_id, m.role, m.parts, m.created_at FROM messages m "
-                "JOIN sessions s ON s.id = m.session_id "
-                "WHERE s.profile_id = ? AND m.id > ? AND m.id <= ? ORDER BY m.id LIMIT ?",
-                profile_id, state["done_through"], state["ceiling"], batch)
-            for row in rows:
-                message = Message(row["role"], tuple(part_from_dict(p) for p in json.loads(row["parts"])))
-                await self._index_message(profile_id, row["session_id"], row["id"], message, row["created_at"])
-            done = rows[-1]["id"] if len(rows) == batch else state["ceiling"]
-            await self.db.execute("UPDATE history_backfill SET done_through = ?, updated_at = ? WHERE profile_id = ?",
-                                  done, self.clock(), profile_id)
+        try:
+            async with self.db.transaction():
+                await self.lock_profile(profile_id)
+                state = await self.db.fetchrow(
+                    "SELECT done_through, ceiling FROM history_backfill WHERE profile_id = ?", profile_id)
+                if state is None or state["done_through"] >= state["ceiling"]:
+                    return 0
+                rows = await self.db.fetch(
+                    "SELECT m.id, m.session_id, m.role, m.parts, m.created_at FROM messages m "
+                    "JOIN sessions s ON s.id = m.session_id "
+                    "WHERE s.profile_id = ? AND m.id > ? AND m.id <= ? ORDER BY m.id LIMIT ?",
+                    profile_id, state["done_through"], state["ceiling"], batch)
+                for row in rows:
+                    message = Message(row["role"], tuple(part_from_dict(p) for p in json.loads(row["parts"])))
+                    await self._index_message(profile_id, row["session_id"], row["id"], message, row["created_at"])
+                done = rows[-1]["id"] if len(rows) == batch else state["ceiling"]
+                await self.db.execute(
+                    "UPDATE history_backfill SET done_through = ?, updated_at = ? WHERE profile_id = ?",
+                    done, self.clock(), profile_id)
+        except Exception:
+            # Outside the failed transaction: send this profile to the back of the queue so one bad batch cannot
+            # stall every other profile, then let the worker log it.
+            await self.db.execute("UPDATE history_backfill SET updated_at = ? WHERE profile_id = ?", self.clock(),
+                                  profile_id)
+            raise
         return len(rows)
 
     async def search_history(self, profile_id: str, tokens: list[str], *, session_id: str | None = None,

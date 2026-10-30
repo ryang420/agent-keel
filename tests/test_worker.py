@@ -412,3 +412,27 @@ async def test_backfill_once_indexes_pending_history(pool_parts):
     worker = WorkerPool(store, bus, executor, owner="w1")
     assert await worker.backfill_once() == 1
     assert await worker.backfill_once() is None
+
+
+async def test_the_backfill_loop_indexes_pending_history_and_stops_on_close(pool_parts, monkeypatch):
+    from keel import worker as worker_module
+    from keel.models import Message, TextPart
+
+    store, _, bus, executor = pool_parts
+    await store.ensure_session("p1", "s1")
+    stored = await store.append_message("s1", None, Message("user", (TextPart("loop words"),)))
+    await store.db.execute("DELETE FROM message_tokens")
+    await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
+                           "VALUES ('p1', 0, ?, 0)", stored.id)
+    monkeypatch.setattr(worker_module, "BACKFILL_IDLE_S", 0.01)
+    pool = WorkerPool(store, bus, executor, owner="w1", workers=1, poll_seconds=0.01)
+    await pool.start()
+    try:
+        for _ in range(100):
+            if await store.history_index_complete("p1"):
+                break
+            await asyncio.sleep(0.02)
+        assert await store.history_index_complete("p1")
+    finally:
+        await asyncio.wait_for(pool.close(drain_seconds=0.1), 2)
+    assert pool._tasks == []

@@ -1,5 +1,7 @@
 """The history index: written with each message, removed with its session or profile, backfilled for old rows."""
 
+import pytest
+
 from keel.models import Message, TextPart, ToolCall
 
 MODELS = [{"provider": "fake", "model": "m"}]
@@ -176,3 +178,61 @@ async def test_sessions_are_browsed_newest_first_with_time_bounds(store, clock):
     mid = sessions[1].last_active_at
     assert [s.id for s in await store.history_sessions("p1", before=mid, limit=5)] == ["old"]
     assert [s.id for s in await store.history_sessions("p1", after=mid, limit=5)] == ["new", "mid"]
+
+
+async def test_a_nul_in_a_message_is_stripped_from_the_index_not_the_message(store):
+    await profile(store)
+    await store.ensure_session("p1", "s1")
+    stored = await store.append_message("s1", None, Message("user", (TextPart("a\x00b note"),)))
+    row = await store.db.fetchrow("SELECT text FROM message_search WHERE message_id = ?", stored.id)
+    assert row["text"] == "ab note"
+    assert "ab" in await postings(store, stored.id)
+    found = await store.search_history("p1", ["ab"])
+    assert [hit.message_id for hit in found] == [stored.id]
+
+
+async def test_backfill_indexes_a_message_containing_a_nul(store):
+    await profile(store)
+    await store.ensure_session("p1", "s1")
+    stored = await store.append_message("s1", None, Message("user", (TextPart("old\x00word"),)))
+    await store.db.execute("DELETE FROM message_tokens")
+    await store.db.execute("DELETE FROM message_search")
+    await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
+                           "VALUES ('p1', 0, ?, 0)", stored.id)
+    assert await store.backfill_history() == 1
+    assert await postings(store, stored.id) == ["oldword"]
+
+
+async def test_importing_a_message_containing_a_nul_succeeds(store):
+    result = await store.import_session(profile_id="p1", tenant_id=1, session_id="s1", title="t", title_source="user",
+                                        created_at=1.0, last_active_at=2.0,
+                                        messages=[(Message("user", (TextPart("bud\x00get"),)), 1.0)])
+    assert await postings(store, result.message_ids[0]) == ["budget"]
+
+
+async def test_a_failing_backfill_batch_does_not_starve_other_profiles(store, monkeypatch):
+    for profile_id in ("p1", "p2"):
+        await profile(store, profile_id)
+        await store.ensure_session(profile_id, f"s-{profile_id}")
+    ids = {}
+    for profile_id in ("p1", "p2"):
+        ids[profile_id] = (await store.append_message(f"s-{profile_id}", None,
+                                                      Message("user", (TextPart("old note"),)))).id
+    await store.db.execute("DELETE FROM message_tokens")
+    await store.db.execute("DELETE FROM message_search")
+    for profile_id in ("p1", "p2"):
+        await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
+                               "VALUES (?, 0, ?, 0)", profile_id, ids[profile_id])
+    real = store._index_message
+
+    async def flaky(profile_id, *args):
+        if profile_id == "p1":
+            raise RuntimeError("bad row")
+        return await real(profile_id, *args)
+
+    monkeypatch.setattr(store, "_index_message", flaky)
+    store.clock.now += 5
+    with pytest.raises(RuntimeError):
+        await store.backfill_history()
+    assert await store.backfill_history() == 1
+    assert await postings(store, ids["p2"]) == ["note", "old"]
