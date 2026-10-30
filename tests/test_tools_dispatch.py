@@ -14,6 +14,7 @@ async def test_a_tool_outside_the_allowlist_is_unknown():
 
 async def test_memory_and_session_search_need_no_sandbox_and_the_sandbox_tools_do():
     assert "memory" not in NEEDS_SANDBOX
+    assert "session_search" not in NEEDS_SANDBOX
     assert set(prompts.TOOL_ORDER) <= NEEDS_SANDBOX
 
 
