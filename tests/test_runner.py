@@ -506,3 +506,27 @@ async def test_a_session_from_before_the_upgrade_keeps_the_plan_one_tool_set(set
     tool_result = [m.message for m in await store.messages("s1") if m.message.role == "tool"][-1]
     assert "Unknown tool: session_search" in tool_result.text
     assert (await store.get_session("p1", "s1")).system_prompt == "an old prompt"
+
+
+async def test_a_session_with_stored_sandbox_tools_on_a_profile_without_a_sandbox_refuses_them(setup):
+    store, provider, executor = setup
+    await store.ensure_session("p1", "s1")
+    await store.set_session_prompt("s1", "P", "fake", "m", tools=[*prompts.TOOL_ORDER])
+    provider.script = [[ToolCallReady(ToolCall("c1", "read_file", '{"path": "a.txt"}')), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store))
+    assert [tool["name"] for tool in provider.requests[0].tools] == list(prompts.TOOL_ORDER)
+    tool_result = [m.message for m in await store.messages("s1") if m.message.role == "tool"][-1]
+    assert "This tool needs a sandbox." in tool_result.text
+    assert (await store.get_session("p1", "s1")).cwd is None
+
+
+async def test_a_stored_tool_without_a_definition_is_not_offered_and_does_not_break_the_run(setup):
+    store, provider, executor = setup
+    await store.ensure_session("p1", "s1")
+    await store.set_session_prompt("s1", "P", "fake", "m", tools=["retired_tool", "read_file"])
+    provider.script = [[TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    run = await start(store)
+    await executor.execute(run)
+    assert [tool["name"] for tool in provider.requests[0].tools] == ["read_file"]
+    assert (await store.get_run("p1", run.id)).status == "completed"

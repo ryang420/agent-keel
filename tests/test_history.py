@@ -17,7 +17,8 @@ def test_latin_words_and_digits_are_tokens_and_punctuation_separates():
 
 
 def test_han_text_is_indexed_as_single_characters_and_bigrams():
-    assert index_tokens("数据库迁移") == {"数", "据", "库", "迁", "移", "数据", "据库", "库迁", "迁移"}
+    assert index_tokens("数据库迁移") == {
+        "数", "据", "库", "迁", "移", "数据", "据库", "库迁", "迁移"}
 
 
 def test_a_han_query_uses_bigrams_and_a_single_character_query_uses_the_character():

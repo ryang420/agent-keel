@@ -82,9 +82,10 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
   (`docs/design/2026-10-23-bedrock-anthropic-messages.md`).
 - Open work: cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`) and, on top of it,
   procedural learning (`docs/design/2026-10-29-procedural-learning.md`), both approved 2026-10-29. Memory
-  entries, the change ledger, memory tool v2 and the memory API are merged (`[Unreleased]`, migration 8); next
-  are the history index and `session_search`, then the durable review queue, memory acceptance, and the learning
-  plans (learned skills, observations and feedback, dream, learning acceptance).
+  entries, the change ledger, memory tool v2 and the memory API (migration 8), the history index,
+  `session_search` and per-session tool lists (migration 9) are merged (`[Unreleased]`); next are the durable
+  review queue, then memory acceptance, then the learning plans (learned skills, observations and feedback, dream,
+  learning acceptance).
 - M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown

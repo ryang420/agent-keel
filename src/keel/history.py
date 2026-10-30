@@ -65,7 +65,8 @@ def query_tokens(query: str) -> list[str]:
 
 
 def searchable_text(message: Message) -> str | None:
-    """The redacted text of a user or assistant message, NULs removed (PostgreSQL text refuses them); None for anything else or a message with no text."""
+    """The redacted text of a user or assistant message, NULs removed (PostgreSQL text refuses them); None for
+    anything else or a message with no text."""
     if message.role not in ("user", "assistant"):
         return None
     text = "\n".join(part.text for part in message.parts if isinstance(part, TextPart)).replace("\x00", "").strip()

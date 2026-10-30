@@ -54,8 +54,11 @@ Errors have one shape, with a machine-readable code:
 ```
 
 - `models`: the provider and model pairs runs may use.
-- `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means the sandbox tools are not offered.
-- `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
+- `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means new sessions are not offered the
+  sandbox tools. Tool availability (the sandbox tools, `memory` and `session_search`) is fixed per session when its
+  prompt is built and changes only when the session compacts; open sessions keep advertising removed tools, which
+  answer that they are unavailable.
+- `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions. Its tool list is fixed the same way, until the session compacts.
 - `skills`: the names of the skills to enable.
 - `memory`: a boolean. When true, the model is offered a `memory` tool and a `session_search` tool (both with or
   without a sandbox) and the system prompt includes a snapshot of stored facts. The tool's `list` action shows entries

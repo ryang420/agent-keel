@@ -16,9 +16,9 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("history_backfill, message_tokens, message_search, sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, "
-              "memory_changes, memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, "
-              "tenants, blobs")
+ALL_TABLES = ("history_backfill, message_tokens, message_search, sandbox_execs, sandbox_operations, sandbox_uses, "
+              "sandboxes, schema_version, memory_mutations, memory_changes, memory_revisions, memory_entries, "
+              "run_events, runs, messages, sessions, profiles, tenants, blobs")
 
 # keel 0.2.0's schema as released (src/keel/store/sql.py at v0.2.0). Kept apart from migration 1, which must
 # reproduce it, so that an edit to migration 1 fails the schema comparison below.

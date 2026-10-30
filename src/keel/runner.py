@@ -30,7 +30,7 @@ from keel.titles import (
     MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
 )
 from keel.tools import ToolContext, ToolOutcome, run_tool
-from keel.tools.base import preview_for, redact
+from keel.tools.base import HANDLERS, preview_for, redact
 
 log = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 60
@@ -368,8 +368,8 @@ class RunExecutor:
             system = session.system_prompt
         # The tool list is fixed with the prompt; a session stored before tool lists existed keeps the tools it
         # was offered then (no session_search) until its next compaction.
-        offered = session.tools if session.tools is not None else tuple(
-            name for name in desired if name != "session_search")
+        offered = tuple(name for name in (session.tools if session.tools is not None else desired)
+                        if name in HANDLERS and (session.tools is not None or name != "session_search"))
         stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
         # before this turn so the request pairs every call.

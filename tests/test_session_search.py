@@ -114,3 +114,22 @@ async def test_an_incomplete_index_is_reported(store):
                            "VALUES ('p1', 0, 99, 0)")
     _, result = await call(ctx, query="anything")
     assert result == {"hits": [], "index_complete": False}
+
+
+async def test_a_stale_profile_incarnation_is_refused(store):
+    ctx = await ready(store)
+    ctx.profile_incarnation = "stale-" + str(ctx.profile_incarnation)
+    error, result = await call(ctx, query="postgres")
+    assert error and result["error"] == "History search is not available."
+
+
+async def test_titles_and_excerpts_are_redacted(store):
+    ctx = await ready(store)
+    secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+    await store.db.execute("UPDATE sessions SET title = ? WHERE id = 'old'", f"key {secret}")
+    stored = await store.append_message("old", None, Message("user", (TextPart("plain note"),)))
+    await store.db.execute("UPDATE message_search SET text = ? WHERE message_id = ?", f"note {secret}", stored.id)
+    _, browsed = await call(ctx)
+    assert secret not in json.dumps(browsed)
+    _, found = await call(ctx, query="note")
+    assert found["hits"] and secret not in json.dumps(found)

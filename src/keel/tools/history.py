@@ -7,7 +7,7 @@ from collections import Counter
 
 # The module, not its names: keel.history imports keel.tools.base, so name imports here would be circular.
 from keel import history as h
-from keel.tools.base import ToolContext, ToolOutcome, error_result, optional_int, tool, tool_json
+from keel.tools.base import ToolContext, ToolOutcome, error_result, optional_int, redact, tool, tool_json
 
 DEFAULT_HITS, MAX_HITS, PER_SESSION = 5, 10, 2
 DEFAULT_WINDOW, MAX_WINDOW = 4, 10
@@ -42,6 +42,10 @@ async def session_search(args: dict, ctx: ToolContext) -> ToolOutcome:
         return error_result(str(exc))
 
 
+def _clean(title: str | None) -> str | None:
+    return redact(title) if title else title
+
+
 def _bounds(args: dict) -> tuple[float | None, float | None]:
     before = h.parse_time(args["before"], "before") if args.get("before") is not None else None
     after = h.parse_time(args["after"], "after") if args.get("after") is not None else None
@@ -65,8 +69,8 @@ async def _search(args: dict, ctx: ToolContext, session_id: str | None) -> ToolO
         if session_id is None and per_session[row.session_id] >= PER_SESSION:
             continue
         per_session[row.session_id] += 1
-        text, truncated = h.excerpt(row.text, tokens)
-        hits.append({"session_id": row.session_id, "session_title": row.title, "message_id": row.message_id,
+        text, truncated = h.excerpt(redact(row.text), tokens)
+        hits.append({"session_id": row.session_id, "session_title": _clean(row.title), "message_id": row.message_id,
                      "role": row.role, "at": h.iso(row.created_at), "run_status": row.run_status or "unknown",
                      "excerpt": text, "truncated": truncated})
         if len(hits) == limit:
@@ -117,6 +121,6 @@ async def _browse(args: dict, ctx: ToolContext) -> ToolOutcome:
     before, after = _bounds(args)
     sessions = await ctx.store.history_sessions(ctx.profile_id, before=before, after=after, limit=limit)
     return ToolOutcome(tool_json({
-        "sessions": [{"session_id": s.id, "title": s.title, "created_at": h.iso(s.created_at),
+        "sessions": [{"session_id": s.id, "title": _clean(s.title), "created_at": h.iso(s.created_at),
                       "last_active_at": h.iso(s.last_active_at), "current": s.id == ctx.session_id} for s in sessions],
         "index_complete": await ctx.store.history_index_complete(ctx.profile_id)}))
