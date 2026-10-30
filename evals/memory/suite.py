@@ -10,8 +10,12 @@ from . import PROTOCOL
 
 GROUPS = ("preference", "recall")
 KINDS = ("explicit", "exception", "correction", "decision", "distractor", "absence")
+KINDS_BY_GROUP = {
+    "preference": ("explicit", "exception", "correction"),
+    "recall": ("decision", "distractor", "absence"),
+}
 LANGUAGES = ("en", "zh")
-CHECKS = ("contains_all", "contains_any", "not_contains", "memory_not_contains")
+CHECKS = ("contains_all", "contains_any", "contains_any_2", "not_contains", "memory_not_contains")
 
 
 class SuiteError(ValueError):
@@ -29,21 +33,34 @@ class Scenario:
     checks: dict
 
 
-def _scenario(raw: dict) -> Scenario:
+def _scenario(raw) -> Scenario:
+    if not isinstance(raw, dict):
+        raise SuiteError("every scenario must be a JSON object")
     try:
-        sessions = tuple(tuple(turn for turn in session) for session in raw["sessions"])
-        found = Scenario(raw["id"], raw["group"], raw["kind"], raw["language"], sessions, raw["probe"],
-                         dict(raw["checks"]))
-    except (KeyError, TypeError) as error:
+        ident, group, kind, language = raw["id"], raw["group"], raw["kind"], raw["language"]
+        raw_sessions, probe, raw_checks = raw["sessions"], raw["probe"], raw["checks"]
+    except KeyError as error:
         raise SuiteError(f"scenario {raw.get('id')!r} is incomplete: {error}") from None
-    if found.group not in GROUPS or found.kind not in KINDS or found.language not in LANGUAGES:
-        raise SuiteError(f"scenario {found.id!r} has an unknown group, kind or language")
+    if not isinstance(raw_sessions, list) or not all(isinstance(session, list) for session in raw_sessions):
+        raise SuiteError(f"scenario {ident!r}: every session must be a list of user turns")
+    if not isinstance(raw_checks, dict):
+        raise SuiteError(f"scenario {ident!r}: checks must be an object")
+    found = Scenario(ident, group, kind, language, tuple(tuple(session) for session in raw_sessions), probe,
+                     dict(raw_checks))
+    if not isinstance(found.id, str) or not found.id:
+        raise SuiteError("every scenario needs a non-empty string id")
+    if found.group not in GROUPS or found.language not in LANGUAGES:
+        raise SuiteError(f"scenario {found.id!r} has an unknown group or language")
+    if found.kind not in KINDS_BY_GROUP[found.group]:
+        raise SuiteError(f"scenario {found.id!r}: kind {found.kind!r} does not belong to group {found.group!r}")
+    if not isinstance(found.probe, str) or not found.probe.strip():
+        raise SuiteError(f"scenario {found.id!r} needs a non-empty probe")
     if not found.sessions or not all(found.sessions) or not all(isinstance(t, str) and t.strip()
                                                                for s in found.sessions for t in s):
         raise SuiteError(f"scenario {found.id!r} needs non-empty setup sessions")
     if set(found.checks) - set(CHECKS) or not any(found.checks.get(name) for name in CHECKS):
         raise SuiteError(f"scenario {found.id!r} has unknown or no checks")
-    if not all(isinstance(value, list) and all(isinstance(item, str) and item for item in value)
+    if not all(isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
                for value in found.checks.values()):
         raise SuiteError(f"scenario {found.id!r}: every check is a list of non-empty strings")
     return found
