@@ -1,6 +1,6 @@
 # Cross-session memory: user continuity and history recall
 
-Date: 2026-10-24. Status: proposed; approach selected, design awaiting approval.
+Date: 2026-10-24. Status: approved 2026-10-29.
 
 ## Intent and decisions
 
