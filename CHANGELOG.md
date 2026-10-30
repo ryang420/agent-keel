@@ -17,6 +17,10 @@ All notable changes to this project are documented here. The format follows
   instance must run this version before messages are written again (no mixed-version rollout): an older binary
   would leave the messages it writes unindexed; a downgrade is not supported.
 - `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
+- `evals/memory`: an evaluation-only harness for cross-session memory (protocol `memory-eval-v1`): 32 reviewed
+  English and Chinese scenarios scored against a memory-off baseline with the design's release gate (a gated arm must
+  also be complete and error-free), and a 100,000-message lexical search benchmark with per-class latency. Deterministic
+  acceptance tests cover the design's §7 matrix in CI.
 - `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
   `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
   per-case PostgreSQL and MongoDB restores on an internal network with read-only roles, and unit tests. It runs
