@@ -82,5 +82,6 @@ def summarize(outcomes: list[Outcome], scenarios: list[Scenario]) -> dict:
         passed_recall = [o for o in mine if o.passed and by_id[o.scenario_id].group == "recall"]
         evidence = {"passed": len(passed_recall), "searched": sum(o.searched for o in passed_recall),
                     "memorised": sum(o.memorised for o in passed_recall)}
-        summary[arm] = {"recall_evidence": evidence, "groups": groups, "languages": languages, "overall": _rate(mine), "gate": gate}
+        summary[arm] = {"recall_evidence": evidence, "groups": groups, "languages": languages,
+                         "overall": _rate(mine), "gate": gate}
     return summary

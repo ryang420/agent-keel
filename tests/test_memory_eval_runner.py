@@ -255,6 +255,7 @@ async def test_a_decoy_failure_errors_that_scenario_and_the_run_continues(store,
     first = Scenario("pref-en-first", "preference", "explicit", "en", SIGNOFF.sessions, SIGNOFF.probe, SIGNOFF.checks)
     summary = await evaluate(store, registry, [first, SIGNOFF], provider="fake", model="m", out=tmp_path)
     outcomes = json.loads((tmp_path / "outcomes.json").read_text())
-    assert [o["failures"][0] for o in outcomes if o["scenario_id"] == "pref-en-first"] == ["error: decoy_RuntimeError"] * 2
+    first_failures = [o["failures"][0] for o in outcomes if o["scenario_id"] == "pref-en-first"]
+    assert first_failures == ["error: decoy_RuntimeError"] * 2
     assert all(o["passed"] for o in outcomes if o["scenario_id"] == "pref-en-signoff" and o["arm"] == "memory")
     assert summary["memory"]["gate"]["errors"] == 1

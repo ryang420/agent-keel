@@ -146,7 +146,8 @@ async def _bench(args) -> int:
         f"{result['append_stats']['raw']['p95']:.2f} ms; overhead (means) +{append['overhead']:.2f} ms\n"
         f"- session_search (warm cache: data just written, after VACUUM ANALYZE of the search tables): overall p50 "
         f"{search['p50']:.1f} ms, p95 {search['p95']:.1f} ms, max {search['max']:.1f} ms over {search['count']} "
-        f"queries (query terms: latin 1-5 words, han 2-4 characters); target: every class p95 < {result['target_p95_ms']} ms, latin and han hit rate > 0.5, absent "
+        f"queries (query terms: latin 1-5 words, han 2-4 characters); target: every class p95 < "
+        f"{result['target_p95_ms']} ms, latin and han hit rate > 0.5, absent "
         f"hit rate 0: {'met' if result['met'] else 'NOT met'}\n{classes}\n- Machine: {result['machine']}\n",
         encoding="utf-8")
     print(f"report: {out / 'bench.md'}")

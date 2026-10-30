@@ -51,8 +51,8 @@ the case file as `probe.system`.
 **Errors.** A provider failure, timeout or crash is recorded as a failed case with `error:` and the exception type,
 never scored as a wrong answer. So is a memory review that did not finish: after each drain every review job of the
 profile must be `done` without an error code, otherwise the case is an `error: review_<status or code>`. A decoy that
-cannot be planted errors that scenario's arms and the run continues. Error text is redacted before it is written. The case is still checked for exposure and unsupported entries where the data can be
-read.
+cannot be planted errors that scenario's arms and the run continues. Error text is redacted before it is written. The
+case is still checked for exposure and unsupported entries where the data can be read.
 
 **Baseline.** The same scenarios with memory off, run against the same model, show what the memory adds. The baseline
 has no gate.
@@ -97,8 +97,8 @@ assumed.
 
 Credentials, endpoint and region come from the environment (`KEEL_OPENAI_API_KEY`, `KEEL_OPENAI_BASE_URL`,
 `KEEL_OPENAI_COMPAT`, `KEEL_OPENAI_CONTEXT_WINDOW`, `AWS_REGION` and the usual AWS variables) and are never written to
-artifacts. The report and `results.json` record the model, the provider, the keel version, the sha256 of the suite file, the git
-commit (`unknown` when git is unavailable) and, for Bedrock, the region.
+artifacts. The report and `results.json` record the model, the provider, the keel version, the sha256 of the suite file,
+the git commit (`unknown` when git is unavailable) and, for Bedrock, the region.
 
 Everything goes under `.local/evals/memory/`, which is gitignored:
 
@@ -113,8 +113,8 @@ Everything goes under `.local/evals/memory/`, which is gitignored:
 `bench` makes no model calls. In a private database it bulk-inserts synthetic English and Chinese messages (100,000 in
 one profile, 20,000 across two others, by default), then indexes them with the real backfill. Words and characters
 are drawn with Zipf-like weights, so a few terms are very common and posting lists are realistic. It runs
-`VACUUM ANALYZE` on the search tables, then times `session_search` for 500 queries by default (Latin queries of 1-5 words, Han queries of 2-4 characters) (`--messages`,
-`--others`, `--queries`).
+`VACUUM ANALYZE` on the search tables, then times `session_search` for 500 queries by default (Latin queries of 1-5
+words, Han queries of 2-4 characters) (`--messages`, `--others`, `--queries`).
 
 It records the search tables' bytes (text, tokens and indexes), backfill throughput, append overhead (indexed against
 raw insert, alternating order, mean, median and p95), and p50, p95 and max latency overall and per query class:
