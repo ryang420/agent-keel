@@ -22,9 +22,7 @@ async def memory(args: dict, ctx: ToolContext) -> ToolOutcome:
         return ToolOutcome(tool_json(await _listing(ctx)))
     target = args.get("target") or "memory"
     limit = ctx.user_chars if target == "user" else ctx.memory_chars
-    ops = args.get("operations")
-    if ops is None:
-        ops = [{key: args.get(key) for key in _OP_KEYS if args.get(key) is not None}]
+    ops = requested_ops(args)
     if not isinstance(ops, list):
         return error_result("operations must be a list.")
     message_id = None
@@ -39,9 +37,15 @@ async def memory(args: dict, ctx: ToolContext) -> ToolOutcome:
         key = f"{ctx.memory_source}:{ctx.run_id}:{ctx.tool_call_id}:{digest}"
     result = await ctx.store.apply_memory(ctx.profile_id, target, limit, ops, source=source, mutation_key=key,
                                          profile_incarnation=ctx.profile_incarnation)
-    if result.get("success") and ctx.session_id:
-        await ctx.store.reset_memory_turns(ctx.session_id, profile_incarnation=ctx.profile_incarnation)
     return ToolOutcome(tool_json(result), error=not result.get("success"))
+
+
+def requested_ops(args: dict):
+    """The batch a memory call asks for: `operations`, or the single operation given in the top-level fields."""
+    ops = args.get("operations")
+    if ops is None:
+        ops = [{key: args.get(key) for key in _OP_KEYS if args.get(key) is not None}]
+    return ops
 
 
 async def _listing(ctx: ToolContext) -> dict:

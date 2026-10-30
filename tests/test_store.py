@@ -518,10 +518,3 @@ async def test_a_failed_batch_stores_nothing(store):
         {"action": "add", "content": "a"}, {"action": "add", "content": "b"}])
     assert result["success"] is False and result["entries"] == []
     assert await store.memory_entries("p1") == {"memory": [], "user": []}
-
-
-async def test_reset_memory_turns_zeroes_the_counter(store):
-    await store.ensure_session("p1", "s1")
-    await store.db.execute("UPDATE sessions SET turns_since_memory = 7 WHERE id = ?", "s1")
-    await store.reset_memory_turns("s1")
-    assert (await store.get_session("p1", "s1")).turns_since_memory == 0

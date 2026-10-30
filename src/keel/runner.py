@@ -109,7 +109,7 @@ class RunExecutor:
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None,
                  skills_ttl_s: float = 60.0, clock=time.monotonic,
                  now=lambda: datetime.now(UTC), compression_threshold: float = 0.75, background=None,
-                 memory_chars: int = 2200, user_chars: int = 1375, memory_review_turns: int = 10) -> None:
+                 memory_chars: int = 2200, user_chars: int = 1375) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
@@ -117,7 +117,6 @@ class RunExecutor:
         self.background = background
         self.memory_chars = memory_chars
         self.user_chars = user_chars
-        self.memory_review_turns = memory_review_turns
         self.max_iterations = max_iterations
         self.mount_root = mount_root
         self.skills_ttl_s = skills_ttl_s
@@ -571,10 +570,9 @@ class RunExecutor:
                 continue
 
     async def _after_complete(self, run: Run, profile) -> None:
-        """A completed run may be renamed, and every memory_review_turns runs may start a memory review.
+        """A completed run may be renamed. Its memory review was queued by finish_run itself.
 
-        A fenced profile starts no new background work: the deletion drains what
-        exists and must not race a review spawned by a just-finished run.
+        A fenced profile starts no new background work: the deletion drains what exists.
         """
         if run.profile_incarnation is None or await self.store.get_profile_deletion(run.profile_id) is not None:
             return
@@ -583,19 +581,6 @@ class RunExecutor:
                                and profile.incarnation != run.profile_incarnation):
             return
         await self._maybe_title(run)
-        if profile is not None and profile.memory and self.background is not None:
-            try:
-                due = await self.store.note_memory_turn(
-                    run.session_id, self.memory_review_turns, profile_incarnation=run.profile_incarnation)
-            except ProfileIncarnationMismatch:
-                return
-            if due:
-                from keel.review import claim, release, run_review
-                if claim(run.profile_id):
-                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}",
-                                                 profile_id=run.profile_id,
-                                                 profile_incarnation=run.profile_incarnation):
-                        release(run.profile_id)
 
     async def _maybe_title(self, run: Run) -> None:
         """After the first completed run, ask the model to name a session that still has a derived title, from every

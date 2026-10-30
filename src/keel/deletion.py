@@ -60,8 +60,8 @@ class ProfileDeletionService:
         authority = ProfileDeletionAuthority(
             operation_id=record.operation_id,
             expected_incarnation=profile.incarnation if profile is not None else None)
-        # Block new background work before draining: a run that just committed
-        # its terminal state must not spawn a review behind the drain's back.
+        # Block new background work before draining: a run that just committed its terminal state must not spawn
+        # a title behind the drain's back.
         if self.background is not None and not (profile is None and record.phase == "purged"):
             async with self.store.profile_deletion_guard(
                     profile_id, authority, phases=("blocked", "draining")):
@@ -115,7 +115,7 @@ class ProfileDeletionService:
 
     async def _drain_background(self, profile_id: str, deadline: float,
                                 authority: ProfileDeletionAuthority) -> None:
-        """Cancel and await this profile's reviews and titles before purging its rows."""
+        """Cancel and await this profile's background titles before purging its rows. Reviews are fenced in the database."""
         if self.background is None:
             return
         try:

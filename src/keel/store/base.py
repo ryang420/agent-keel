@@ -93,9 +93,9 @@ class Session:
     context_tokens: int | None = None
     context_message_id: int | None = None
     compaction_failed_at: float | None = None
-    turns_since_memory: int = 0
     pruned_id: int | None = None
     tools: tuple[str, ...] | None = None
+    generation: str | None = None
 
 
 @dataclass(frozen=True)

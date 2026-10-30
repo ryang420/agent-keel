@@ -16,9 +16,9 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("history_backfill, message_tokens, message_search, sandbox_execs, sandbox_operations, sandbox_uses, "
-              "sandboxes, schema_version, memory_mutations, memory_changes, memory_revisions, memory_entries, "
-              "run_events, runs, messages, sessions, profiles, tenants, blobs")
+ALL_TABLES = ("memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, sandbox_execs, "
+              "sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, memory_changes, "
+              "memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, tenants, blobs")
 
 # keel 0.2.0's schema as released (src/keel/store/sql.py at v0.2.0). Kept apart from migration 1, which must
 # reproduce it, so that an edit to migration 1 fails the schema comparison below.
@@ -95,6 +95,14 @@ async def restore_legacy_memories(db) -> None:
         await db.execute(f"DROP TABLE {table}")
     await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
+
+
+async def restore_pre_review_queue(db) -> None:
+    """Undo migration 10 on a database that is being rewound to an older schema version."""
+    for table in ("memory_review_jobs", "memory_reviews"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("ALTER TABLE sessions DROP COLUMN generation")
+    await db.execute("ALTER TABLE sessions ADD COLUMN turns_since_memory INTEGER NOT NULL DEFAULT 0")
 
 
 async def restore_pre_history_index(db) -> None:
@@ -386,7 +394,7 @@ async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
         session = await store.ensure_session("p1", "s1")
         assert (session.summary, session.summary_head_id, session.summary_tail_id) == (None, None, None)
         assert (session.context_tokens, session.context_message_id, session.compaction_failed_at) == (None, None, None)
-        assert session.turns_since_memory == 0
+        assert session.generation
         assert session.pruned_id is None
     finally:
         await store.close()
@@ -398,7 +406,7 @@ async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
     try:
         assert (await store.get_profile("p1")).memory is False
         session = await store.get_session("p1", "s1")
-        assert session.summary is None and session.turns_since_memory == 0 and session.title == "Old chat"
+        assert session.summary is None and session.generation and session.title == "Old chat"
         assert session.pruned_id is None
     finally:
         await store.close()
@@ -408,6 +416,7 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
@@ -464,6 +473,7 @@ async def test_a_v4_database_gains_the_coordination_tables(db_url):
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
@@ -626,7 +636,7 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
 
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == 9
+        assert await schema_version(upgraded.db) == LATEST_VERSION
         # Order and duplicates survive exactly; the rendered snapshot is unchanged.
         assert await upgraded.memory_entries("p1") == {"memory": [], "user": ["likes tea", "likes tea", "works late"]}
         items = await upgraded.memory_items("p1")
@@ -661,7 +671,7 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
 
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == 9
+        assert await schema_version(upgraded.db) == LATEST_VERSION
         rows = await upgraded.db.fetch(
             "SELECT profile_id, done_through, ceiling FROM history_backfill ORDER BY profile_id")
         assert [(r["profile_id"], r["done_through"], r["ceiling"]) for r in rows] == [
@@ -672,5 +682,27 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
             pass
         assert await upgraded.history_index_complete("p1")
         assert (await upgraded.db.fetchrow("SELECT COUNT(*) AS n FROM message_search"))["n"] == 4
+    finally:
+        await upgraded.close()
+
+
+async def test_migration_10_adds_review_tables_and_session_generations(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.ensure_session("p1", "s1")
+        await store.db.execute("UPDATE schema_version SET version = 9")
+        await restore_pre_review_queue(store.db)
+    finally:
+        await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        assert {"memory_reviews", "memory_review_jobs"} <= await database_table_names(upgraded.db)
+        assert (await upgraded.get_session("p1", "s1")).generation
+        columns = {row["column_name"] for row in await upgraded.db.fetch(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'sessions'")}
+        assert "turns_since_memory" not in columns
+        assert await upgraded.db.fetchrow("SELECT 1 AS n FROM memory_reviews") is None  # no auto-review of old history
     finally:
         await upgraded.close()

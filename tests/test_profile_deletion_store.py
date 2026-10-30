@@ -142,8 +142,6 @@ async def test_old_run_authority_cannot_write_into_a_reprovisioned_profile(store
     with pytest.raises(ProfileIncarnationMismatch):
         await store.set_title("p1", "reused-session", "stale", "llm",
                               profile_incarnation=old_run.profile_incarnation)
-    with pytest.raises(ProfileIncarnationMismatch):
-        await store.note_memory_turn("reused-session", 1, profile_incarnation=old_run.profile_incarnation)
 
     saved = await store.apply_memory("p1", "user", 2200, [{"action": "add", "content": "fresh"}],
                                      profile_incarnation=new_profile.incarnation)
@@ -237,6 +235,17 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
         await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
                                "VALUES (?, 0, 1, 0)", profile)
 
+    for profile in ("p1", "p2"):
+        await store.db.execute(
+            "INSERT INTO memory_reviews (profile_id, session_id, generation, profile_incarnation, reviewed_through, "
+            "queued_through, dirty_through, pending_turns, last_completed_at, provider, model) "
+            "VALUES (?, ?, 'g', 'i', 0, 0, 1, 1, 0, 'fake', 'm')", profile, f"{profile}-s")
+        await store.db.execute(
+            "INSERT INTO memory_review_jobs (id, profile_id, session_id, generation, profile_incarnation, status, "
+            "provider, model, source_from, source_through, cursor_message, next_attempt_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'g', 'i', 'failed', 'fake', 'm', 0, 1, 0, 0, 0, 0)", f"j-{profile}", profile,
+            f"{profile}-s")
+
     record = await store.begin_profile_deletion("p1", 1, OP_A)
     record = await store.advance_profile_deletion(record, "draining")
     await store.purge_profile_data(record)
@@ -245,7 +254,7 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
     assert await store.list_sessions("p1") == []
     assert await store.memory_entries("p1") == {"memory": [], "user": []}
     for table in ("memory_entries", "memory_changes", "memory_revisions", "memory_mutations",
-                  "message_search", "message_tokens", "history_backfill"):
+                  "message_search", "message_tokens", "history_backfill", "memory_reviews", "memory_review_jobs"):
         assert await store.db.fetchrow(f"SELECT 1 AS n FROM {table} WHERE profile_id = ?", "p1") is None
         assert await store.db.fetchrow(f"SELECT 1 AS n FROM {table} WHERE profile_id = ?", "p2") is not None
 

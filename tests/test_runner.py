@@ -327,12 +327,10 @@ async def test_memory_is_offered_without_a_sandbox(setup):
                        [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))],
                        [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
     run = await start(store)
-    await store.db.execute("UPDATE sessions SET turns_since_memory = 4 WHERE id = ?", "s1")
     await executor.execute(run)
     assert tuple(tool["name"] for tool in provider.requests[0].tools) == ("memory", "session_search")
     assert (await store.memory_entries("p1"))["user"] == ["The user likes tea"]
     session = await store.get_session("p1", "s1")
-    assert session.turns_since_memory == 0
     # "tea" occurs inside "instead" in the guidance text, so the frozen snapshot is checked by the whole fact.
     assert "The user likes tea" not in session.system_prompt and prompts.text("memory") in session.system_prompt
     assert "USER PROFILE (who the user is)\n(empty)" in session.system_prompt
