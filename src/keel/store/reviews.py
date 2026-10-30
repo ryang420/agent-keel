@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 import uuid
 
-from keel.store.base import ProfileDeletionBusy, ReviewClaim, ReviewJob, ReviewNotRetryable, ReviewSourceGone
+from keel.review_input import SourceRow
+from keel.store.base import (MemorySource, ProfileDeletionBusy, ReviewClaim, ReviewJob, ReviewNotRetryable,
+                             ReviewSourceGone)
 
 REVIEW_ATTEMPTS = 3
 RETRY_BASE_S = 30.0
@@ -295,3 +297,57 @@ class ReviewStoreMixin:
                 "next_attempt_at = ?, finished_at = NULL, updated_at = ? WHERE id = ? RETURNING *",
                 await self.coordination_now(), self.clock(), job_id)
             return _job(updated)
+    async def review_rows(self, claim: ReviewClaim, *, limit: int = 200) -> tuple[list[SourceRow], bool]:
+        job = claim.job
+        rows = await self.db.fetch(
+            "SELECT message_id, role, text, created_at FROM message_search WHERE profile_id = ? AND session_id = ? "
+            "AND message_id > ? AND message_id <= ? ORDER BY message_id LIMIT ?",
+            job.profile_id, job.session_id, job.cursor_message, job.source_through, limit)
+        found = [SourceRow(row["message_id"], row["role"], row["text"], row["created_at"]) for row in rows]
+        return found, len(found) < limit
+
+    async def review_context(self, claim: ReviewClaim, *, limit: int = 12) -> list[SourceRow]:
+        job = claim.job
+        rows = await self.db.fetch(
+            "SELECT message_id, role, text, created_at FROM message_search WHERE profile_id = ? AND session_id = ? "
+            "AND message_id <= ? ORDER BY message_id DESC LIMIT ?",
+            job.profile_id, job.session_id, job.cursor_message, limit)
+        return [SourceRow(row["message_id"], row["role"], row["text"], row["created_at"]) for row in rows]
+
+    async def commit_review(self, claim: ReviewClaim, proposals: dict, *, end: tuple[int, int], done: bool,
+                            evidence: int | None, usage: dict | None) -> str:
+        """Apply a complete staged proposal, the job's progress and the session cursor atomically. Nothing is written
+        unless this claim still holds its lease, its owner is current and every touched target is unchanged."""
+        job = claim.job
+        async with self.db.transaction():
+            await self.lock_profile(job.profile_id)
+            row = await self._owned_review(claim)
+            if row is None:
+                return "lost"
+            gone = await self._review_gone(job.profile_id, job.session_id, claim.generation,
+                                           claim.profile_incarnation)
+            if gone is not None:
+                await self._settle_review(row, "discarded", code=gone, message="The review's owner changed.",
+                                          usage=usage)
+                return "discarded"
+            for target, (revision, _, _, _) in proposals.items():
+                if await self._memory_revision(job.profile_id, target) != revision:
+                    await self._retry_or_fail(row, "conflict", "Memory changed while the review ran.", retry=True,
+                                              usage=usage)
+                    return "conflict"
+            source = MemorySource("review", session_id=job.session_id, message_id=evidence)
+            key = f"review:{job.id}:{row['cursor_message']}:{row['cursor_offset']}"
+            for target, (_, before, after, changes) in proposals.items():
+                await self._commit_memory(job.profile_id, target, before, after, changes, source, key)
+            now = await self.coordination_now()
+            if done:
+                await self._settle_review(row, "done", usage=usage, cursor=(job.source_through, 0))
+                reviewed = job.source_through
+            else:
+                await self._settle_review(row, "pending", usage=usage, attempts=0, next_attempt_at=now, cursor=end)
+                reviewed = end[0]
+            await self.db.execute(
+                "UPDATE memory_reviews SET reviewed_through = GREATEST(reviewed_through, ?) "
+                "WHERE profile_id = ? AND session_id = ? AND generation = ?",
+                reviewed, job.profile_id, job.session_id, claim.generation)
+            return "committed"
