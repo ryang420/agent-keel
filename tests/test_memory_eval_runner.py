@@ -123,6 +123,9 @@ async def test_tool_offers_ledger_and_review_records_per_arm(store, tmp_path):
     data = json.loads((tmp_path / "a" / "cases" / "pref-en-signoff" / "memory.json").read_text())
     assert data["memory_changes"][0]["action"] == "add" and data["memory_changes"][0]["source_kind"] == "foreground"
     assert "review_usage" in data and isinstance(data["reviews"], list)
+    attempts = [a["usage"] for job in data["reviews"] for a in job["usage"]]
+    assert attempts and data["review_usage"]["input_tokens"] is not None
+    assert data["review_usage"]["input_tokens"] == sum(u["input_tokens"] for u in attempts)
     assert data["setup"][0]["transcript"][0]["role"] == "user"
 
     other = Scenario("pref-en-other", "preference", "explicit", "en", SIGNOFF.sessions, SIGNOFF.probe, SIGNOFF.checks)

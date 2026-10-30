@@ -131,7 +131,7 @@ async def _reviews(store, profile_id: str) -> tuple[list[dict], Usage]:
     total, jobs = Usage(), []
     for job in sorted(await store.list_reviews(profile_id, limit=100), key=lambda j: j.created_at):
         for attempt in job.usage:
-            total = total + Usage.from_dict(attempt)
+            total = total + Usage.from_dict(attempt.get("usage"))
         jobs.append({"id": job.id, "status": job.status, "attempts": job.attempts, "error_code": job.error_code,
                      "error": redact(job.error) if job.error else job.error, "usage": job.usage})
     return jobs, total
