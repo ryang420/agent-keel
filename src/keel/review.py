@@ -60,6 +60,11 @@ def chunk_tokens(context_window: int) -> int:
     return min(CHUNK_TOKENS, max(500, (context_window - OUTPUT_TOKENS) // 4))
 
 
+def attempt_tokens(window: int, attempts: int) -> int:
+    """Each retry takes half the text of the one before, so a job that ran out of budget converges."""
+    return max(250, chunk_tokens(window) // 2 ** max(0, attempts - 1))
+
+
 class MemoryReviewer:
     def __init__(self, store, providers, settings: ReviewSettings = ReviewSettings(), *,
                  sleep=asyncio.sleep) -> None:
@@ -145,7 +150,7 @@ class MemoryReviewer:
         window = provider.capabilities(job.model).context_window
         rows, complete = await self.store.review_rows(claim, limit=SOURCE_ROWS)
         chunk = build_chunk(rows, cursor_message=job.cursor_message, cursor_offset=job.cursor_offset,
-                            through=job.source_through, complete=complete, tokens=chunk_tokens(window))
+                            through=job.source_through, complete=complete, tokens=attempt_tokens(window, job.attempts))
         end = (chunk.end_message, chunk.end_offset)
         if not chunk.segments:
             await self.store.commit_review(claim, {}, end=end, done=chunk.done, evidence=None,
@@ -163,7 +168,7 @@ class MemoryReviewer:
         for _ in range(ITERATIONS):
             estimate = base + sum(message_tokens(message) for message in messages)
             if state.reserved + estimate > INPUT_TOKENS or estimate > window - OUTPUT_TOKENS:
-                raise _Failed("budget", "The review ran out of its input budget.", retry=False)
+                raise _Failed("budget", "The review ran out of its input budget.", retry=True)
             state.reserved += estimate
             state.requests += 1
             request = ModelRequest(provider=job.provider, model=job.model, system=system, messages=tuple(messages),

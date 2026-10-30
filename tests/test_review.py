@@ -3,13 +3,14 @@ commits once; failures retry or stop; nothing is written to the session (cross-s
 
 import asyncio
 import json
+import re
 
 from keel.background import Background
 from keel.events import InMemoryEventBus
 from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
-from keel.providers.base import ModelError, ProviderRegistry
+from keel.providers.base import Capabilities, ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
-from keel.review import MemoryReviewer, ReviewSettings
+from keel.review import MemoryReviewer, ReviewSettings, chunk_tokens
 from keel.runner import RunExecutor
 
 OK = [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]
@@ -122,10 +123,11 @@ async def test_a_survivor_retries_a_job_whose_worker_died(store, clock):
     provider = FakeProvider(script=[OK, ["hang"], SAVE, DONE])
     reviewer, _ = await setup(store, clock, provider)
     task = asyncio.create_task(reviewer.run_once("w1"))
-    for _ in range(50):
+    for _ in range(100):
         await asyncio.sleep(0.01)
         if review_requests(provider):
             break
+    assert review_requests(provider), "the review never reached the model"
     task.cancel()  # shutdown mid-review: the worker never commits
     await asyncio.gather(task, return_exceptions=True)
     [job] = await store.list_reviews("p1")
@@ -149,3 +151,102 @@ async def test_a_stale_job_from_a_recreated_profile_writes_nothing(store, clock)
     assert await store.review_owner_gone(claimed) == "profile_gone"
     assert await store.commit_review(claimed, {}, end=(0, 0), done=True, evidence=None, usage=None) == "lost"
     assert await store.memory_items("p1") == []
+
+
+async def test_a_lost_lease_cancels_the_attempt_and_a_later_claim_retries_the_job(store, clock):
+    provider = FakeProvider(script=[OK, ["hang"]])
+    _, run = await setup(store, clock, provider)
+    reviewer = MemoryReviewer(store, ProviderRegistry(), ReviewSettings(turns=1, lease_seconds=0.3), sleep=no_sleep)
+    reviewer.providers.register(provider)
+
+    async def refused(claim, lease_seconds):
+        return False
+
+    store.renew_review = refused
+    assert await asyncio.wait_for(reviewer.run_once("w1"), 5)
+    assert await store.memory_items("p1") == []
+    clock.now += 60
+    claimed = await store.claim_review("w2", 30.0, turns=1, idle_seconds=60.0, max_age_seconds=600.0)
+    assert claimed is not None
+    [job] = await store.list_reviews("p1")
+    assert job.error_code == "lease_expired" and job.id == claimed.job.id and job.attempts == 2
+    assert not [t for t in asyncio.all_tasks() if t.get_name().startswith("keel-review-")]
+
+
+async def test_a_failed_lease_renewal_is_logged_and_the_review_still_completes(store, clock):
+    provider = FakeProvider(script=[OK, [0.35] + SAVE, DONE])
+    _, run = await setup(store, clock, provider)
+    reviewer = MemoryReviewer(store, ProviderRegistry(), ReviewSettings(turns=1, lease_seconds=0.3), sleep=no_sleep)
+    reviewer.providers.register(provider)
+    real, calls = store.renew_review, []
+
+    async def flaky(claim, lease_seconds):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("database blip")
+        return await real(claim, lease_seconds)
+
+    store.renew_review = flaky
+    assert await asyncio.wait_for(reviewer.run_once("w1"), 5)
+    assert len(calls) >= 2
+    assert [item.text for item in await store.memory_items("p1")] == ["The user prefers tea"]
+    assert (await store.list_reviews("p1"))[0].status == "done"
+
+
+def test_the_chunk_shrinks_for_a_small_context_window():
+    assert chunk_tokens(128_000) == 2000
+    assert chunk_tokens(6000) == 1000 < chunk_tokens(128_000)
+    assert chunk_tokens(100) == 500
+
+
+def small_window(provider, size):
+    provider._capabilities = Capabilities(size, True, False, True, "none")
+
+
+async def test_a_request_that_does_not_fit_the_window_retries_later_without_calling_the_model(store, clock):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+    small_window(provider, 2500)
+    assert await reviewer.run_once("w1")
+    assert review_requests(provider) == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "budget")
+
+
+async def test_the_cumulative_input_cap_ends_the_attempt_and_commits_nothing(store, clock, monkeypatch):
+    import keel.review as review
+    from keel.compress import text_tokens
+    from keel import prompts
+
+    base = text_tokens(prompts.text("memory_review")) + text_tokens(json.dumps(prompts.tool_definitions(("memory",))))
+    monkeypatch.setattr(review, "INPUT_TOKENS", base * 3 // 2)
+    provider = FakeProvider(script=[OK, SAVE, DONE])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    assert len(review_requests(provider)) == 1
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("pending", "budget")
+
+
+async def test_a_retried_attempt_reviews_a_smaller_chunk(store, clock):
+    failing = [[ModelError("server_error", "down")]] * 3
+    provider = FakeProvider(script=[OK] + failing + [DONE])
+    reviewer, _ = await setup(store, clock, provider, text="word " * 6000)
+    assert await reviewer.run_once("w1")
+    clock.now += 3600
+    assert await reviewer.run_once("w1")
+    spans = [int(re.search(r"chars=0-(\d+)/", request.messages[0].text).group(1))
+             for request in (review_requests(provider)[0], review_requests(provider)[-1])]
+    assert spans[1] < spans[0] and abs(spans[1] * 2 - spans[0]) <= spans[0] * 0.1
+
+
+async def test_a_job_whose_session_was_replaced_before_the_review_is_discarded_unread(store, clock):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+    await store.db.execute("UPDATE sessions SET generation = ? WHERE id = ?", "other", "s1")
+    assert await reviewer.run_once("w1")
+    assert review_requests(provider) == []
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("discarded", "session_gone")
