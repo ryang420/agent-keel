@@ -19,8 +19,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - A session's tool list is fixed with its prompt and changes only at a compaction; sessions started before this
-  release have no stored list: their tools follow the profile, without `session_search`, until they compact. Tools now declare whether they need a sandbox, and a call to a tool
-  the session was not offered is refused.
+  release have no stored list: their tools follow the profile, without `session_search`, until they compact.
+  Tools now declare whether they need a sandbox, and a call to a tool the session was not offered is refused.
 - Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
   user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
   memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,
