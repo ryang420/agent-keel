@@ -54,16 +54,19 @@ Errors have one shape, with a machine-readable code:
 ```
 
 - `models`: the provider and model pairs runs may use.
-- `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means the sandbox tools are not offered.
-- `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
+- `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means new sessions are not offered the
+  sandbox tools. Tool availability (the sandbox tools, `memory` and `session_search`) is fixed per session when its
+  prompt is built and changes only when the session compacts; open sessions keep advertising removed tools, which
+  answer that they are unavailable.
+- `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions. Its tool list is fixed the same way, until the session compacts.
 - `skills`: the names of the skills to enable.
-- `memory`: a boolean. When true, the model is offered a `memory` tool (with or without a sandbox) and the system
-  prompt includes a snapshot of stored facts. The tool's `list` action shows entries with ids and versions, and a
-  change can name an entry by `entry_id` with an `expected_version`. A write does not change this session's stored
-  prompt: it is visible in the next session's prompt, and after a compaction. Every `KEEL_MEMORY_REVIEW_TURNS` completed
-  runs (10 by default) of that profile, a background review may save facts. The review does not add messages or
-  events to the session, and one already running for that profile is skipped. Omitted, the field is false, including
-  on update. `null`, or anything other than a boolean, is 400 `invalid_input`.
+- `memory`: a boolean. When true, the model is offered a `memory` tool and a `session_search` tool (both with or
+  without a sandbox) and the system prompt includes a snapshot of stored facts. The tool's `list` action shows entries
+  with ids and versions, and a change can name an entry by `entry_id` with an `expected_version`. A write does not
+  change this session's stored prompt: it is visible in the next session's prompt, and after a compaction. Every
+  `KEEL_MEMORY_REVIEW_TURNS` completed runs (10 by default) of that profile, a background review may save facts. The
+  review does not add messages or events to the session, and one already running for that profile is skipped. Omitted,
+  the field is false, including on update. `null`, or anything other than a boolean, is 400 `invalid_input`.
 
 The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
 
@@ -189,9 +192,14 @@ and returns the entry at its new version. `DELETE /v1/profiles/{profile_id}/memo
 removes it. Both answer 404 `memory_not_found` for an unknown entry, 409 `version_conflict` when the entry has
 changed since that version, 409 `profile_deletion_busy` while the profile is being deleted, and 400 `invalid_input`
 for a missing or non-integer `expected_version`. PATCH also answers 400 `invalid_input` when the text is empty,
-looks like a secret or an instruction, or would exceed the target's character budget. Sessions already open keep the memory snapshot in their stored
-prompt until they compact; new sessions see the change. Removing an entry stops it being used; it does not erase
-the conversations it came from.
+looks like a secret or an instruction, or would exceed the target's character budget. Sessions already open keep the
+memory snapshot in their stored prompt until they compact; new sessions see the change. Removing an entry stops it
+being used; it does not erase the conversations it came from.
+
+With `memory` on, new sessions are also offered `session_search`. It searches and reads the profile's earlier
+conversations: user and assistant text only, secrets redacted, never across profiles. A session keeps the tools it
+started with until it compacts, so open sessions do not gain `session_search` until then. Deleting a session removes
+its messages from search.
 
 ## Verifying a model
 

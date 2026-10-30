@@ -39,3 +39,16 @@ def test_memory_guidance_follows_guidance_and_the_snapshot_follows_the_date():
     assert prompt.index("SNAPSHOT") == prompt.index(date) + len(date) + 2
     plain = build_system_prompt(soul="SOUL", model="m1", provider="bedrock", now=NOW, tools=True, workdir="/work")
     assert memory not in plain and "SNAPSHOT" not in plain
+
+
+def test_history_guidance_follows_the_memory_guidance():
+    from datetime import UTC, datetime
+    from keel import prompts
+    from keel.prompt import build_system_prompt
+
+    text = build_system_prompt(soul="", model="m", provider="fake", now=datetime(2026, 10, 30, tzinfo=UTC),
+                               tools=True, memory=True, history=True)
+    assert text.index(prompts.text("memory")) < text.index(prompts.text("history")) < text.index(
+        prompts.text("platform"))
+    assert prompts.text("history") not in build_system_prompt(
+        soul="", model="m", provider="fake", now=datetime(2026, 10, 30, tzinfo=UTC), tools=True, memory=True)

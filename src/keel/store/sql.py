@@ -19,6 +19,7 @@ from keel.store.base import (
 )
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
+from keel.store.history import HistoryStoreMixin
 from keel.store.memory import MemoryStoreMixin
 from keel.store.migrations import migrate
 from keel.store.sandboxes import SandboxStoreMixin
@@ -46,6 +47,7 @@ def _session(row: dict) -> Session:
         context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
         compaction_failed_at=row["compaction_failed_at"], turns_since_memory=row["turns_since_memory"],
         pruned_id=row["pruned_id"],
+        tools=tuple(json.loads(row["tools"])) if row.get("tools") is not None else None,
     )
 
 
@@ -75,7 +77,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
+class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
@@ -278,6 +280,7 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
                     _j([tool_call_to_dict(c) for c in message.tool_calls]), message.tool_call_id,
                     message.tool_name, at)
                 ids.append(row["id"])
+                await self._index_message(profile_id, session_id, row["id"], message, at)
         return ImportResult("imported", profile is None, tuple(ids), title)
 
     async def _free_title(self, profile_id: str, title: str | None) -> str | None:
@@ -301,11 +304,13 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
             profile_id, limit)
         return [_session(row) for row in rows]
 
-    async def set_session_prompt(self, session_id: str, system_prompt: str, provider: str, model: str) -> Session:
-        """Store a session's system prompt once; the first writer wins and later calls read it back."""
+    async def set_session_prompt(self, session_id: str, system_prompt: str, provider: str, model: str,
+                                 tools: Sequence[str] | None = None) -> Session:
+        """Store a session's system prompt, and the tools it was built with, once; the first writer wins."""
         await self.db.execute(
-            "UPDATE sessions SET system_prompt = ?, provider = ?, model = ? WHERE id = ? AND system_prompt IS NULL",
-            system_prompt, provider, model, session_id)
+            "UPDATE sessions SET system_prompt = ?, provider = ?, model = ?, tools = ? "
+            "WHERE id = ? AND system_prompt IS NULL",
+            system_prompt, provider, model, None if tools is None else _j(list(tools)), session_id)
         row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
         if row is None:
             raise SessionNotFound(session_id)
@@ -328,13 +333,14 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
             pruned_id, failed_at, session_id)
 
     async def compact_session(self, session_id: str, *, summary: str, head_id: int, tail_id: int,
-                              system_prompt: str) -> None:
-        """Record a compaction. Unlike set_session_prompt, this overwrites the system prompt."""
+                              system_prompt: str, tools: Sequence[str] | None = None) -> None:
+        """Record a compaction. Unlike set_session_prompt, this overwrites the system prompt and, when given, the
+        session's tool list."""
         await self.db.execute(
             "UPDATE sessions SET summary = ?, summary_head_id = ?, summary_tail_id = ?, pruned_id = ?, "
-            "system_prompt = ?, context_tokens = NULL, context_message_id = NULL, compaction_failed_at = NULL "
-            "WHERE id = ?",
-            summary, head_id, tail_id, tail_id, system_prompt, session_id)
+            "system_prompt = ?, tools = COALESCE(?, tools), context_tokens = NULL, context_message_id = NULL, "
+            "compaction_failed_at = NULL WHERE id = ?",
+            summary, head_id, tail_id, tail_id, system_prompt, None if tools is None else _j(list(tools)), session_id)
 
     async def set_title(self, profile_id: str, session_id: str, title: str, source: str, *,
                         profile_incarnation: str | None = None) -> Session:
@@ -360,6 +366,7 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
 
     async def delete_session(self, profile_id: str, session_id: str) -> bool:
         async with self.db.transaction():
+            await self.lock_profile(profile_id)
             row = await self.db.fetchrow("SELECT id FROM sessions WHERE id = ? AND profile_id = ?",
                                          session_id, profile_id)
             if row is None:
@@ -371,6 +378,12 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
             await self.db.execute(
                 "DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?)", session_id)
             await self.db.execute("DELETE FROM runs WHERE session_id = ?", session_id)
+            await self.db.execute(
+                "DELETE FROM message_tokens WHERE message_id IN "
+                "(SELECT message_id FROM message_search WHERE profile_id = ? AND session_id = ?)",
+                profile_id, session_id)
+            await self.db.execute("DELETE FROM message_search WHERE profile_id = ? AND session_id = ?",
+                                  profile_id, session_id)
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", session_id)
             await self.db.execute("DELETE FROM blobs WHERE session_id = ?", session_id)
             await self.db.execute(
@@ -395,6 +408,10 @@ class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
             await self.db.execute(
                 "UPDATE sessions SET message_count = message_count + 1, last_active_at = ? WHERE id = ?",
                 now, session_id)
+            if message.role in ("user", "assistant"):
+                owner = await self.db.fetchrow("SELECT profile_id FROM sessions WHERE id = ?", session_id)
+                if owner is not None:
+                    await self._index_message(owner["profile_id"], session_id, row["id"], message, now)
         return StoredMessage(row["id"], session_id, run_id, message, now)
 
     async def messages(self, session_id: str) -> list[StoredMessage]:

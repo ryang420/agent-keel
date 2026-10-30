@@ -11,7 +11,7 @@ from keel.tools.base import ToolContext, ToolOutcome, error_result, tool, tool_j
 _OP_KEYS = ("action", "content", "new_text", "old_text", "entry_id", "expected_version")
 
 
-@tool("memory")
+@tool("memory", sandbox=False)
 async def memory(args: dict, ctx: ToolContext) -> ToolOutcome:
     if ctx.store is None or not ctx.profile_id:
         return error_result("Memory is not available.")

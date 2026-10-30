@@ -4,11 +4,10 @@ Adapted from Hermes (Nous Research hermes-agent, MIT, v2026.9.24 `f97608f178`): 
 stable tier in agent/system_prompt.py, the api_server platform hint, the skills index header, the
 iteration-cap request, the compaction summary prefix and checkpoint prompt (agent/context_compressor.py), the
 session title prompt (agent/title_generator.py), the memory-review prompt (agent/background_review.py) and the
-eight tool schemas as model_tools sends them. Edits remove
-what keel does not have: background processes, a persistent kernel, skill authoring, document extraction, other
-tools, and the compressor's skill, session-log and
-memory-provider sections. The memory guidance and its tool schema are keel's, and memory is not one of the
-eight tools in TOOL_ORDER. See THIRD_PARTY_NOTICES.md.
+eight tool schemas as model_tools sends them. Edits remove what keel does not have: background processes, a
+persistent kernel, skill authoring, document extraction, other tools, and the compressor's skill, session-log and
+memory-provider sections. The memory and history guidance and the memory and session_search tool schemas are keel's, and neither tool is one of the eight
+in TOOL_ORDER. See THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations

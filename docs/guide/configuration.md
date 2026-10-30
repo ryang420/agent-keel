@@ -21,7 +21,7 @@ service key are required; an invalid value stops the service at start with a mes
 | `KEEL_EVENT_RETENTION_DAYS` | `7` | Days finished run events are kept, a positive integer. An hourly task deletes older ones (runs, their output and messages are kept). The same retention governs resolved sandbox coordination records: the minute-by-minute maintenance pass prunes resolved, unreferenced attempts, usages and execs older than this in batches of 100. Unresolved creates, unreleased usages, unresolved execs and current references are never pruned. |
 | `KEEL_BACKGROUND_LIMIT` | `4` | How many best-effort tasks (a title, a memory review) this instance may run at once outside a run, a positive integer; past the limit the new task is dropped and logged, and they are cancelled only when the service stops. |
 | `KEEL_MEMORY_REVIEW_TURNS` | `10` | Completed runs of a memory-enabled profile between background memory reviews, a positive integer. |
-| `KEEL_MEMORY_CHARS` | `2200` | Character limit for the `memory` target, a positive integer. |
+| `KEEL_MEMORY_CHARS` | `2200` | Character limit for the `memory` target, a positive integer. A profile with `memory` on is also offered `session_search`, with no setting of its own. |
 | `KEEL_USER_CHARS` | `1375` | Character limit for the `user` target, a positive integer. |
 
 ## Sandbox

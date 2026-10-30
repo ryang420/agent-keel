@@ -18,7 +18,9 @@ from keel.sandbox.records import LeaseStamp, RunClaim
 log = logging.getLogger(__name__)
 _MAX_CLAIM_BACKOFF = 10.0
 SHUTDOWN_MESSAGE = "The service was shutting down."
-_BACKGROUND = ("keel-sweeper", "keel-maintenance")
+BACKFILL_BATCH = 200
+BACKFILL_IDLE_S = 30.0
+_BACKGROUND = ("keel-sweeper", "keel-maintenance", "keel-history-backfill")
 
 
 @dataclass
@@ -71,6 +73,7 @@ class WorkerPool:
         self._stop = asyncio.Event()
         self._tasks = [asyncio.create_task(self._work(), name=f"keel-worker-{i}") for i in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._sweep(), name="keel-sweeper"))
+        self._tasks.append(asyncio.create_task(self._backfill(), name="keel-history-backfill"))
         if self.event_retention_s is not None:
             self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
 
@@ -152,6 +155,23 @@ class WorkerPool:
             except Exception:
                 log.exception("pruning old run events failed")
             await self._idle(self.maintenance_s)
+
+    async def backfill_once(self) -> int | None:
+        return await self.store.backfill_history(BACKFILL_BATCH)
+
+    async def _backfill(self) -> None:
+        """Index history older than migration 9, a batch at a time, until none is left; then check twice a minute.
+        Instances may overlap: each batch runs under the profile lock and indexing is idempotent."""
+        while not self._closing:
+            try:
+                done = await self.backfill_once()
+            except Exception:
+                log.exception("history backfill failed")
+                done = None
+            if done is None:
+                await self._idle(BACKFILL_IDLE_S)
+            else:
+                await asyncio.sleep(0)
 
     async def _idle(self, seconds: float) -> None:
         try:

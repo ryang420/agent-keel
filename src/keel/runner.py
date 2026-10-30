@@ -30,7 +30,7 @@ from keel.titles import (
     MODEL_TITLE_LIMIT, TITLE_INPUT_CHARS, TITLE_LIMIT, derive_title, parse_model_title, title_candidates,
 )
 from keel.tools import ToolContext, ToolOutcome, run_tool
-from keel.tools.base import preview_for, redact
+from keel.tools.base import HANDLERS, preview_for, redact
 
 log = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 60
@@ -83,10 +83,13 @@ class _Turn:
     provider: object
     stored: list[StoredMessage]  # the session's messages, kept in step with what the run appends
     context: SessionContext
-    tools: tuple[dict, ...]
     window: int
-    rebuild: Callable[[], Awaitable[str]]
+    rebuild: Callable[[], Awaitable[tuple[str, tuple[str, ...]]]]
     blobs: dict = field(default_factory=dict)  # image bytes loaded during this run, by blob id
+
+
+def _definitions(names: tuple[str, ...]) -> tuple[dict, ...]:
+    return prompts.tool_definitions(names) if names else ()
 
 
 def _unanswered(stored_messages, run_id: str | None = None) -> list[ToolCall]:
@@ -334,32 +337,39 @@ class RunExecutor:
                               profile_id=run.profile_id, profile_incarnation=run.profile_incarnation,
                               session_id=run.session_id, run_id=run.id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
-        names: list[str] = []
+        desired: list[str] = []
         if ctx is not None:
-            names.extend(prompts.TOOL_ORDER)
+            desired.extend(prompts.TOOL_ORDER)
         if profile is not None and profile.memory:
-            names.append("memory")
-        if ctx is None and names:
+            desired += ["memory", "session_search"]
+        if ctx is None:
             cwd = session.cwd if session and session.cwd else "/"
             ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id,
                               profile_incarnation=run.profile_incarnation, session_id=run.session_id, run_id=run.id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
-        saved_cwd = ctx.cwd if ctx else None
+        saved_cwd = ctx.cwd
 
-        async def rebuild() -> str:
+        async def rebuild() -> tuple[str, tuple[str, ...]]:
             snapshot = ""
             if profile is not None and profile.memory:
                 entries = await self.store.memory_entries(run.profile_id)
                 snapshot = memory_snapshot(entries["memory"], entries["user"])
             return build_system_prompt(
                 soul=profile.soul if profile else "", model=run.model, provider=run.provider, now=self._now(),
-                tools=bool(names), skills=skills, workdir=policy.workdir if policy else None,
-                memory=bool(profile and profile.memory), memory_snapshot=snapshot)
+                tools=bool(desired), skills=skills, workdir=policy.workdir if policy else None,
+                memory=bool(profile and profile.memory), memory_snapshot=snapshot,
+                history="session_search" in desired), tuple(desired)
 
         system = session.system_prompt if session else None
         if system is None:
-            system = (await self.store.set_session_prompt(run.session_id, await rebuild(), run.provider,
-                                                          run.model)).system_prompt
+            prompt, built = await rebuild()
+            session = await self.store.set_session_prompt(run.session_id, prompt, run.provider, run.model,
+                                                          tools=built)
+            system = session.system_prompt
+        # The tool list is fixed with the prompt; a session stored before tool lists existed keeps the tools it
+        # was offered then (no session_search) until its next compaction.
+        offered = tuple(name for name in (session.tools if session.tools is not None else desired)
+                        if name in HANDLERS and (session.tools is not None or name != "session_search"))
         stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
         # before this turn so the request pairs every call.
@@ -374,12 +384,11 @@ class RunExecutor:
             bounds=Boundaries.of(session), system=system,
             anchor_tokens=session.context_tokens if session else None,
             anchor_id=session.context_message_id if session else None,
-            failed_at=session.compaction_failed_at if session else None)
+            failed_at=session.compaction_failed_at if session else None, tools=offered)
         turn = _Turn(provider=provider, stored=stored, context=context,
-                     tools=prompts.tool_definitions(tuple(names)) if names else (),
                      window=provider.capabilities(run.model).context_window, rebuild=rebuild)
         for iteration in range(self.max_iterations + 1):
-            final = iteration == self.max_iterations and bool(turn.tools)
+            final = iteration == self.max_iterations and bool(turn.context.tools)
             calls, reasoning, incomplete = await self._model_call(run, turn, state, final=final)
             output = "".join(state.text)
             assistant = Message("assistant", (TextPart(output),) if output else (), tool_calls=tuple(calls),
@@ -398,6 +407,8 @@ class RunExecutor:
                     await self._shielded(run, self._after_complete(run, profile), "finish the completed run")
                 return
             for call in calls:
+                # What this session is offered, read per call so a compaction applies to later calls.
+                ctx.allowed = frozenset(turn.context.tools)
                 outcome, duration, preview = await self._call_tool(run, call, ctx, state)
                 result = Message("tool", (TextPart(outcome.content),), tool_call_id=call.id, tool_name=call.name)
                 # `pending` is only the fallback for cleanup; cleanup reconciles against the stored messages,
@@ -425,8 +436,9 @@ class RunExecutor:
                           final: bool) -> tuple[list[ToolCall], list, bool]:
         """One model call over the assembled history. The compactor runs first, and once more when the call fails
         with context_overflow before any output; the call is then retried once."""
-        items, spent = await self.compactor.prepare(run, turn.provider, turn.stored, turn.context, tools=turn.tools,
-                                                    window=turn.window, rebuild=turn.rebuild)
+        items, spent = await self.compactor.prepare(run, turn.provider, turn.stored, turn.context,
+                                                    tools=_definitions(turn.context.tools), window=turn.window,
+                                                    rebuild=turn.rebuild)
         state.usage = state.usage + spent
         retried = False
         while True:
@@ -436,7 +448,7 @@ class RunExecutor:
                 messages.append(Message("user", (TextPart(prompts.MAX_ITERATIONS_REQUEST),)))
             request = ModelRequest(
                 provider=run.provider, model=run.model, system=turn.context.system, messages=tuple(messages),
-                instructions=run.instructions, tools=() if final else turn.tools,
+                instructions=run.instructions, tools=() if final else _definitions(turn.context.tools),
                 reasoning_effort=run.reasoning_effort, cache_scope=run.session_id,
             )
             try:
@@ -446,7 +458,7 @@ class RunExecutor:
                     raise
                 retried, before = True, items
                 items, spent = await self.compactor.prepare(run, turn.provider, turn.stored, turn.context,
-                                                            tools=turn.tools, window=turn.window,
+                                                            tools=_definitions(turn.context.tools), window=turn.window,
                                                             rebuild=turn.rebuild, overflow=True)
                 state.usage = state.usage + spent
                 if items == before:

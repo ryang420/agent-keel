@@ -7,9 +7,10 @@ import json
 import logging
 
 from keel.sandbox.base import SandboxError
-from keel.tools import files, memory, shell, skill_tools  # noqa: F401  (registers their tools)
+from keel.tools import files, history, memory, shell, skill_tools  # noqa: F401  (registers their tools)
 from keel.tools.base import (
-    HANDLERS, MAX_TOOL_RESULT_CHARS, ToolArgumentError, ToolContext, ToolOutcome, cap_json_result, error_result,
+    HANDLERS, MAX_TOOL_RESULT_CHARS, NEEDS_SANDBOX, ToolArgumentError, ToolContext, ToolOutcome, cap_json_result,
+    error_result,
 )
 
 log = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ async def run_tool(name: str, arguments: str, ctx: ToolContext) -> ToolOutcome:
     """Run one tool call. Every failure becomes an error result the model can read; nothing raises except a
     cancellation. Sandbox failures retain an internal marker for coordinated run failure handling."""
     handler = HANDLERS.get(name)
-    if handler is None:
+    if handler is None or (ctx.allowed is not None and name not in ctx.allowed):
         return error_result(f"Unknown tool: {name}")
     try:
         args = json.loads(arguments or "{}")
@@ -28,7 +29,7 @@ async def run_tool(name: str, arguments: str, ctx: ToolContext) -> ToolOutcome:
         return error_result(f"Invalid JSON arguments: {exc}")
     if not isinstance(args, dict):
         return error_result("Tool arguments must be a JSON object.")
-    if name != "memory" and ctx.backend is None:
+    if name in NEEDS_SANDBOX and ctx.backend is None:
         return error_result("This tool needs a sandbox.")
     try:
         outcome = await handler(args, ctx)

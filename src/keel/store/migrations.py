@@ -220,9 +220,31 @@ INSERT INTO memory_changes (profile_id, target, entry_id, action, new_text, sour
 DROP TABLE memories
 """
 
+# History search (cross-session memory design §3): a redacted text row per user/assistant message and unique
+# postings per profile. Existing history is indexed later by a resumable backfill up to each profile's ceiling;
+# newer messages are indexed as they are written. Sessions record the tools their prompt was built with.
+_V9 = """
+ALTER TABLE sessions ADD COLUMN tools TEXT;
+CREATE TABLE message_search (
+    message_id {bigint} PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, role TEXT NOT NULL,
+    text TEXT NOT NULL, created_at {real} NOT NULL);
+CREATE INDEX message_search_session ON message_search (profile_id, session_id, message_id);
+CREATE INDEX message_search_time ON message_search (profile_id, created_at);
+CREATE TABLE message_tokens (
+    profile_id TEXT NOT NULL, token TEXT NOT NULL, message_id {bigint} NOT NULL,
+    PRIMARY KEY (profile_id, token, message_id));
+CREATE INDEX message_tokens_message ON message_tokens (message_id);
+CREATE TABLE history_backfill (
+    profile_id TEXT PRIMARY KEY, done_through {bigint} NOT NULL, ceiling {bigint} NOT NULL,
+    updated_at {real} NOT NULL);
+INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at)
+    SELECT s.profile_id, 0, MAX(m.id), EXTRACT(EPOCH FROM now())
+    FROM messages m JOIN sessions s ON s.id = m.session_id GROUP BY s.profile_id
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 
