@@ -95,6 +95,35 @@ async def _run(args) -> int:
     return 0 if summary["memory"]["gate"]["passed"] else 1
 
 
+async def _bench(args) -> int:
+    from evals.dab.runner import temporary_database
+
+    from .bench import bench
+
+    started = datetime.now(UTC)
+    out = Path(args.root) / "bench" / started.strftime("%Y%m%dT%H%M%SZ")
+    out.mkdir(parents=True, exist_ok=True)
+    async with temporary_database(_admin_dsn(args)) as dsn:
+        store = await open_store(dsn)
+        try:
+            result = await bench(store, messages=args.messages, others=args.others, queries=args.queries)
+        finally:
+            await store.close()
+    result["started"] = started.isoformat()
+    (out / "bench.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    search, append = result["search_ms"], result["append_ms"]
+    (out / "bench.md").write_text(
+        f"# Search benchmark\n\n- {result['messages']} messages in one profile, {result['others']} in others\n"
+        f"- Index: {result['index_bytes'] / 2**20:.1f} MiB; backfill {result['backfill_messages_per_s']:.0f} msg/s\n"
+        f"- Append: {append['indexed']:.2f} ms indexed vs {append['raw']:.2f} ms raw "
+        f"(+{append['overhead']:.2f} ms)\n"
+        f"- session_search: p50 {search['p50']:.1f} ms, p95 {search['p95']:.1f} ms, max {search['max']:.1f} ms "
+        f"over {search['count']} queries; target p95 < {result['target_p95_ms']} ms: "
+        f"{'met' if result['met'] else 'NOT met'}\n- Machine: {result['machine']}\n", encoding="utf-8")
+    print(f"report: {out / 'bench.md'}")
+    return 0 if result["met"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m evals.memory", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -108,6 +137,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--scenarios", help="comma-separated scenario ids (default: all)")
     run.add_argument("--root", default=str(DEFAULT_ROOT))
     run.add_argument("--database-admin-dsn")
+    bench_cmd = commands.add_parser("bench", help="lexical search benchmark on a private database")
+    bench_cmd.add_argument("--messages", type=int, default=100_000)
+    bench_cmd.add_argument("--others", type=int, default=20_000)
+    bench_cmd.add_argument("--queries", type=int, default=200)
+    bench_cmd.add_argument("--root", default=str(DEFAULT_ROOT))
+    bench_cmd.add_argument("--database-admin-dsn")
     args = parser.parse_args(argv)
     if args.command == "validate":
         try:
@@ -117,4 +152,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"{len(scenarios)} scenarios OK ({PROTOCOL})")
         return 0
+    if args.command == "bench":
+        return asyncio.run(_bench(args))
     return asyncio.run(_run(args))
