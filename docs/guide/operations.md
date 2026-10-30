@@ -109,6 +109,18 @@ Verification after cutover:
 - The daemon ID reported by `docker info` matches the one recorded in the sandbox and operation rows;
   changing it closes admission until the recorded daemon is restored and the service restarted.
 
+## History search index
+
+Migration 9 creates the index behind `session_search`. Every instance indexes new messages as they are written and
+backfills older ones in the background, 200 messages per batch, so no operator step is needed. Until the backfill
+finishes for a profile, `session_search` reports `index_complete: false` for it. Watch progress with:
+
+```sql
+SELECT profile_id, done_through, ceiling FROM history_backfill WHERE done_through < ceiling;
+```
+
+Every instance must run this release: an older instance writes messages the index never sees.
+
 ## Complete profile deletion
 
 A consumer may ask the service to remove one profile completely through the delete/complete contract in

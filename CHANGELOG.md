@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `session_search`: memory-enabled profiles can search and read their earlier conversations (lexical, English and
+  Chinese), with a background index backfill (schema migration 9). Migration 9 adds the search index, so every
+  instance must run this version before messages are written again (no mixed-version rollout): an older binary
+  would leave the messages it writes unindexed; a downgrade is not supported.
 - `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
 - `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
   `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
@@ -14,6 +18,9 @@ All notable changes to this project are documented here. The format follows
   outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
 
 ### Changed
+- A session's tool list is fixed with its prompt and changes only at a compaction; sessions started before this
+  release keep their previous tools until then. Tools now declare whether they need a sandbox, and a call to a tool
+  the session was not offered is refused.
 - Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
   user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
   memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,

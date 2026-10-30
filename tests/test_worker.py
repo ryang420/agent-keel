@@ -398,3 +398,17 @@ async def test_prune_once_without_a_retention_deletes_nothing(store, clock):
     pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
     assert await pool.prune_once() == 0
     assert len(await store.events_after(run.id, 0)) == 2
+
+
+async def test_backfill_once_indexes_pending_history(pool_parts):
+    from keel.models import Message, TextPart
+
+    store, _, bus, executor = pool_parts
+    await store.ensure_session("p1", "s1")
+    stored = await store.append_message("s1", None, Message("user", (TextPart("old words"),)))
+    await store.db.execute("DELETE FROM message_tokens")
+    await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
+                           "VALUES ('p1', 0, ?, 0)", stored.id)
+    worker = WorkerPool(store, bus, executor, owner="w1")
+    assert await worker.backfill_once() == 1
+    assert await worker.backfill_once() is None
