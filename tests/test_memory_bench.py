@@ -1,7 +1,8 @@
 """The search benchmark runs end to end at a small size and reports every measure the design asks for."""
 
-from evals.memory.bench import bench, synthetic_text
 import random
+
+from evals.memory.bench import bench, synthetic_text
 
 
 def test_synthetic_text_is_deterministic_and_mixes_languages():
@@ -22,3 +23,8 @@ async def test_a_small_benchmark_reports_every_measure(store):
     assert result["target_p95_ms"] == 500 and isinstance(result["met"], bool)
     assert {"postgres", "python", "cpus"} <= set(result["machine"])
     assert await store.history_index_complete("bench")
+    by_class = result["search_by_class"]
+    assert set(by_class) == {"latin", "han", "absent"}
+    assert by_class["latin"]["hit_rate"] > 0 and by_class["han"]["hit_rate"] > 0
+    assert by_class["absent"]["hit_rate"] == 0 and sum(c["count"] for c in by_class.values()) == 20
+    assert {"mean", "median", "p95"} <= set(result["append_stats"]["indexed"])

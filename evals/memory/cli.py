@@ -112,14 +112,23 @@ async def _bench(args) -> int:
     result["started"] = started.isoformat()
     (out / "bench.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     search, append = result["search_ms"], result["append_ms"]
+    classes = "\n".join(
+        f"  - {name}: {c['count']} queries, hit rate {c['hit_rate']:.2f}, p50 {c['p50']:.1f} ms, p95 {c['p95']:.1f} ms, "
+        f"max {c['max']:.1f} ms" for name, c in result["search_by_class"].items())
     (out / "bench.md").write_text(
         f"# Search benchmark\n\n- {result['messages']} messages in one profile, {result['others']} in others\n"
-        f"- Index: {result['index_bytes'] / 2**20:.1f} MiB; backfill {result['backfill_messages_per_s']:.0f} msg/s\n"
-        f"- Append: {append['indexed']:.2f} ms indexed vs {append['raw']:.2f} ms raw "
-        f"(+{append['overhead']:.2f} ms)\n"
-        f"- session_search: p50 {search['p50']:.1f} ms, p95 {search['p95']:.1f} ms, max {search['max']:.1f} ms "
-        f"over {search['count']} queries; target p95 < {result['target_p95_ms']} ms: "
-        f"{'met' if result['met'] else 'NOT met'}\n- Machine: {result['machine']}\n", encoding="utf-8")
+        f"- Search tables total (text + tokens + indexes): {result['index_bytes'] / 2**20:.1f} MiB; backfill "
+        f"{result['backfill_messages_per_s']:.0f} msg/s (batch {result['backfill_batch']})\n"
+        f"- Append (indexed and raw alternate per iteration; the indexed path includes its transaction and the "
+        f"session counter update): indexed mean {result['append_stats']['indexed']['mean']:.2f} / median "
+        f"{result['append_stats']['indexed']['median']:.2f} / p95 {result['append_stats']['indexed']['p95']:.2f} ms; raw mean "
+        f"{result['append_stats']['raw']['mean']:.2f} / median {result['append_stats']['raw']['median']:.2f} / p95 "
+        f"{result['append_stats']['raw']['p95']:.2f} ms; overhead (means) +{append['overhead']:.2f} ms\n"
+        f"- session_search (warm cache: data just written, after VACUUM ANALYZE of the search tables): overall p50 "
+        f"{search['p50']:.1f} ms, p95 {search['p95']:.1f} ms, max {search['max']:.1f} ms over {search['count']} "
+        f"queries; target: every class p95 < {result['target_p95_ms']} ms, latin and han hit rate > 0.5, absent "
+        f"hit rate 0: {'met' if result['met'] else 'NOT met'}\n{classes}\n- Machine: {result['machine']}\n",
+        encoding="utf-8")
     print(f"report: {out / 'bench.md'}")
     return 0 if result["met"] else 1
 
@@ -140,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     bench_cmd = commands.add_parser("bench", help="lexical search benchmark on a private database")
     bench_cmd.add_argument("--messages", type=int, default=100_000)
     bench_cmd.add_argument("--others", type=int, default=20_000)
-    bench_cmd.add_argument("--queries", type=int, default=200)
+    bench_cmd.add_argument("--queries", type=int, default=500)
     bench_cmd.add_argument("--root", default=str(DEFAULT_ROOT))
     bench_cmd.add_argument("--database-admin-dsn")
     args = parser.parse_args(argv)
