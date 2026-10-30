@@ -16,6 +16,7 @@ from keel.sandbox.base import ExecResult, Sandbox, SandboxError, SandboxExecutor
 MAX_TOOL_RESULT_CHARS = 100_000
 PREVIEW_CHARS = 500
 HANDLERS: dict[str, Callable[[dict, "ToolContext"], Awaitable["ToolOutcome"]]] = {}
+NEEDS_SANDBOX: set[str] = set()  # tools that run in the profile's sandbox; the rest read and write the store only
 
 _KEY_WORDS = r"(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY)"
 _JSON_KEY_WORDS = r"(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)"
@@ -68,6 +69,7 @@ class ToolContext:
     memory_source: str = "foreground"  # "review" for a background review; recorded as the change's source
     memory_chars: int = 2200
     user_chars: int = 1375
+    allowed: frozenset[str] | None = None  # the tools this call may run; None (direct callers and tests) is any
 
     def resolve(self, path: str) -> str:
         return posixpath.normpath(posixpath.join(self.cwd, path))
@@ -96,9 +98,13 @@ class ToolContext:
         return result
 
 
-def tool(name: str):
+def tool(name: str, *, sandbox: bool = True):
     def register(handler):
         HANDLERS[name] = handler
+        if sandbox:
+            NEEDS_SANDBOX.add(name)
+        else:
+            NEEDS_SANDBOX.discard(name)
         return handler
     return register
 

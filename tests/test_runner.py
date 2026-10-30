@@ -357,6 +357,27 @@ async def test_a_sandbox_profile_with_memory_gets_the_sandbox_tools_and_memory(s
     assert [tool["name"] for tool in provider.requests[0].tools] == [*prompts.TOOL_ORDER, "memory"]
 
 
+async def test_a_tool_that_was_not_offered_is_refused_by_the_run(store, tmp_path, monkeypatch):
+    """The model may name a tool the run never offered: the run's allowlist turns it into an unknown tool."""
+    provider = FakeProvider()
+    registry = ProviderRegistry()
+    registry.register(provider)
+    work = tmp_path / "work"
+    work.mkdir()
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], soul="", skills=[], memory=False,
+                               sandbox={"image": "local", "workdir": str(work)})
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
+    executor = ClaimedExecutor(store, InMemoryEventBus(), registry, coordinator=coordinator, sleep=no_sleep)
+    provider.script = [[ToolCallReady(ToolCall("c1", "memory", json.dumps({"action": "list"}))),
+                        Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await start(store, claim=False)
+    await executor.execute(await executor.claim_next())
+    assert [tool["name"] for tool in provider.requests[0].tools] == list(prompts.TOOL_ORDER)
+    (result,) = [message for message in provider.requests[1].messages if message.role == "tool"]
+    assert json.loads(result.parts[0].text)["error"] == "Unknown tool: memory"
+
+
 async def test_a_tool_other_than_memory_needs_a_sandbox():
     missing = await run_tool("terminal", '{"command": "true"}', ToolContext())
     assert missing.error and "sandbox" in missing.content

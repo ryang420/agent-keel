@@ -344,6 +344,8 @@ class RunExecutor:
             ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id,
                               profile_incarnation=run.profile_incarnation, session_id=run.session_id, run_id=run.id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
+        if ctx is not None:
+            ctx.allowed = frozenset(names)  # only the tools offered to the model in this run may run
         saved_cwd = ctx.cwd if ctx else None
 
         async def rebuild() -> str:
