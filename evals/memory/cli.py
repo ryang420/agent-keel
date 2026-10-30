@@ -41,21 +41,37 @@ def _model(args) -> str:
     return model
 
 
+def _settings(dsn: str) -> Settings:
+    """Mirrors Settings.from_env for the model-facing fields; the rest is fixed for an in-process evaluation."""
+    env = os.environ
+    base_url = (env.get("KEEL_OPENAI_BASE_URL") or "").strip() or "https://api.openai.com/v1"
+    if not base_url.lower().startswith(("http://", "https://")):
+        raise SystemExit("KEEL_OPENAI_BASE_URL must start with http:// or https://")
+    window = (env.get("KEEL_OPENAI_CONTEXT_WINDOW") or "").strip() or "128000"
+    if not window.isdigit() or int(window) < 1:
+        raise SystemExit("KEEL_OPENAI_CONTEXT_WINDOW must be a positive integer")
+    return Settings(
+        credentials=(ServiceCredential(1, "memory-eval"),), database_url=dsn, sandbox="none",
+        aws_region=(env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1").strip(),
+        openai_api_key=(env.get("KEEL_OPENAI_API_KEY") or env.get("OPENAI_API_KEY") or "").strip() or None,
+        openai_base_url=base_url, openai_compat=(env.get("KEEL_OPENAI_COMPAT") or "").strip().lower()
+        in ("1", "true", "yes"), openai_context_window=int(window))
+
+
 async def _run(args) -> int:
     from evals.dab.runner import temporary_database
 
     scenarios = load_suite(args.suite)
+    subset = bool(args.scenarios)
     if args.scenarios:
         wanted = set(args.scenarios.split(","))
         scenarios = [s for s in scenarios if s.id in wanted]
     model = _model(args)
-    key = (os.environ.get("KEEL_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip() or None
     started = datetime.now(UTC)
     out = Path(args.root) / "runs" / started.strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True, exist_ok=True)
     async with temporary_database(_admin_dsn(args)) as dsn:
-        settings = Settings(credentials=(ServiceCredential(1, "memory-eval"),), database_url=dsn, sandbox="none",
-                            openai_api_key=key)
+        settings = _settings(dsn)
         providers = default_providers(settings)
         store = await open_store(dsn)
         try:
@@ -66,12 +82,17 @@ async def _run(args) -> int:
             await store.close()
             await providers.aclose()
     meta = {"protocol": PROTOCOL, "provider": args.provider, "model": model, "keel_version": keel.__version__,
-            "started": started.isoformat(), "scenarios": len(scenarios)}
+            "started": started.isoformat(), "scenarios": len(scenarios), "gate_applicable": not subset}
+    if args.provider == "bedrock":
+        meta["region"] = settings.aws_region
     outcomes = [Outcome(**{**item, "failures": tuple(item["failures"])})
                 for item in json.loads((out / "outcomes.json").read_text(encoding="utf-8"))]
     write(out, summary, outcomes, meta)
     print(f"report: {out / 'report.md'}")
-    return 0 if args.arm == "baseline" or summary.get("memory", {}).get("gate", {}).get("passed") else 1
+    errors = sum(data["gate"]["errors"] for data in summary.values())
+    if subset or args.arm == "baseline":  # a subset never claims the gate
+        return 0 if not errors else 1
+    return 0 if summary["memory"]["gate"]["passed"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:

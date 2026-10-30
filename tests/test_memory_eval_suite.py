@@ -180,7 +180,7 @@ def test_the_gate_needs_every_scenario_exactly_once():
     scenarios = load_suite(SUITE)
     passing = [Outcome(s.id, "memory", True, (), False, False) for s in scenarios]
     assert summarize(passing, scenarios)["memory"]["gate"] == {
-        "rate": 0.9, "exposure": 0, "unsupported": 0, "complete": True, "passed": True}
+        "rate": 0.9, "exposure": 0, "unsupported": 0, "complete": True, "errors": 0, "passed": True}
     missing = summarize(passing[1:], scenarios)["memory"]["gate"]
     assert missing["complete"] is False and missing["passed"] is False
     duplicated = summarize(passing + [passing[0]], scenarios)["memory"]["gate"]

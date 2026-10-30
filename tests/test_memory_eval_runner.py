@@ -106,5 +106,29 @@ async def test_a_failing_case_is_recorded_and_the_run_continues(store, tmp_path)
     data = json.loads((tmp_path / "cases" / errored[0]["scenario_id"] / f"{errored[0]['arm']}.json").read_text())
     assert data["error"]["type"] == "RuntimeError" and len(data["error"]["message"]) <= 500
     assert sum(o["passed"] for o in outcomes if o["arm"] == "memory") >= 1
-    for arm in ("memory", "baseline"):
-        assert summary[arm]["gate"]["complete"] is True
+    errors = {arm: summary[arm]["gate"] for arm in ("memory", "baseline")}
+    assert sum(g["errors"] for g in errors.values()) == 1
+    assert all(g["complete"] is True and g["passed"] is False for g in errors.values() if g["errors"])
+    assert all(g["complete"] is True for g in errors.values())
+
+
+async def test_tool_offers_ledger_and_review_records_per_arm(store, tmp_path):
+    registry = ProviderRegistry()
+    scripted = Scripted()
+    registry.register(scripted)
+    await evaluate(store, registry, [SIGNOFF], provider="fake", model="m", arms=("memory",), out=tmp_path / "a")
+    offered = [{(t.get("name") or t.get("function", {}).get("name")) for t in r.tools}
+               for r in scripted.requests if not r.system.startswith("You maintain")]
+    assert offered and all({"memory", "session_search"} <= names for names in offered)
+    data = json.loads((tmp_path / "a" / "cases" / "pref-en-signoff" / "memory.json").read_text())
+    assert data["memory_changes"][0]["action"] == "add" and data["memory_changes"][0]["source_kind"] == "foreground"
+    assert "review_usage" in data and isinstance(data["reviews"], list)
+    assert data["setup"][0]["transcript"][0]["role"] == "user"
+
+    other = Scenario("pref-en-other", "preference", "explicit", "en", SIGNOFF.sessions, SIGNOFF.probe, SIGNOFF.checks)
+    base = Scripted()
+    registry = ProviderRegistry()
+    registry.register(base)
+    await evaluate(store, registry, [other], provider="fake", model="m", arms=("baseline",), out=tmp_path / "b")
+    names = {(t.get("name") or t.get("function", {}).get("name")) for r in base.requests for t in r.tools}
+    assert not names & {"memory", "session_search"}

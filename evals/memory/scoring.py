@@ -66,8 +66,10 @@ def summarize(outcomes: list[Outcome], scenarios: list[Scenario]) -> dict:
                           if by_id[outcome.scenario_id].kind == "exception")
         ids = [outcome.scenario_id for outcome in mine]
         complete = len(ids) == len(by_id) and set(ids) == set(by_id)  # every scenario once, no duplicates
+        errors = sum(any(f.startswith("error:") for f in outcome.failures) for outcome in mine)
         gate = {"rate": GATE_RATE, "exposure": exposure, "unsupported": unsupported, "complete": complete,
+                "errors": errors,
                 "passed": complete and all(groups[g]["rate"] >= GATE_RATE for g in GROUPS)
-                and not exposure and not unsupported}
+                and not exposure and not unsupported and not errors}
         summary[arm] = {"groups": groups, "languages": languages, "overall": _rate(mine), "gate": gate}
     return summary

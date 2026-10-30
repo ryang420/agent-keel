@@ -18,16 +18,20 @@ def write(out: Path, summary: dict, outcomes, meta: dict) -> None:
                                                  ensure_ascii=False, indent=2), encoding="utf-8")
     lines = [f"# Memory evaluation ({meta['protocol']})", "",
              f"- Model: `{meta['provider']}` / `{meta['model']}`", f"- keel: {meta['keel_version']}",
+             *([f"- Region: {meta['region']}"] if meta.get("region") else []),
              f"- Started: {meta['started']}", f"- Scenarios: {meta['scenarios']}", "",
              "| Arm | Preference | Recall | English | Chinese | Overall |", "|---|---|---|---|---|---|"]
     for arm, data in summary.items():
         groups, languages = data["groups"], data["languages"]
         lines.append(f"| {arm} | {_pct(groups['preference'])} | {_pct(groups['recall'])} | "
                      f"{_pct(languages['en'])} | {_pct(languages['zh'])} | {_pct(data['overall'])} |")
-    if "memory" in summary:
+    if "memory" in summary and meta.get("gate_applicable", True):
         gate = summary["memory"]["gate"]
-        lines += ["", f"Gate (memory arm): {'PASSED' if gate['passed'] else 'FAILED'} — ≥{gate['rate']:.0%} per group, "
-                      f"exposure {gate['exposure']}, unsupported preferences {gate['unsupported']}."]
+        verdict = "PASSED" if gate["passed"] else "FAILED"
+        lines += ["", f"Gate (memory arm): {verdict} — ≥{gate['rate']:.0%} per group, exposure {gate['exposure']}, "
+                      f"unsupported preferences {gate['unsupported']}, errors {gate['errors']}."]
+    elif "memory" in summary:
+        lines += ["", "Gate: not applicable (subset run)"]
     errors = [o for o in outcomes if any(f.startswith("error:") for f in o.failures)]
     if errors:
         lines += ["", f"Cases that errored (counted as failures): {len(errors)}"]
