@@ -691,6 +691,7 @@ async def test_migration_10_adds_review_tables_and_session_generations(db_url):
     try:
         await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
         await store.ensure_session("p1", "s1")
+        await store.ensure_session("p1", "s2")
         await store.db.execute("UPDATE schema_version SET version = 9")
         await restore_pre_review_queue(store.db)
     finally:
@@ -699,7 +700,8 @@ async def test_migration_10_adds_review_tables_and_session_generations(db_url):
     try:
         assert await schema_version(upgraded.db) == LATEST_VERSION
         assert {"memory_reviews", "memory_review_jobs"} <= await database_table_names(upgraded.db)
-        assert (await upgraded.get_session("p1", "s1")).generation
+        first, second = [await upgraded.get_session("p1", name) for name in ("s1", "s2")]
+        assert first.generation and second.generation and first.generation != second.generation
         columns = {row["column_name"] for row in await upgraded.db.fetch(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'sessions'")}
         assert "turns_since_memory" not in columns

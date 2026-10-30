@@ -115,7 +115,8 @@ class ProfileDeletionService:
 
     async def _drain_background(self, profile_id: str, deadline: float,
                                 authority: ProfileDeletionAuthority) -> None:
-        """Cancel and await this profile's background titles before purging its rows. Reviews are fenced in the database."""
+        """Cancel and await this profile's background titles before purging its rows. Reviews are fenced in the
+        database."""
         if self.background is None:
             return
         try:

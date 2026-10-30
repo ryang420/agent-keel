@@ -129,7 +129,8 @@ jobs. Each instance runs `KEEL_MEMORY_REVIEW_WORKERS` review loops (default 1) b
 lease on database time, renewed every third of `KEEL_LEASE_SECONDS`; a worker that stops renewing loses the job to
 another instance and cannot write afterwards. At most one review runs per profile across all instances.
 
-A job tries at most three times (backoff 30 s, then 60 s). A model that is no longer enabled for the profile
+A job tries at most three times; failed attempts back off 30 s, then 60 s, while a job whose lease expired is
+retried at once with no backoff. A model that is no longer enabled for the profile
 (`model_unavailable`) and provider errors that are not transient fail at once. A review whose input would exceed its
 budget ends the attempt with `budget` and is retried, each retry of the same chunk reviewing half as much new text
 (down to 250 tokens). Inspect jobs with `GET /v1/profiles/{p}/memory/reviews` and requeue a failed one with
@@ -139,8 +140,9 @@ are unaffected. Each attempt's token usage is on the job.
 Deleting a session removes its review state and jobs; deleting a profile removes all of them and fences any review
 still running. Turning memory off and on again discards the profile's queued, failed and running reviews (a running
 one cannot write afterwards) and starts again from the next completed run. Migration 10 queues nothing for existing
-conversations. Like migration 9, it needs every instance on this version before runs start again (no mixed-version
-rollout): an older binary still counts turns in a column that no longer exists.
+conversations. It rewrites the `sessions` table (each row gets its own generation) under an exclusive lock, so
+expect it to take time on large tables. Like migration 9, it needs every instance on this version before runs
+start again (no mixed-version rollout): an older binary still counts turns in a column that no longer exists.
 
 ## Complete profile deletion
 

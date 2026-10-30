@@ -89,4 +89,5 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
 - M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
-  hands a running command's cleanup to the executor's cancel path.
+  hands a running command's cleanup to the executor's cancel path; finished memory review jobs are never pruned, and
+  the review queue scans `memory_reviews` without a dirty-row index.

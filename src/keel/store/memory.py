@@ -130,6 +130,7 @@ class MemoryStoreMixin:
             "SELECT MAX(id) AS id FROM messages WHERE session_id = ? AND run_id = ? AND role = 'user'",
             session_id, run_id)
         return row["id"] if row else None
+
     async def review_memory(self, profile_id: str) -> tuple[dict[str, list[Slot]], dict[str, int]]:
         """Active entries per target in order, and each target's revision, read together under the profile lock."""
         async with self.db.transaction():
