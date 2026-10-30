@@ -16,7 +16,7 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, "
+ALL_TABLES = ("history_backfill, message_tokens, message_search, sandbox_execs, sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, "
               "memory_changes, memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, "
               "tenants, blobs")
 
@@ -95,6 +95,13 @@ async def restore_legacy_memories(db) -> None:
         await db.execute(f"DROP TABLE {table}")
     await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
+
+
+async def restore_pre_history_index(db) -> None:
+    """Undo migration 9 on a database that is being rewound to an older schema version."""
+    for table in ("history_backfill", "message_tokens", "message_search"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("ALTER TABLE sessions DROP COLUMN tools")
 
 
 async def database_table_names(db) -> set[str]:
@@ -401,6 +408,7 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
@@ -456,6 +464,7 @@ async def test_a_v4_database_gains_the_coordination_tables(db_url):
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
     await store.db.execute("ALTER TABLE profiles DROP COLUMN incarnation")
@@ -617,7 +626,7 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
 
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == 8
+        assert await schema_version(upgraded.db) == 9
         # Order and duplicates survive exactly; the rendered snapshot is unchanged.
         assert await upgraded.memory_entries("p1") == {"memory": [], "user": ["likes tea", "likes tea", "works late"]}
         items = await upgraded.memory_items("p1")
@@ -628,5 +637,40 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
             "SELECT revision FROM memory_revisions WHERE profile_id = ? AND target = ?", "p1", "user")
         assert revision["revision"] == 1
         assert "memories" not in await database_table_names(upgraded.db)
+    finally:
+        await upgraded.close()
+
+
+async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_tool_list(db_url, monkeypatch):
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:8])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 8)
+    store = await open_store(db_url)
+    for profile in ("p1", "p2"):
+        await store.upsert_profile(profile, models=[], sandbox={}, soul="", skills=[], tenant_id=1)
+        await store.ensure_session(profile, f"{profile}-s")
+    ids = {}
+    for profile in ("p1", "p2"):
+        for text in ("one", "two"):
+            row = await store.db.fetchrow(
+                "INSERT INTO messages (session_id, run_id, role, parts, tool_calls, tool_call_id, tool_name, "
+                "reasoning, active, created_at) VALUES (?, NULL, 'user', ?, '[]', NULL, NULL, '[]', 1, 1.0) "
+                "RETURNING id", f"{profile}-s", json.dumps([{"type": "text", "text": text}]))
+            ids[profile] = row["id"]
+    await store.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == 9
+        rows = await upgraded.db.fetch(
+            "SELECT profile_id, done_through, ceiling FROM history_backfill ORDER BY profile_id")
+        assert [(r["profile_id"], r["done_through"], r["ceiling"]) for r in rows] == [
+            ("p1", 0, ids["p1"]), ("p2", 0, ids["p2"])]
+        assert (await upgraded.get_session("p1", "p1-s")).tools is None
+        assert not await upgraded.history_index_complete("p1")
+        while await upgraded.backfill_history() is not None:
+            pass
+        assert await upgraded.history_index_complete("p1")
+        assert (await upgraded.db.fetchrow("SELECT COUNT(*) AS n FROM message_search"))["n"] == 4
     finally:
         await upgraded.close()

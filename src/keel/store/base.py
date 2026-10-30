@@ -95,6 +95,7 @@ class Session:
     compaction_failed_at: float | None = None
     turns_since_memory: int = 0
     pruned_id: int | None = None
+    tools: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
