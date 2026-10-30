@@ -250,3 +250,28 @@ async def test_a_job_whose_session_was_replaced_before_the_review_is_discarded_u
     assert await store.memory_items("p1") == []
     [job] = await store.list_reviews("p1")
     assert (job.status, job.error_code) == ("discarded", "session_gone")
+
+
+async def test_a_cut_off_response_commits_nothing_and_keeps_the_cursor(store, clock):
+    cut = [TextDelta("partial"), Completed(Usage(1, 1, 0, 0), "incomplete")]
+    provider = FakeProvider(script=[OK, cut])
+    reviewer, _ = await setup(store, clock, provider)
+    assert await reviewer.run_once("w1")
+    assert await store.memory_items("p1") == []
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code, job.cursor_message) == ("pending", "incomplete", 0)
+    state = await store.db.fetchrow("SELECT reviewed_through FROM memory_reviews WHERE session_id = 's1'")
+    assert state["reviewed_through"] == 0
+
+
+async def test_a_profile_purged_after_the_owner_check_discards_the_job(store, clock, monkeypatch):
+    provider = FakeProvider(script=[OK])
+    reviewer, _ = await setup(store, clock, provider)
+
+    async def gone(profile_id):
+        return None
+
+    monkeypatch.setattr(store, "get_profile", gone)
+    assert await reviewer.run_once("w1")
+    [job] = await store.list_reviews("p1")
+    assert (job.status, job.error_code) == ("discarded", "profile_gone")

@@ -110,6 +110,11 @@ def overlap(rows: list[SourceRow], tokens: int = OVERLAP_TOKENS, turns: int = OV
     return chosen[::-1]
 
 
+def neutralise(text: str) -> str:
+    """Keep conversation text from closing or opening a message tag."""
+    return text.replace("</message", "</ message").replace("<message", "< message")
+
+
 def render(context: list[Segment], chunk: Chunk, items: dict[str, list[dict]], limits: dict[str, int]) -> str:
     lines = ["Live memory (edit entries by id):"]
     for target in ("user", "memory"):
@@ -126,5 +131,5 @@ def render(context: list[Segment], chunk: Chunk, items: dict[str, list[dict]], l
             attrs += " context-only"
         elif segment.start or segment.end < segment.total:
             attrs += f" chars={segment.start}-{segment.end}/{segment.total}"
-        lines += [f"<message {attrs}>", segment.text, "</message>"]
+        lines += [f"<message {attrs}>", neutralise(segment.text), "</message>"]
     return "\n".join(lines)

@@ -143,6 +143,9 @@ class MemoryReviewer:
             await self.store.discard_review(claim, gone)
             return
         profile = await self.store.get_profile(job.profile_id)
+        if profile is None:
+            await self.store.discard_review(claim, "profile_gone")
+            return
         if ({"provider": job.provider, "model": job.model} not in profile.models
                 or job.provider not in self.providers.names()):
             raise _Failed("model_unavailable", "The run's model is no longer enabled for this profile.", retry=False)
@@ -175,6 +178,7 @@ class MemoryReviewer:
                                    tools=tools, reasoning_effort="low", max_output_tokens=OUTPUT_TOKENS,
                                    cache_scope="")
             calls, text, reasoning = [], [], []
+            cut_off = False
             async for event in stream_with_retries(provider, request, sleep=self.sleep,
                                                    context=f"memory review {job.id}"):
                 if isinstance(event, TextDelta):
@@ -185,8 +189,11 @@ class MemoryReviewer:
                     reasoning.append(event.item)
                 elif isinstance(event, Completed):
                     state.usage = state.usage + event.usage
+                    cut_off = cut_off or event.status == "incomplete"
             messages.append(Message("assistant", (TextPart("".join(text)),) if text else (), tool_calls=tuple(calls),
                                     reasoning=tuple(reasoning)))
+            if cut_off:
+                raise _Failed("incomplete", "The review's response was cut off.", retry=True)
             if not calls:
                 outcome = await self.store.commit_review(claim, stage.proposals(), end=end, done=chunk.done,
                                                          evidence=chunk.last_message,

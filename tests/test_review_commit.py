@@ -3,6 +3,7 @@ owner are current and the targets it touched have not moved (cross-session memor
 
 from keel.memory import Change, Slot
 from keel.models import Message, TextPart
+from keel.review_input import build_chunk
 from keel.store.base import MemorySource
 
 LEASE = 30.0
@@ -143,3 +144,37 @@ async def test_review_memory_reads_slots_and_revisions_together(store, clock):
     slots, revisions = await store.review_memory("p1")
     assert [slot.text for slot in slots["user"]] == ["likes tea"] and slots["memory"] == []
     assert revisions == {"user": 1, "memory": 0}
+
+
+async def test_a_conflict_is_recorded_as_a_conflict_not_a_commit(store, clock):
+    claim, user, reply = await setup(store, clock)
+    await store.apply_memory("p1", "user", 1375, [{"action": "add", "content": "likes coffee"}])
+    assert await store.commit_review(claim, add("likes tea"), end=(reply.id, 0), done=True, evidence=user.id,
+                                     usage={"attempt": 1, "outcome": "committed"}) == "conflict"
+    [job] = await store.list_reviews("p1")
+    assert [entry["outcome"] for entry in job.usage] == ["conflict"]
+
+
+async def test_chunks_present_every_code_point_once_and_the_cursor_follows_whole_messages(store, clock):
+    text = " ".join(f"w{i}" for i in range(120))  # several chunks of 40 tokens
+    claim, user, reply = await setup(store, clock, text=text)
+    seen: dict[int, str] = {}
+    reviewed = []
+    while True:
+        rows, complete = await store.review_rows(claim, limit=1)
+        chunk = build_chunk(rows, cursor_message=claim.job.cursor_message, cursor_offset=claim.job.cursor_offset,
+                            through=claim.job.source_through, complete=complete, tokens=40)
+        for segment in chunk.segments:
+            assert segment.start == len(seen.get(segment.message_id, ""))
+            seen[segment.message_id] = seen.get(segment.message_id, "") + segment.text
+        assert await store.commit_review(claim, {}, end=(chunk.end_message, chunk.end_offset), done=chunk.done,
+                                         evidence=None, usage=None) == "committed"
+        state = await store.db.fetchrow("SELECT reviewed_through FROM memory_reviews WHERE session_id = 's1'")
+        reviewed.append(state["reviewed_through"])
+        if chunk.done:
+            break
+        claim = await store.claim_review("w1", LEASE, **RULES)
+    assert seen == {user.id: text, reply.id: "Noted."}
+    assert reviewed[0] == user.id - 1  # the split message is not yet examined
+    assert reviewed[-1] == claim.job.source_through == reply.id
+    assert reviewed == sorted(reviewed) and len(reviewed) > 2

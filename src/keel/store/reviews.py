@@ -297,6 +297,7 @@ class ReviewStoreMixin:
                 "next_attempt_at = ?, finished_at = NULL, updated_at = ? WHERE id = ? RETURNING *",
                 await self.coordination_now(), self.clock(), job_id)
             return _job(updated)
+
     async def review_rows(self, claim: ReviewClaim, *, limit: int = 200) -> tuple[list[SourceRow], bool]:
         job = claim.job
         rows = await self.db.fetch(
@@ -319,6 +320,10 @@ class ReviewStoreMixin:
         """Apply a complete staged proposal, the job's progress and the session cursor atomically. Nothing is written
         unless this claim still holds its lease, its owner is current and every touched target is unchanged."""
         job = claim.job
+
+        def entry(outcome: str) -> dict | None:  # a refused commit must not be recorded as a committed one
+            return None if usage is None else {**usage, "outcome": outcome}
+
         async with self.db.transaction():
             await self.lock_profile(job.profile_id)
             row = await self._owned_review(claim)
@@ -328,12 +333,12 @@ class ReviewStoreMixin:
                                            claim.profile_incarnation)
             if gone is not None:
                 await self._settle_review(row, "discarded", code=gone, message="The review's owner changed.",
-                                          usage=usage)
+                                          usage=entry("discarded"))
                 return "discarded"
             for target, (revision, _, _, _) in proposals.items():
                 if await self._memory_revision(job.profile_id, target) != revision:
                     await self._retry_or_fail(row, "conflict", "Memory changed while the review ran.", retry=True,
-                                              usage=usage)
+                                              usage=entry("conflict"))
                     return "conflict"
             source = MemorySource("review", session_id=job.session_id, message_id=evidence)
             key = f"review:{job.id}:{row['cursor_message']}:{row['cursor_offset']}"
@@ -344,7 +349,8 @@ class ReviewStoreMixin:
                 await self._settle_review(row, "done", usage=usage, cursor=(job.source_through, 0))
                 reviewed = job.source_through
             else:
-                await self._settle_review(row, "pending", usage=usage, attempts=0, next_attempt_at=now, cursor=end)
+                await self._settle_review(row, "pending", usage=usage, attempts=0, next_attempt_at=now,
+                                          cursor=end)
                 reviewed = end[0]
             await self.db.execute(
                 "UPDATE memory_reviews SET reviewed_through = GREATEST(reviewed_through, ?) "
