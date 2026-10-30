@@ -405,3 +405,37 @@ async def test_the_title_covers_the_conversation_when_its_first_run_did_not_comp
     title_request = provider.requests[-1]
     assert OPENING in title_request.messages[0].text and "hello" in title_request.messages[0].text
     assert (await store.get_session("p1", "s1")).title == "Pool exhausts under load"
+
+
+async def test_a_memory_write_records_the_run_its_user_message_and_the_tool_call(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    provider.script = [[ToolCallReady(ToolCall("c1", "memory", json.dumps(
+        {"action": "add", "target": "user", "content": "The user likes tea"}))), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    run = await start(store)
+    await executor.execute(run)
+    [item] = await store.memory_items("p1")
+    assert (item.source_kind, item.run_id, item.session_id) == ("foreground", run.id, "s1")
+    assert item.message_id == await store.run_user_message_id("s1", run.id)
+    row = await store.db.fetchrow("SELECT tool_call_id FROM memory_changes WHERE entry_id = ?", item.id)
+    assert row["tool_call_id"] == "c1"
+    result = json.loads(provider.requests[1].messages[-1].text)
+    assert result["items"] == [{"id": item.id, "text": "The user likes tea", "version": 1}]
+
+
+async def test_the_memory_list_action_returns_ids_and_versions_without_writing(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    await store.apply_memory("p1", "memory", 2200, [{"action": "add", "content": "uses uv"}])
+    provider.script = [[ToolCallReady(ToolCall("c1", "memory", json.dumps({"action": "list", "target": "memory"}))),
+                        Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store))
+    listed = json.loads(provider.requests[1].messages[-1].text)
+    [item] = await store.memory_items("p1")
+    assert listed["memory"]["items"] == [{"id": item.id, "text": "uses uv", "version": 1}]
+    assert listed["user"]["items"] == [] and listed["memory"]["usage"] == "7/2200"
+    assert len(await store.db.fetch("SELECT id FROM memory_changes")) == 1

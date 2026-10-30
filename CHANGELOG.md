@@ -7,12 +7,18 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
 - `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
   `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
   per-case PostgreSQL and MongoDB restores on an internal network with read-only roles, and unit tests. It runs
   outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
 
 ### Changed
+- Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
+  user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
+  memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,
+  and a repeated tool call is applied once. Migration 8 drops the old `memories` table, so every instance must run
+  this version before memory is written again (no mixed-version rollout for memory); a downgrade is not supported.
 - **Breaking:** PostgreSQL is now the only supported database, including local development. `KEEL_DATABASE_URL`
   must use `postgresql://` or `postgres://`; SQLite URLs are rejected. Existing PostgreSQL databases continue to
   upgrade in place through numbered migrations.

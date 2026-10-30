@@ -107,6 +107,31 @@ class StoredMessage:
 
 
 @dataclass(frozen=True)
+class MemorySource:
+    """Who committed a memory change. Set from trusted context, never from model arguments."""
+    kind: str  # "foreground", "review", "consumer" or "legacy"
+    run_id: str | None = None
+    session_id: str | None = None
+    message_id: int | None = None
+    tool_call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryItem:
+    """An active memory entry with the source of its latest change."""
+    id: str
+    target: str
+    text: str
+    version: int
+    created_at: float
+    updated_at: float
+    source_kind: str | None
+    run_id: str | None
+    session_id: str | None
+    message_id: int | None
+
+
+@dataclass(frozen=True)
 class ImportResult:
     """What SqlStore.import_session did with one conversation."""
 

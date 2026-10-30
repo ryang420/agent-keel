@@ -495,21 +495,21 @@ async def test_memory_writes_are_a_transaction(store):
 
     # The row already exists, and the read pauses, so the two adds overlap. A lost update keeps only one of them.
     await store.apply_memory("p3", "memory", 100, [{"action": "add", "content": "base"}])
-    original = store.db.fetchrow
+    original = store.db.fetch
 
     async def pausing(sql, *args):
-        row = await original(sql, *args)
-        if "FROM memories" in sql:
+        rows = await original(sql, *args)
+        if "FROM memory_entries" in sql:
             await asyncio.sleep(0.1)
-        return row
+        return rows
 
-    store.db.fetchrow = pausing
+    store.db.fetch = pausing
     try:
         await asyncio.gather(
             store.apply_memory("p3", "memory", 100, [{"action": "add", "content": "left"}]),
             store.apply_memory("p3", "memory", 100, [{"action": "add", "content": "right"}]))
     finally:
-        store.db.fetchrow = original
+        store.db.fetch = original
     assert sorted((await store.memory_entries("p3"))["memory"]) == ["base", "left", "right"]
 
 

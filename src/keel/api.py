@@ -19,12 +19,13 @@ from keel.config import tenant_id_for
 from keel.deletion import (
     ProfileDeletionBusyError, ProfileDeletionService, ProfileDeletionUnavailableError,
 )
+from keel.memory import joined
 from keel.models import part_to_dict, ImagePart, TextPart
 from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict, profile_mount_root
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
-    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileTenantMismatch,
-    SessionBusy, SessionNotFound, TitleInUse,
+    ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch,
+    ProfileTenantMismatch, MemorySource, SessionBusy, SessionNotFound, TitleInUse,
 )
 from keel.titles import sanitize_title
 from keel.verify import VerifyError, verify_model
@@ -102,6 +103,13 @@ def message_json(stored) -> dict:
         "tool_call_id": message.tool_call_id, "tool_name": message.tool_name,
         "run_id": stored.run_id, "created_at": stored.created_at,
     }
+
+
+def memory_item_json(item) -> dict:
+    """Serialize an active memory entry with the source of its latest change."""
+    return {"id": item.id, "text": item.text, "version": item.version, "created_at": item.created_at,
+            "updated_at": item.updated_at, "source": {"kind": item.source_kind, "run_id": item.run_id,
+                                                      "session_id": item.session_id, "message_id": item.message_id}}
 
 
 def session_json(session) -> dict:
@@ -618,6 +626,76 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(409, "session_busy", "Stop the run in progress before deleting the session.")
         if not deleted:
             raise ApiError(404, "session_not_found", "No such session.")
+        return {"deleted": True}
+
+    def memory_limits(request: Request) -> dict[str, int]:
+        executor = k(request).executor
+        return {"memory": executor.memory_chars, "user": executor.user_chars}
+
+    async def change_memory(request: Request, profile, entry_id: str, op: dict):
+        """Apply one consumer change to an entry the profile owns; map refusals to HTTP errors."""
+        store = k(request).store
+        item = await store.memory_item(profile.id, entry_id)
+        if item is None:
+            raise ApiError(404, "memory_not_found", "No such memory entry.")
+        try:
+            result = await store.apply_memory(profile.id, item.target, memory_limits(request)[item.target],
+                                              [{**op, "entry_id": entry_id}], source=MemorySource("consumer"),
+                                              profile_incarnation=profile.incarnation)
+        except ProfileIncarnationMismatch:
+            raise ApiError(404, "profile_not_found", "No such profile.") from None
+        if not result["success"]:
+            code = result.get("code")
+            if code == "not_found":
+                raise ApiError(404, "memory_not_found", "No such memory entry.")
+            if code == "version_conflict":
+                raise ApiError(409, "version_conflict", result["error"])
+            raise ApiError(400, "invalid_input", result["error"])
+        if op["action"] == "remove":
+            return None
+        # A replace keeps the entry's id; read it back once and treat a concurrent removal as not found.
+        current = await store.memory_item(profile.id, entry_id)
+        if current is None:
+            raise ApiError(404, "memory_not_found", "No such memory entry.")
+        return current
+
+    def version_arg(value) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ApiError(400, "invalid_input", "expected_version must be an integer.")
+        return value
+
+    @app.get("/v1/profiles/{profile_id}/memory")
+    async def get_memory(request: Request, profile_id: str):
+        """List the profile's active memory entries per target, with usage against the budget and each entry's
+        latest source. Works whether or not memory is enabled."""
+        await profile_or_404(request, profile_id)
+        items = await k(request).store.memory_items(profile_id)
+        body = {}
+        for target, limit in memory_limits(request).items():
+            mine = [item for item in items if item.target == target]
+            body[target] = {"usage": f"{len(joined([item.text for item in mine]))}/{limit}",
+                            "entries": [memory_item_json(item) for item in mine]}
+        return body
+
+    @app.patch("/v1/profiles/{profile_id}/memory/{entry_id}")
+    async def patch_memory(request: Request, profile_id: str, entry_id: str):
+        """Replace an entry's text if it is still at expected_version: 404 memory_not_found, 409 version_conflict,
+        400 invalid_input for a refused text (secret, injection, budget)."""
+        profile = await profile_or_404(request, profile_id)
+        body = await _json_body(request)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError(400, "invalid_input", "text must be a non-empty string.")
+        op = {"action": "replace", "content": text, "expected_version": version_arg(body.get("expected_version"))}
+        return memory_item_json(await change_memory(request, profile, entry_id, op))
+
+    @app.delete("/v1/profiles/{profile_id}/memory/{entry_id}")
+    async def delete_memory(request: Request, profile_id: str, entry_id: str, expected_version: int | None = None):
+        """Remove an entry if it is still at expected_version. History stays in the ledger."""
+        profile = await profile_or_404(request, profile_id)
+        if expected_version is None:
+            raise ApiError(400, "invalid_input", "expected_version is required.")
+        await change_memory(request, profile, entry_id, {"action": "remove", "expected_version": expected_version})
         return {"deleted": True}
 
     return app

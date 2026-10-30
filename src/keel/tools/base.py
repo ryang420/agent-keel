@@ -64,6 +64,8 @@ class ToolContext:
     profile_id: str = ""
     profile_incarnation: str | None = None
     session_id: str = ""
+    run_id: str = ""
+    memory_source: str = "foreground"  # "review" for a background review; recorded as the change's source
     memory_chars: int = 2200
     user_chars: int = 1375
 

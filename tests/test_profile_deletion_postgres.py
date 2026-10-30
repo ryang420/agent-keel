@@ -57,10 +57,9 @@ async def test_a_paused_writer_is_serialized_with_the_deletion_fence(pg_dsn):
                 entered.set()  # admitted, but not yet written
                 await release.wait()
                 await writer_store.db.execute(
-                    "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT (profile_id, target) DO UPDATE SET entries = excluded.entries, "
-                    "updated_at = excluded.updated_at",
-                    profile_id, target, '["old writer committed after purge"]', 1.0)
+                    "INSERT INTO memory_entries (id, profile_id, target, position, text, version, state, "
+                    "created_at, updated_at) VALUES (?, ?, ?, 0, ?, 1, 'active', 1.0, 1.0)",
+                    "late-entry", profile_id, target, "old writer committed after purge")
                 return {"success": True, "entries": []}
 
         writer_store.apply_memory = paused_apply_memory

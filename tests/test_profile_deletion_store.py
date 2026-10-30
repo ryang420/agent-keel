@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
-from keel.store.base import ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch, ProfileTenantMismatch
+from keel.store.base import (
+    MemorySource, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch, ProfileTenantMismatch,
+)
 
 MODELS = [{"provider": "fake", "model": "m"}]
 OP_A = "11111111-1111-4111-8111-111111111111"
@@ -227,7 +229,9 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
                                      input_parts=[{"type": "text", "text": "hi"}], instructions=None)
         await store.append_message(f"{profile}-s", run.id, _message())
         await store.put_blob(profile, f"{profile}-s", "text/plain", "aGk=")
-        await store.apply_memory(profile, "user", 10, [{"action": "add", "content": "likes tea"}])
+        await store.apply_memory(profile, "user", 10, [{"action": "add", "content": "likes tea"}],
+                                 source=MemorySource("foreground", run_id=run.id, session_id=f"{profile}-s"),
+                                 mutation_key=f"foreground:{run.id}:c1")
 
     record = await store.begin_profile_deletion("p1", 1, OP_A)
     record = await store.advance_profile_deletion(record, "draining")
@@ -236,6 +240,9 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
     assert await store.get_profile("p1") is None
     assert await store.list_sessions("p1") == []
     assert await store.memory_entries("p1") == {"memory": [], "user": []}
+    for table in ("memory_entries", "memory_changes", "memory_revisions", "memory_mutations"):
+        assert await store.db.fetchrow(f"SELECT 1 AS n FROM {table} WHERE profile_id = ?", "p1") is None
+        assert await store.db.fetchrow(f"SELECT 1 AS n FROM {table} WHERE profile_id = ?", "p2") is not None
 
     assert await store.get_profile("p2") is not None
     assert len(await store.list_sessions("p2")) == 1

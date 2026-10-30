@@ -7,7 +7,6 @@ import time
 import uuid
 from typing import Callable, Sequence
 
-from keel.memory import apply_entries
 from keel.models import (
     Message, Usage, part_from_dict, part_to_dict, reasoning_from_dict, reasoning_to_dict,
     tool_call_from_dict, tool_call_to_dict,
@@ -20,6 +19,7 @@ from keel.store.base import (
 )
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
+from keel.store.memory import MemoryStoreMixin
 from keel.store.migrations import migrate
 from keel.store.sandboxes import SandboxStoreMixin
 from keel.store.deletions import ProfileDeletionAuthority, ProfileDeletionStoreMixin
@@ -75,7 +75,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
+class SqlStore(MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
@@ -196,35 +196,6 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             raise SandboxBusy("the profile has unresolved sandbox lifecycle work")
 
     # memory
-
-    async def apply_memory(self, profile_id: str, target: str, limit: int, ops: list[dict], *,
-                           profile_incarnation: str | None = None) -> dict:
-        """Read, modify and write one target in a single transaction (a row lock on Postgres)."""
-        if target not in ("memory", "user"):
-            return {"success": False, "error": "target must be memory or user.", "entries": []}
-        async with self.db.transaction():
-            await self.lock_profile(profile_id)
-            await self.assert_profile_admitted(profile_id)
-            await self._check_profile_incarnation(profile_id, profile_incarnation)
-            await self.db.execute(
-                "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, '[]', ?) "
-                "ON CONFLICT (profile_id, target) DO NOTHING",
-                profile_id, target, self.clock())
-            lock = " FOR UPDATE"
-            row = await self.db.fetchrow(
-                f"SELECT entries FROM memories WHERE profile_id = ? AND target = ?{lock}", profile_id, target)
-            current = json.loads(row["entries"])
-            updated, result = apply_entries(current, ops, limit)
-            if result["success"] and updated != current:
-                await self.db.execute(
-                    "UPDATE memories SET entries = ?, updated_at = ? WHERE profile_id = ? AND target = ?",
-                    _j(updated), self.clock(), profile_id, target)
-            return result
-
-    async def memory_entries(self, profile_id: str) -> dict[str, list[str]]:
-        rows = await self.db.fetch("SELECT target, entries FROM memories WHERE profile_id = ?", profile_id)
-        found = {row["target"]: json.loads(row["entries"]) for row in rows}
-        return {"memory": found.get("memory", []), "user": found.get("user", [])}
 
     async def reset_memory_turns(self, session_id: str, *, profile_incarnation: str | None = None) -> None:
         async with self.db.transaction():
@@ -402,6 +373,11 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             await self.db.execute("DELETE FROM runs WHERE session_id = ?", session_id)
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", session_id)
             await self.db.execute("DELETE FROM blobs WHERE session_id = ?", session_id)
+            await self.db.execute(
+                "UPDATE memory_changes SET run_id = NULL, session_id = NULL, message_id = NULL, tool_call_id = NULL "
+                "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            await self.db.execute(
+                "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute("DELETE FROM sessions WHERE id = ?", session_id)
         return True
 
