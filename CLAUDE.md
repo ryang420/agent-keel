@@ -17,8 +17,9 @@ milestones) and `docs/design/2026-10-12-m2-agent-loop.md` (the agent loop, tools
   `git config user.email` before the first commit of a session.
 - Test fixtures that look like credentials are built from pieces at runtime (`"hunter" + "2"`, `"AKIA" + "…"`), so
   secret scanners stay quiet. Never commit a real credential, and never print credentials or environment dumps.
-- Pushing, tagging and anything that publishes (GitHub releases, the GHCR image) needs the owner's go-ahead. The
-  owner pushes; this machine has no GitHub credentials (`! git push` from the prompt).
+- Pushing, opening or merging a PR, tagging and anything that publishes (GitHub releases, the GHCR image) needs
+  the owner's explicit go-ahead for that change. With it, use `git push` and `gh`; merge a PR only after its CI
+  passes, with a merge commit (`gh pr merge --merge`).
 
 ## Develop
 
@@ -79,7 +80,12 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
   reliability and fault-injection tests, explicit tenant ownership with independent profiles (§12), complete
   profile deletion, the coordinated sandbox lifecycle, and Claude models on the `bedrock` provider
   (`docs/design/2026-10-23-bedrock-anthropic-messages.md`).
-- No milestone is open in keel itself; M4 (history import and cutover) is consumer-specific.
+- Open work: cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`) and, on top of it,
+  procedural learning (`docs/design/2026-10-29-procedural-learning.md`), both approved 2026-10-29. Memory
+  entries, the change ledger, memory tool v2 and the memory API are merged (`[Unreleased]`, migration 8); next
+  are the history index and `session_search`, then the durable review queue, memory acceptance, and the learning
+  plans (learned skills, observations and feedback, dream, learning acceptance).
+- M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
   hands a running command's cleanup to the executor's cancel path.
