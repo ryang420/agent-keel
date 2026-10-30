@@ -61,7 +61,7 @@ async def test_a_reviewed_preference_reaches_a_fresh_session_and_not_an_open_one
     commit, and not in a session whose prompt was frozen before it."""
     store.coordination_clock = clock
     await memory_profile(store)
-    provider = FakeProvider(script=[OK, save("Prefers the conclusion first"), NOTHING, OK])
+    provider = FakeProvider(script=[OK, save("Prefers the conclusion first"), NOTHING, OK, OK])
     executor, reviewer = parts(store, provider)
     await turn(store, executor, "a", "From now on, give me the conclusion first.")
     before = (await store.get_session("p1", "a")).system_prompt
@@ -71,6 +71,8 @@ async def test_a_reviewed_preference_reaches_a_fresh_session_and_not_an_open_one
     assert "Prefers the conclusion first" in provider.requests[-1].system
     assert "Prefers the conclusion first" not in before
     assert (await store.get_session("p1", "a")).system_prompt == before
+    await turn(store, executor, "a", "And again.")
+    assert provider.requests[-1].system == before
 
 
 async def test_a_correction_leaves_only_the_corrected_fact_for_a_fresh_session(store, clock):
@@ -100,6 +102,8 @@ async def test_a_short_session_is_reviewed_once_after_a_restart(pg_dsn, clock):
         await memory_profile(first)
         executor, _ = parts(first, FakeProvider(script=[OK]))
         await turn(first, executor, "s1", "I work in UTC.")
+        early = MemoryReviewer(first, _registry(FakeProvider(script=[])), ReviewSettings(), sleep=no_sleep)
+        assert not await early.run_once("w1")
     finally:
         await first.close()
     clock.now += 60
@@ -123,8 +127,10 @@ def _registry(provider):
 
 
 async def test_two_instances_never_run_two_reviews_for_one_profile_or_duplicate_jobs(pg_dsn, clock):
-    """§7 row 11: two stores on one database claim at the same moment; at most one review runs per profile and each
-    session has at most one open job."""
+    """§7 row 11, two-instance half (the foreground-correction race is
+    tests/test_review_commit.py::test_a_foreground_write_to_a_touched_target_is_a_conflict): two stores on one
+    database claim at the same moment; at most one review runs per profile and each session has at most one open
+    job."""
     one = await open_store(pg_dsn, clock=clock, coordination_clock=clock)
     two = await open_store(pg_dsn, clock=clock, coordination_clock=clock)
     try:
@@ -146,7 +152,8 @@ async def test_two_instances_never_run_two_reviews_for_one_profile_or_duplicate_
 
 
 async def test_a_committed_review_is_never_applied_twice(store, clock):
-    """§7 row 10: once a review committed, a worker that dies afterwards leaves nothing to redo: no job is claimable
+    """§7 row 10, committed half (a crash before commit is covered by the fault-injection tests): once a review
+    committed, a worker that dies afterwards leaves nothing to redo: no job is claimable
     and the fact is stored once."""
     store.coordination_clock = clock
     await memory_profile(store)
@@ -166,9 +173,12 @@ async def test_two_turns_keep_prompt_and_tool_bytes_and_make_no_extra_model_call
     store.coordination_clock = clock
     await memory_profile(store)
     provider = FakeProvider(script=[save("Works in UTC"), OK, OK])
-    executor, _ = parts(store, provider)
+    background = Background()
+    registry = _registry(provider)
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep, background=background)
     await turn(store, executor, "s1", "I work in UTC.")
     await turn(store, executor, "s1", "Thanks.")
+    await background.close()
     assert len(provider.requests) == 3
     systems = {request.system for request in provider.requests}
     tools = {json.dumps(request.tools, sort_keys=True) for request in provider.requests}

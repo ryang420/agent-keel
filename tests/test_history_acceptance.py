@@ -70,16 +70,14 @@ async def test_compacted_messages_stay_searchable_and_search_leaves_the_session_
     change the session's compaction state."""
     await profile(store)
     old = await say(store, "long", "The codename is BLUE HERON.")
-    await say(store, "long", "Noted.", role="assistant")
-    await store.db.execute("UPDATE messages SET active = 0 WHERE session_id = 'long'")
-    await store.db.execute("UPDATE sessions SET summary = 'earlier work', summary_head_id = ?, summary_tail_id = ? "
-                           "WHERE id = 'long'", old.id, old.id + 1)
+    tail = await say(store, "long", "Noted.", role="assistant")
+    await store.compact_session("long", summary="earlier work", head_id=old.id, tail_id=tail.id,
+                                system_prompt="compacted prompt")
     before = await store.get_session("p1", "long")
     error, result = await search(await context(store), query="codename heron")
     assert not error and [h["message_id"] for h in result["hits"]] == [old.id]
     assert await store.get_session("p1", "long") == before
-    rows = await store.db.fetch("SELECT active FROM messages WHERE session_id = 'long'")
-    assert {row["active"] for row in rows} == {0}
+    assert before.summary == "earlier work" and before.system_prompt == "compacted prompt"
 
 
 async def test_a_long_message_reads_back_exactly_in_bounded_chunks(store):
@@ -89,11 +87,14 @@ async def test_a_long_message_reads_back_exactly_in_bounded_chunks(store):
     message = await say(store, "old", text)
     ctx = await context(store)
     pieces, offset = [], 0
-    while offset is not None:
+    for _ in range(20):
         error, chunk = await search(ctx, message_id=message.id, offset=offset)
         assert not error and len(chunk["text"]) <= 4000
         pieces.append(chunk["text"])
         offset = chunk["next_offset"]
+        if offset is None:
+            break
+    assert offset is None and len(pieces) > 1
     assert "".join(pieces) == text
 
 
@@ -110,10 +111,10 @@ async def test_no_owner_crossing_through_query_anchor_offset_or_listing(store):
     error, result = await search(ctx, query="zebracorn")
     assert [h["message_id"] for h in result["hits"]] == [mine.id]
     missing = await search(ctx, message_id=10**12, offset=10)
-    for foreign in (same_tenant, other_tenant):
+    for foreign, session in ((same_tenant, "theirs"), (other_tenant, "far")):
         assert await search(ctx, message_id=foreign.id, offset=10) == missing
-        _, around = await search(ctx, session_id="far", around_message_id=foreign.id)
-        assert "zebracorn" not in json.dumps(around)
+        assert await search(ctx, session_id=session, around_message_id=foreign.id) == await search(
+            ctx, session_id=session, around_message_id=10**12)
     _, listing = await search(ctx)
     assert {s["session_id"] for s in listing["sessions"]} <= {"mine", "now"}
 
@@ -122,6 +123,8 @@ async def test_a_recreated_profile_finds_nothing_of_its_previous_incarnation(sto
     """§7 row 12: after a profile is deleted and created again, search finds none of the old history."""
     await profile(store)
     await say(store, "old", "The codename is BLUE HERON.")
+    error, before = await search(await context(store), query="codename heron")
+    assert not error and len(before["hits"]) == 1
     record = await store.begin_profile_deletion("p1", 1, "op-1")
     record = await store.advance_profile_deletion(record, "draining")
     await store.purge_profile_data(record)
