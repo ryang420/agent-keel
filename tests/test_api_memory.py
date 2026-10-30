@@ -105,3 +105,61 @@ async def test_a_stale_profile_incarnation_answers_404_profile_not_found(client,
     delete = await http.delete(f"/v1/profiles/p1/memory/{item.id}?expected_version=1")
     for response in (patch, delete):
         assert response.status_code == 404 and response.json()["error"]["code"] == "profile_not_found"
+
+
+async def failed_review(store, clock):
+    """A finished run whose review failed for good: the job the routes show and retry."""
+    from keel.models import Message, TextPart
+
+    store.coordination_clock = clock
+    await store.ensure_session("p1", "s1")
+    run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                 instructions=None)
+    await store.append_message("s1", run.id, Message("user", (TextPart("I prefer tea"),)))
+    await store.finish_run(run.id, "completed", output="")
+    claim = await store.claim_review("w1", 30.0, turns=1, idle_seconds=60.0, max_age_seconds=600.0)
+    await store.fail_review(claim, "budget", "The review ran out of its input budget.", retry=False,
+                            usage={"attempt": 1, "outcome": "budget", "requests": 0, "usage": {}})
+    return claim.job.id
+
+
+async def test_reviews_list_status_without_transcript_and_retry_once(client, clock):
+    http, store = client
+    job_id = await failed_review(store, clock)
+    body = (await http.get("/v1/profiles/p1/memory/reviews")).json()
+    [review] = body["reviews"]
+    assert (review["id"], review["status"], review["error_code"], review["session_id"]) == (
+        job_id, "failed", "budget", "s1")
+    assert "I prefer tea" not in str(body)
+    assert set(review) == {"id", "session_id", "status", "attempts", "error_code", "error", "provider", "model",
+                           "source", "cursor", "usage", "created_at", "updated_at", "finished_at"}
+    retried = await http.post(f"/v1/profiles/p1/memory/reviews/{job_id}/retry")
+    assert retried.status_code == 200 and retried.json()["status"] == "pending"
+    again = await http.post(f"/v1/profiles/p1/memory/reviews/{job_id}/retry")
+    assert again.status_code == 200 and again.json()["status"] == "pending"
+    assert [r["status"] for r in (await http.get("/v1/profiles/p1/memory/reviews?status=pending")).json()[
+        "reviews"]] == ["pending"]
+
+
+async def test_review_routes_are_owned_and_validated(client, clock):
+    http, store = client
+    job_id = await failed_review(store, clock)
+    assert (await http.post("/v1/profiles/p1/memory/reviews/nope/retry")).status_code == 404
+    other = {"Authorization": "Bearer key-two"}
+    assert (await http.get("/v1/profiles/p1/memory/reviews", headers=other)).status_code == 404
+    assert (await http.post(f"/v1/profiles/p1/memory/reviews/{job_id}/retry", headers=other)).status_code == 404
+    assert (await http.get("/v1/profiles/p1/memory/reviews?status=bogus")).status_code == 400
+    assert (await http.get("/v1/profiles/p1/memory/reviews?limit=0")).status_code == 400
+    assert (await http.get("/v1/profiles/p1/memory/reviews?limit=101")).status_code == 400
+
+
+async def test_retry_refuses_finished_and_orphaned_reviews(client, clock):
+    http, store = client
+    job_id = await failed_review(store, clock)
+    await store.db.execute("UPDATE sessions SET generation = 'other' WHERE id = 's1'")
+    gone = await http.post(f"/v1/profiles/p1/memory/reviews/{job_id}/retry")
+    assert gone.status_code == 409 and gone.json()["error"]["code"] == "review_source_gone"
+    await store.db.execute("UPDATE memory_review_jobs SET status = 'done' WHERE id = ?", job_id)
+    done = await http.post(f"/v1/profiles/p1/memory/reviews/{job_id}/retry")
+    assert done.status_code == 409 and done.json()["error"]["code"] == "review_not_retryable"

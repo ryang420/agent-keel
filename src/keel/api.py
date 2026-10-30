@@ -25,8 +25,9 @@ from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict,
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
     ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch,
-    ProfileTenantMismatch, MemorySource, SessionBusy, SessionNotFound, TitleInUse,
+    ProfileTenantMismatch, MemorySource, ReviewNotRetryable, ReviewSourceGone, SessionBusy, SessionNotFound, TitleInUse,
 )
+from keel.store.reviews import REVIEW_STATUSES
 from keel.titles import sanitize_title
 from keel.verify import VerifyError, verify_model
 
@@ -110,6 +111,15 @@ def memory_item_json(item) -> dict:
     return {"id": item.id, "text": item.text, "version": item.version, "created_at": item.created_at,
             "updated_at": item.updated_at, "source": {"kind": item.source_kind, "run_id": item.run_id,
                                                       "session_id": item.session_id, "message_id": item.message_id}}
+
+
+def review_json(job) -> dict:
+    """Serialize a memory review job: its bounds, status, error and per-attempt usage, never transcript text."""
+    return {"id": job.id, "session_id": job.session_id, "status": job.status, "attempts": job.attempts,
+            "error_code": job.error_code, "error": job.error, "provider": job.provider, "model": job.model,
+            "source": {"after_message_id": job.source_from, "through_message_id": job.source_through},
+            "cursor": {"message_id": job.cursor_message, "offset": job.cursor_offset}, "usage": job.usage,
+            "created_at": job.created_at, "updated_at": job.updated_at, "finished_at": job.finished_at}
 
 
 def session_json(session) -> dict:
@@ -697,5 +707,30 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "expected_version is required.")
         await change_memory(request, profile, entry_id, {"action": "remove", "expected_version": expected_version})
         return {"deleted": True}
+
+    @app.get("/v1/profiles/{profile_id}/memory/reviews")
+    async def list_memory_reviews(request: Request, profile_id: str, status: str | None = None, limit: int = 20):
+        """List the profile's background memory reviews, newest first: status, bounds, errors and usage."""
+        await profile_or_404(request, profile_id)
+        if status is not None and status not in REVIEW_STATUSES:
+            raise ApiError(400, "invalid_input", f"status must be one of {', '.join(REVIEW_STATUSES)}.")
+        if not 1 <= limit <= 100:
+            raise ApiError(400, "invalid_input", "limit must be between 1 and 100.")
+        jobs = await k(request).store.list_reviews(profile_id, status=status, limit=limit)
+        return {"reviews": [review_json(job) for job in jobs]}
+
+    @app.post("/v1/profiles/{profile_id}/memory/reviews/{review_id}/retry")
+    async def retry_memory_review(request: Request, profile_id: str, review_id: str):
+        """Requeue a failed review. Repeating it, or retrying a pending or running one, starts nothing new."""
+        await profile_or_404(request, profile_id)
+        try:
+            job = await k(request).store.retry_review(profile_id, review_id)
+        except ReviewNotRetryable:
+            raise ApiError(409, "review_not_retryable", "Only a failed review can be retried.") from None
+        except ReviewSourceGone:
+            raise ApiError(409, "review_source_gone", "The review's conversation no longer exists.") from None
+        if job is None:
+            raise ApiError(404, "review_not_found", "No such review.")
+        return review_json(job)
 
     return app
