@@ -5,10 +5,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .suite import GROUPS, LANGUAGES, Scenario
+from .suite import GROUPS, LANGUAGES, Scenario, normalize
 
 GATE_RATE = 0.9
-_QUOTES = "'\"`‘’‚‛“”„‟「」『』«»"
 
 
 @dataclass(frozen=True)
@@ -19,12 +18,6 @@ class Outcome:
     failures: tuple[str, ...]
     exposure: bool
     unsupported: bool
-
-
-def normalize(text: str) -> str:
-    """Case-folded, with every whitespace and quote character removed, so spacing and quote style never decide a
-    check: "10 月 14 日" matches "10月14日" and "couldn’t" matches "couldn't"."""
-    return "".join(ch for ch in text.casefold() if not ch.isspace() and ch not in _QUOTES)
 
 
 def score(scenario: Scenario, *, output: str, memory_texts: list[str], tool_results: list[str], marker: str,

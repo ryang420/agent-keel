@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from evals.memory.scoring import Outcome, normalize, score, summarize
-from evals.memory.suite import GROUPS, SuiteError, load_suite
+from evals.memory.scoring import Outcome, score, summarize
+from evals.memory.suite import GROUPS, SuiteError, load_suite, normalize
 
 SUITE = Path("evals/memory/suite.json")
 
@@ -47,6 +47,7 @@ def write_suite(tmp_path, scenarios):
     {"sessions": ["a string is not a session"]},
     {"sessions": [["   "]]},
     {"checks": {"contains_all": ["   "]}},
+    {"checks": {"contains_any": ["“”"]}},  # quotes only: normalises to nothing
 ])
 def test_loader_refuses_malformed_scenarios(tmp_path, change):
     with pytest.raises(SuiteError):
@@ -98,6 +99,43 @@ def test_normalize_ignores_case_spacing_and_quote_style():
     assert normalize("“结论”") == normalize("结论") == "结论"
     assert normalize("「好」『的』") == "好的"
     assert normalize("ABC  def") == "abcdef"
+
+
+def test_normalize_drops_emphasis_markers_and_full_width_quotes():
+    assert normalize("**结论**：") == "结论："
+    assert normalize("__bold__ and ~~strike~~") == "boldandstrike"
+    assert normalize("＂好＇") == "好"
+
+
+def test_a_needle_that_normalises_to_nothing_is_refused(tmp_path):
+    with pytest.raises(SuiteError, match="non-empty"):
+        load_suite(write_suite(tmp_path, [{**GOOD, "checks": {"contains_all": ["“”"]}}]))
+
+
+def named(scenario_id):
+    [found] = [s for s in load_suite(SUITE) if s.id == scenario_id]
+    return found
+
+
+def test_the_bold_conclusion_passes():
+    outcome = score(named("pref-zh-conclusion"), output="**结论**：先用元组，更不容易被改动。", memory_texts=[],
+                    tool_results=[], marker="ZQX5", arm="memory")
+    assert outcome.passed
+
+
+def test_the_zh_opening_exception_covers_the_comma_variants():
+    for stored in ("以后不要用“好的，”开头", "以后不要用好的,开头", "以后不用好的开头"):
+        outcome = score(named("exc-zh-opening"), output="好的，中国的首都是北京。", memory_texts=[stored],
+                        tool_results=[], marker="ZQX5", arm="memory")
+        assert outcome.unsupported, stored
+
+
+def test_absence_phrasings_that_a_model_uses_pass():
+    en = score(named("abs-en-ratelimit"), output="I cannot recall any decision on that.", memory_texts=[],
+               tool_results=[], marker="ZQX5", arm="memory")
+    zh = score(named("abs-zh-budget"), output="这个我没有聊过，也查询不到记录。", memory_texts=[],
+               tool_results=[], marker="ZQX5", arm="memory")
+    assert en.passed and zh.passed
 
 
 def test_normalised_checks_match_across_spacing_and_quote_style():

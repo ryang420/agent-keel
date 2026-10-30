@@ -16,6 +16,15 @@ KINDS_BY_GROUP = {
 }
 LANGUAGES = ("en", "zh")
 CHECKS = ("contains_all", "contains_any", "contains_any_2", "not_contains", "memory_not_contains")
+_QUOTES = "'\"`‘’‚‛“”„‟「」『』«»＂＇"
+_MARKUP = "*_~"
+
+
+def normalize(text: str) -> str:
+    """Case-folded, with every whitespace, quote and emphasis character removed, so spacing, quote style and bold
+    markers never decide a check: "10 月 14 日" matches "10月14日", "couldn’t" matches "couldn't" and "**结论**："
+    matches "结论："."""
+    return "".join(ch for ch in text.casefold() if not ch.isspace() and ch not in _QUOTES and ch not in _MARKUP)
 
 
 class SuiteError(ValueError):
@@ -60,7 +69,7 @@ def _scenario(raw) -> Scenario:
         raise SuiteError(f"scenario {found.id!r} needs non-empty setup sessions")
     if set(found.checks) - set(CHECKS) or not any(found.checks.get(name) for name in CHECKS):
         raise SuiteError(f"scenario {found.id!r} has unknown or no checks")
-    if not all(isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
+    if not all(isinstance(value, list) and all(isinstance(item, str) and normalize(item) for item in value)
                for value in found.checks.values()):
         raise SuiteError(f"scenario {found.id!r}: every check is a list of non-empty strings")
     return found
