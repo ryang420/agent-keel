@@ -108,6 +108,29 @@ class StoredMessage:
 
 
 @dataclass(frozen=True)
+class HistoryRow:
+    """A search candidate: an indexed message, with its session's title and the status of the run that wrote it."""
+    message_id: int
+    session_id: str
+    title: str | None
+    role: str
+    text: str            # the redacted searchable text
+    created_at: float
+    run_status: str | None  # None when the message has no run (imported)
+    hits: int            # distinct query tokens it contains
+
+
+@dataclass(frozen=True)
+class HistoryMessage:
+    """A stored message read for context, with the status of the run that wrote it."""
+    id: int
+    session_id: str
+    message: Message
+    created_at: float
+    run_status: str | None
+
+
+@dataclass(frozen=True)
 class MemorySource:
     """Who committed a memory change. Set from trusted context, never from model arguments."""
     kind: str  # "foreground", "review", "consumer" or "legacy"

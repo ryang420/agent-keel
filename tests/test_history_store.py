@@ -110,3 +110,69 @@ async def test_backfill_does_not_index_a_deleted_session(store):
 async def test_a_profile_without_a_backfill_row_is_complete(store):
     await profile(store)
     assert await store.history_index_complete("p1")
+
+
+async def seed_two_profiles(store):
+    await profile(store, "p1", 1)
+    await profile(store, "p2", 1)
+    for profile_id, session_id in (("p1", "a"), ("p1", "b"), ("p2", "x")):
+        await store.ensure_session(profile_id, session_id)
+    first = await store.append_message("a", None, Message("user", (TextPart("we chose postgres for billing"),)))
+    store.clock.now += 10  # the store fixture's clock is tests/conftest.py's Clock
+    second = await store.append_message("b", None, Message("assistant", (TextPart("postgres again"),)))
+    foreign = await store.append_message("x", None, Message("user", (TextPart("postgres billing secret plan"),)))
+    return first, second, foreign
+
+
+async def test_search_ranks_by_coverage_and_never_crosses_profiles(store):
+    first, second, foreign = await seed_two_profiles(store)
+    rows = await store.search_history("p1", ["postgres", "billing"])
+    assert [(row.message_id, row.hits) for row in rows] == [(first.id, 2), (second.id, 1)]
+    assert rows[0].session_id == "a" and rows[0].role == "user" and rows[0].run_status is None
+    assert [row.message_id for row in await store.search_history("p2", ["postgres"])] == [foreign.id]
+    assert foreign.id not in [row.message_id for row in rows]
+
+
+async def test_search_filters_by_session_and_time_before_choosing_candidates(store, clock):
+    first, second, _ = await seed_two_profiles(store)
+    assert [r.message_id for r in await store.search_history("p1", ["postgres"], session_id="b")] == [second.id]
+    assert [r.message_id for r in await store.search_history("p1", ["postgres"], exclude_session_id="b")] \
+        == [first.id]
+    assert await store.search_history("p1", ["postgres"], session_id="x") == []
+    assert await store.search_history("p1", ["postgres"], before=first.created_at) == []
+    assert [r.message_id for r in await store.search_history("p1", ["postgres"], after=second.created_at)] \
+        == [second.id]
+
+
+async def test_context_returns_neighbours_and_continuation_anchors(store):
+    await profile(store)
+    await store.ensure_session("p1", "s1")
+    ids = [(await store.append_message("s1", None, Message("user", (TextPart(f"m{i}"),)))).id for i in range(9)]
+    messages, earlier, later = await store.history_context("p1", "s1", ids[4], 2)
+    assert [m.id for m in messages] == ids[2:7]
+    assert (earlier, later) == (ids[1], ids[7])
+    messages, earlier, later = await store.history_context("p1", "s1", ids[0], 2)
+    assert [m.id for m in messages] == ids[0:3] and earlier is None
+    latest, earlier, later = await store.history_context("p1", "s1", None, 2)
+    assert [m.id for m in latest] == ids[4:9] and (earlier, later) == (ids[3], None)
+
+
+async def test_context_and_message_reads_refuse_foreign_and_mismatched_ids(store):
+    first, _, foreign = await seed_two_profiles(store)
+    assert await store.history_context("p1", "x", foreign.id, 2) is None
+    assert await store.history_context("p1", "b", first.id, 2) is None  # the anchor is in another session
+    assert await store.history_message("p1", foreign.id) is None
+    assert (await store.history_message("p1", first.id)).message.text == "we chose postgres for billing"
+
+
+async def test_sessions_are_browsed_newest_first_with_time_bounds(store, clock):
+    await profile(store)
+    for name in ("old", "mid", "new"):
+        await store.ensure_session("p1", name)
+        await store.append_message(name, None, Message("user", (TextPart(name),)))
+        clock.now += 10
+    sessions = await store.history_sessions("p1", limit=2)
+    assert [s.id for s in sessions] == ["new", "mid"]
+    mid = sessions[1].last_active_at
+    assert [s.id for s in await store.history_sessions("p1", before=mid, limit=5)] == ["old"]
+    assert [s.id for s in await store.history_sessions("p1", after=mid, limit=5)] == ["new", "mid"]
