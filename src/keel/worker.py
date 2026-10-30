@@ -20,6 +20,7 @@ _MAX_CLAIM_BACKOFF = 10.0
 SHUTDOWN_MESSAGE = "The service was shutting down."
 BACKFILL_BATCH = 200
 BACKFILL_IDLE_S = 30.0
+REVIEW_POLL_S = 5.0
 _BACKGROUND = ("keel-sweeper", "keel-maintenance", "keel-history-backfill")
 
 
@@ -46,7 +47,8 @@ def _confirmed(sent: float, stamp: LeaseStamp) -> float:
 class WorkerPool:
     def __init__(self, store, bus, executor, *, owner: str, workers: int = 4, lease_seconds: float = 30.0,
                  poll_seconds: float = 0.5, clock=time.time, monotonic=time.monotonic,
-                 event_retention_s: float | None = None, maintenance_s: float = 3600.0, coordinator=None) -> None:
+                 event_retention_s: float | None = None, maintenance_s: float = 3600.0, coordinator=None, reviewer=None,
+                 review_workers: int = 1) -> None:
         if coordinator is None and getattr(executor, "coordinator", None) is not None:
             # A legacy claim reserves no usage; a sandbox-enabled worker must claim through the coordinator.
             raise ValueError("a sandbox-enabled executor needs a coordinated worker")
@@ -62,6 +64,8 @@ class WorkerPool:
         self.monotonic = monotonic
         self.event_retention_s = event_retention_s
         self.maintenance_s = maintenance_s
+        self.reviewer = reviewer
+        self.review_workers = review_workers
         self._tasks: list[asyncio.Task] = []
         self._closing = False
         self._stop = asyncio.Event()
@@ -74,6 +78,9 @@ class WorkerPool:
         self._tasks = [asyncio.create_task(self._work(), name=f"keel-worker-{i}") for i in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._sweep(), name="keel-sweeper"))
         self._tasks.append(asyncio.create_task(self._backfill(), name="keel-history-backfill"))
+        if self.reviewer is not None:
+            self._tasks += [asyncio.create_task(self._review(), name=f"keel-memory-review-{i}")
+                            for i in range(self.review_workers)]
         if self.event_retention_s is not None:
             self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
 
@@ -86,7 +93,8 @@ class WorkerPool:
         """
         self._closing = True
         self._stop.set()
-        background = [t for t in self._tasks if t.get_name() in _BACKGROUND]
+        background = [t for t in self._tasks
+                      if t.get_name() in _BACKGROUND or t.get_name().startswith("keel-memory-review")]
         workers = [t for t in self._tasks if t not in background]
         for task in background:
             task.cancel()
@@ -155,6 +163,20 @@ class WorkerPool:
             except Exception:
                 log.exception("pruning old run events failed")
             await self._idle(self.maintenance_s)
+
+    async def _review(self) -> None:
+        """Memory reviews, one at a time per loop, beside the run workers; when none is due, poll every few
+        seconds. A cancel at shutdown gives a running review's job back."""
+        while not self._closing:
+            try:
+                ran = await self.reviewer.run_once(self.owner)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("memory review failed")
+                ran = False
+            if not ran:
+                await self._idle(REVIEW_POLL_S)
 
     async def backfill_once(self) -> int | None:
         return await self.store.backfill_history(BACKFILL_BATCH)
