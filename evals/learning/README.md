@@ -46,9 +46,9 @@ and all six kinds. Its meta records each of these (`full_run`, `suite_tracked`, 
 it is not applicable.
 
 `gate` refuses, with an error, a non-zero exit and no `gate.json`: a result file without meta; a protocol other than
-`learning-eval-v1`; a curve and a conversations run on different providers or models (the curve is openai-only, so the
-conversations run must use openai and the same model); a conversations run that is not gate-applicable; a conversations
-result without both arms; and a curve result that is incomplete or has errors.
+`learning-eval-v1`; a curve and a conversations run on different providers or models (run both on the same provider
+and model); a conversations run that is not gate-applicable; a conversations result without both arms; and a curve
+result that is incomplete or has errors.
 
 ## Conversation protocol
 
@@ -139,7 +139,8 @@ python -m evals.dab prepare
 docker build -t keel-dab-eval:1 evals/dab
 ```
 
-The curve is openai-only, as the DAB harness is; conversations run on either provider.
+Both evaluations run on either provider: `--provider openai` (default for the curve) or `--provider bedrock`, which
+needs `AWS_REGION` or `AWS_DEFAULT_REGION`; no region is assumed.
 
 ## Commands
 
@@ -155,10 +156,10 @@ python -m evals.learning gate --curve .local/evals/learning/curve/<stamp>/result
 `run` options: `--max-tokens` (required), `--arm learning|baseline|both` (default both), `--scenarios a,b` (unknown
 ids fail before anything runs), `--suite`, `--root`, `--database-admin-dsn`. A run that is not gate-applicable (a
 subset, or a suite other than the tracked one) reports the gate as not applicable with the reasons and exits non-zero
-only when a case errored; a gate-applicable run exits non-zero when the conversation gate fails. A bedrock
-conversations run cannot be combined with the openai-only curve.
+only when a case errored; a gate-applicable run exits non-zero when the conversation gate fails.
 
-`curve` options: `--datasets` (comma-separated, file-backed; default the four above), `--repeats` (default 5),
+`curve` options: `--provider openai|bedrock` (default openai), `--datasets` (comma-separated, file-backed; default
+the four above), `--repeats` (default 5),
 `--max-tokens` (required), `--model`, `--dab-root` (default `.local/evals/dab`), `--sandbox docker|none` (default
 docker), `--image`, `--root`, `--database-admin-dsn`. The model and the admin DSN are checked before the run directory
 and the budget ledger are created. It exits non-zero when the run is incomplete or any record errored.

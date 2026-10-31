@@ -261,7 +261,8 @@ async def _sequence(client, keel, charging: Charging, cases: list[Case], *, path
 async def execute_curve(cases: list[Case], *, repo: Path, paths: Paths, ledger: Ledger, mount_root: Path,
                         admin_dsn: str, provider: str, model: str, repeats: int = 3, image: str = DEFAULT_IMAGE,
                         sandbox: str = "docker", providers=None, reasoning_effort: str = "low",
-                        timeout_s: float = 1800.0, max_output: int = 8192, max_iterations: int = 60) -> list[dict]:
+                        timeout_s: float = 1800.0, max_output: int = 8192, max_iterations: int = 60,
+                        aws_region: str | None = None) -> list[dict]:
     datasets: dict[str, list[Case]] = {}
     for case in cases:
         if case.dataset.service_dbms:
@@ -276,8 +277,10 @@ async def execute_curve(cases: list[Case], *, repo: Path, paths: Paths, ledger: 
     async with temporary_database(admin_dsn) as database_url:
         settings = replace(_settings(database_url, mount_root=mount_root, docker="docker",
                                      max_iterations=max_iterations, openai_base_url=None, sandbox=sandbox,
-                                     require_key=providers is None),
+                                     require_key=providers is None and provider == "openai"),
                            memory_review_workers=0)  # only the curve drives reviews and dreams
+        if aws_region:
+            settings = replace(settings, aws_region=aws_region)  # bedrock reaches the model in the region given
         charging = Charging(ledger)
         registry = _budgeted(providers if providers is not None else default_providers(settings), charging,
                              max_output)

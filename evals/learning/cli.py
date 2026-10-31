@@ -163,7 +163,10 @@ async def _curve(args) -> int:
 
     from .curve import execute_curve, summarize_curve
 
-    model = _model(args, "openai")  # the DAB harness is openai-only
+    model = _model(args, args.provider)
+    region = _region() if args.provider == "bedrock" else None
+    if args.provider == "bedrock" and not region:
+        raise SystemExit("set AWS_REGION or AWS_DEFAULT_REGION for --provider bedrock; no region is assumed")
     admin = _admin_dsn(args)  # every refusal happens before the run directory and the budget ledger exist
     suite = Suite.load(Path("evals/dab/suite.json"))
     names = tuple(name for name in args.datasets.split(",") if name)
@@ -179,10 +182,10 @@ async def _curve(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     ledger = Ledger.grant(out / "budget.json", args.max_tokens)
     records = await execute_curve(cases, repo=dab.repo, paths=Paths(out), ledger=ledger, mount_root=out / "mounts",
-                                  admin_dsn=admin, provider="openai", model=model, repeats=args.repeats,
-                                  image=args.image, sandbox=args.sandbox)
+                                  admin_dsn=admin, provider=args.provider, model=model, repeats=args.repeats,
+                                  image=args.image, sandbox=args.sandbox, aws_region=region)
     summary = summarize_curve(records)
-    meta = {"protocol": PROTOCOL, "provider": "openai", "model": model, "keel_version": keel.__version__,
+    meta = {"protocol": PROTOCOL, "provider": args.provider, "model": model, "keel_version": keel.__version__,
             "started": started.isoformat(), "datasets": list(names), "repeats": args.repeats,
             "max_tokens": args.max_tokens, "spent_tokens": ledger.spent_tokens, "commit": _commit()}
     write_curve(out, summary, records, meta)
@@ -256,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--database-admin-dsn")
     curve = commands.add_parser("curve", help="the DAB learning curve (openai only, needs a prepared DAB checkout)")
     curve.add_argument("--datasets", default=DEFAULT_DATASETS, help="comma-separated file-backed DAB datasets")
+    curve.add_argument("--provider", choices=sorted(_MODEL_ENV), default="openai")
     curve.add_argument("--repeats", type=int, default=5)
     curve.add_argument("--max-tokens", type=int, required=True, help="cumulative token budget for this run")
     curve.add_argument("--model")
