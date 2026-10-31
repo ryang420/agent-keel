@@ -9,6 +9,8 @@ OUTCOMES = ("worked", "failed", "corrected", "requested", "feedback_up", "feedba
 REVIEW_OUTCOMES = ("worked", "failed", "corrected", "requested")  # feedback outcomes come only from feedback
 MAX_PER_JOB = 5
 EXPIRY_SECONDS = 30 * 86_400  # a pending observation not consumed by then expires
+STATS_SECONDS = 30 * 86_400  # the window for per-version outcome statistics
+SUSPEND_DOWN = 3  # down ratings that suspend a skill version when they outnumber the up ratings
 MAX_COMMENT = 2_000
 FEEDBACK_TOPIC = "Run feedback"
 

@@ -196,6 +196,28 @@ class ReviewClaim:
 
 
 @dataclass(frozen=True)
+class RunFeedback:
+    run_id: str
+    session_id: str
+    rating: str  # "up" or "down"
+    comment: str | None
+    observation_id: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """One learned skill version over the statistics window: runs that loaded it, their ratings and end states."""
+    loads: int
+    up: int
+    down: int
+    completed: int
+    failed: int
+    cancelled: int
+
+
+@dataclass(frozen=True)
 class Observation:
     """A lesson observation: what a review, feedback or a skill request saw, awaiting or past the dream."""
     id: str

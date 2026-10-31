@@ -142,3 +142,29 @@ async def test_session_deletion_detaches_evidence_and_keeps_the_skill(store):
     assert (await store.learned_skill("p1", skill_id)).body == "1. Step one."
     for table in ("lesson_observations", "skill_loads"):
         assert (await store.db.fetchrow(f"SELECT COUNT(*) AS n FROM {table}"))["n"] == 0
+
+
+async def test_an_automatic_source_cannot_create(store):
+    await profile(store)
+    result = await store.change_learned_skill("p1", create(), source=SkillSource("automatic"))
+    assert result["code"] == "invalid"
+
+
+async def test_a_stale_incarnation_changes_nothing(store):
+    await profile(store)
+    with pytest.raises(ProfileIncarnationMismatch):
+        await store.change_learned_skill("p1", create(), source=CONSUMER, profile_incarnation="stale")
+    assert await store.learned_skills("p1") == []
+
+
+async def test_a_replay_after_learning_is_disabled_is_refused(store):
+    """The flag is checked at every commit, before the replay lookup (plan ⑥ ruling 9)."""
+    await profile(store)
+    source = SkillSource("foreground", run_id="r1", session_id="s1")
+    first = await store.change_learned_skill("p1", create(), source=source, mutation_key="skill:r1:c1:y",
+                                             require_learning=True)
+    assert first["success"]
+    await profile(store, learning=False)
+    again = await store.change_learned_skill("p1", create(), source=source, mutation_key="skill:r1:c1:y",
+                                             require_learning=True)
+    assert again["code"] == "learning_disabled"

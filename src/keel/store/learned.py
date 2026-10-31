@@ -78,6 +78,8 @@ class LearnedSkillStoreMixin:
         return "A learned skill already has that name; revise it instead." if row else None
 
     async def _create_skill(self, profile_id: str, op: dict, shipped: set[str], source: SkillSource) -> dict:
+        if source.kind not in ("foreground", "dream", "consumer"):
+            return _fail("invalid", "Only the foreground, a dream or the consumer can create a skill.")
         name, description, body, category = (op.get(key) for key in _FIELDS)
         if reason := check(name, description, body, category):
             return _fail("invalid", reason)
