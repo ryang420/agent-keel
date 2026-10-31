@@ -126,16 +126,16 @@ async def test_a_merge_retires_the_source_and_reactivates_a_suspended_target(dre
                                       source=SkillSource("automatic"))
     claim, ids = await setup(dreams, clock)
     staged = await stage(dreams)
-    call(staged, "merge_skills", target_id=target, source_ids=[source], body="1. Merged.", observations=ids[:1])
+    call(staged, "merge_skills", target_id=target, source_ids=[source], body="1. Merged.", observations=ids)
     assert await dreams.commit_dream(claim, staged.proposal, usage=USAGE) == "committed"
     merged, retired = await dreams.learned_skill("p1", target), await dreams.learned_skill("p1", source)
     assert (merged.state, merged.version, merged.body) == ("active", 3, "1. Merged.")
     assert (retired.state, retired.version) == ("retired", 2)
     *_, last = await dreams.learned_skill_versions("p1", target)
-    assert (last.change, last.observation_ids) == ("merge", (ids[0],))
+    assert (last.change, set(last.observation_ids)) == ("merge", set(ids))
     *_, gone = await dreams.learned_skill_versions("p1", source)
     assert (gone.change, gone.rationale) == ("retire", "merged into weekly-report")
-    assert {o.id: o.state for o in await dreams.observations("p1")} == {ids[0]: "consumed", ids[1]: "pending"}
+    assert {o.state for o in await dreams.observations("p1")} == {"consumed"}
 
 
 async def test_dismissed_observations_keep_their_reason_and_a_no_op_completes(dreams, clock):

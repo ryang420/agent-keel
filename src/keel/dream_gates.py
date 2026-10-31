@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-SESSIONS = 2  # without a request or commented praise, a create or revise needs observations from this many sessions
+SESSIONS = 2  # without a request or commented praise, new text needs observations from this many sessions
 SIMILAR = 0.6  # token overlap at which a new skill's name or description duplicates a live one
 _TOKEN = re.compile(r"[a-z0-9]+")  # one character class, no nesting: linear in the input
 _SHORT = 2  # tokens this short carry no meaning ("a", "of", "q3")
@@ -38,8 +38,10 @@ def duplicates(name: str, description: str, other_name: str, other_description: 
 
 
 def evidence_refusal(action: str, cited: list) -> str | None:
-    """Why the cited observations (already checked to be this attempt's input) cannot support the change, or None."""
-    if action in ("create", "revise"):
+    """Why the cited observations (already checked to be this attempt's input) cannot support the change, or None. A
+    merge writes new text on its target, so it needs what a create or revise needs; retiring its sources needs nothing
+    more."""
+    if action in ("create", "revise", "merge"):
         if any(item.outcome == "requested" for item in cited):
             return None
         if any(item.outcome == "feedback_up" and item.situation.strip() for item in cited):

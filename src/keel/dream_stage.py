@@ -10,7 +10,7 @@ import json
 
 from keel.dream_gates import duplicates, evidence_refusal, precedence_refusal
 from keel.learned import MAX_SKILLS, check, document
-from keel.tools.base import tool_json
+from keel.tools.base import redact, tool_json
 
 STAGED = ("skill_view", "create_skill", "revise_skill", "merge_skills", "retire_skill", "dismiss_observation")
 FIELDS = ("name", "description", "body", "category")
@@ -30,8 +30,10 @@ def _refusal(message: str, code: str = "invalid") -> tuple[str, bool]:
 
 
 def _rationale(args: dict) -> str | None:
+    """The model's reason for a change, stored and served with the version: redacted, then cut to MAX_REASON. (Its
+    length is bounded by the response's output tokens, and the patterns are linear.)"""
     value = args.get("rationale")
-    return value[:MAX_REASON] if isinstance(value, str) else None
+    return redact(value)[:MAX_REASON] if isinstance(value, str) else None
 
 
 class StagedDream:
@@ -215,5 +217,5 @@ class StagedDream:
             return _refusal("That observation supports a staged change; it cannot also be dismissed.")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON:
             return _refusal(f"reason must be non-empty text of at most {MAX_REASON} characters.")
-        self.proposal.dismissed[observation_id] = reason
+        self.proposal.dismissed[observation_id] = redact(reason)  # stored in the observation's note and served
         return tool_json({"success": True, "staged": "dismiss"}), False

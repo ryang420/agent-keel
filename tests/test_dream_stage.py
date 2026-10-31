@@ -71,9 +71,13 @@ def test_a_revise_pins_the_read_version_and_respects_the_consumer():
 
 
 def test_a_merge_retires_the_sources_before_rewriting_the_target():
-    staged = StagedDream([obs("o1", "s1", at=200.0)], SKILLS, set())
+    staged = StagedDream([obs("o1", "s1", at=200.0), obs("o2", "s2", at=200.0)], SKILLS, set())
+    thin, error = call(staged, "merge_skills", target_id="k1", source_ids=["k2"], body="1. Merged.",
+                       observations=["o1"])
+    assert error and thin["code"] == "evidence"  # the merged text needs what a create or revise needs
+    assert staged.proposal.ops == []
     result, error = call(staged, "merge_skills", target_id="k1", source_ids=["k2"], body="1. Merged.",
-                         observations=["o1"])
+                         observations=["o1", "o2"])
     assert not error, result
     retire, merge = staged.proposal.ops
     assert (retire["action"], retire["skill_id"], retire["expected_version"]) == ("retire", "k2", 2)
@@ -117,3 +121,14 @@ def test_skill_view_reads_the_snapshot_including_suspended_skills():
     assert not error and result["state"] == "suspended" and "1. Old step." in result["content"]
     shipped, error = call(staged, "skill_view", name="shipped-skill")
     assert error and "deployment skill" in shipped["error"]
+
+
+def test_a_rationale_and_a_dismissal_reason_are_redacted_before_they_are_stored():
+    key = "AKIA" + "ABCDEFGHIJKLMNOP"  # built at runtime, never a literal credential
+    staged = stage()
+    call(staged, "create_skill", name="csv-cleanup", description="Clean a CSV export", body="1. Drop empty rows.",
+         observations=["o1", "o2"], rationale=f"the user pasted {key} twice")
+    call(staged, "dismiss_observation", observation_id="o3", reason=f"one-off use of {key}")
+    [op] = staged.proposal.ops
+    assert key not in op["rationale"] and "[REDACTED]" in op["rationale"]
+    assert key not in staged.proposal.dismissed["o3"] and "[REDACTED]" in staged.proposal.dismissed["o3"]

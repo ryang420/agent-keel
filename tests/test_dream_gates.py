@@ -45,10 +45,12 @@ def test_create_and_revise_need_two_sessions_a_request_or_commented_praise():
     assert evidence_refusal("create", [obs(outcome="feedback_up", situation=" ")]) is not None
 
 
-def test_retire_and_merge_need_one_cited_observation():
+def test_retire_needs_one_cited_observation_and_merge_needs_what_new_text_needs():
     assert evidence_refusal("retire", []) is not None
     assert evidence_refusal("retire", [obs()]) is None
-    assert evidence_refusal("merge", [obs()]) is None
+    assert evidence_refusal("merge", [obs()]) is not None  # a merge writes the target's text anew
+    assert evidence_refusal("merge", [obs("o1", "s1"), obs("o2", "s2")]) is None
+    assert evidence_refusal("merge", [obs(outcome="requested")]) is None
 
 
 def test_a_consumer_change_stands_until_newer_evidence():
