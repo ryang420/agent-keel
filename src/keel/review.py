@@ -39,14 +39,14 @@ class ReviewSettings:
     user_chars: int = 1375
 
 
-class _Failed(Exception):
+class JobFailed(Exception):
     def __init__(self, code: str, message: str, *, retry: bool) -> None:
         super().__init__(message)
         self.code = code
         self.retry = retry
 
 
-class _Attempt:
+class AttemptUsage:
     def __init__(self, number: int) -> None:
         self.number = number
         self.requests = 0
@@ -56,6 +56,26 @@ class _Attempt:
     def entry(self, outcome: str) -> dict:
         return {"attempt": self.number, "outcome": outcome, "requests": self.requests,
                 "usage": self.usage.to_dict()}
+
+
+async def keep_lease(attempt: asyncio.Task, renew, lease_seconds: float, what: str) -> None:
+    """Renew every third of the lease until the attempt ends; a lost lease cancels it (its commit would be refused
+    anyway). `renew` returns whether the lease is still held."""
+    while not attempt.done():
+        done, _ = await asyncio.wait({attempt}, timeout=lease_seconds / 3)
+        if done:
+            break
+        try:
+            renewed = await renew()
+        except Exception:
+            log.warning("renewing %s failed", what, exc_info=True)
+            continue
+        if not renewed:
+            log.warning("%s lost its lease", what)
+            attempt.cancel()
+            await asyncio.gather(attempt, return_exceptions=True)
+            return
+    await attempt
 
 
 def chunk_tokens(context_window: int) -> int:
@@ -86,7 +106,8 @@ class MemoryReviewer:
             return False
         attempt = asyncio.create_task(self._attempt(claim), name=f"keel-review-{claim.job.id}")
         try:
-            await self._keep_lease(claim, attempt)
+            await keep_lease(attempt, lambda: self.store.renew_review(claim, s.lease_seconds), s.lease_seconds,
+                             f"memory review {claim.job.id}")
         except asyncio.CancelledError:
             attempt.cancel()
             await asyncio.gather(attempt, return_exceptions=True)
@@ -97,33 +118,14 @@ class MemoryReviewer:
             raise
         return True
 
-    async def _keep_lease(self, claim, attempt: asyncio.Task) -> None:
-        """Renew every third of the lease until the attempt ends; a lost lease cancels it (its commit would be
-        refused anyway)."""
-        while not attempt.done():
-            done, _ = await asyncio.wait({attempt}, timeout=self.settings.lease_seconds / 3)
-            if done:
-                break
-            try:
-                renewed = await self.store.renew_review(claim, self.settings.lease_seconds)
-            except Exception:
-                log.warning("renewing memory review %s failed", claim.job.id, exc_info=True)
-                continue
-            if not renewed:
-                log.warning("memory review %s lost its lease", claim.job.id)
-                attempt.cancel()
-                await asyncio.gather(attempt, return_exceptions=True)
-                return
-        await attempt
-
     async def _attempt(self, claim) -> None:
         """Never raises except on cancellation: every outcome is recorded on the job."""
-        state = _Attempt(claim.job.attempts)
+        state = AttemptUsage(claim.job.attempts)
         try:
             async with asyncio.timeout(DEADLINE_S):
                 await self._review(claim, state)
             return
-        except _Failed as failure:
+        except JobFailed as failure:
             code, message, retry = failure.code, str(failure), failure.retry
         except TimeoutError:
             code, message, retry = "deadline", "The review did not finish in time.", True
@@ -139,7 +141,7 @@ class MemoryReviewer:
         except Exception:
             log.warning("could not record the failure of memory review %s", claim.job.id, exc_info=True)
 
-    async def _review(self, claim, state: _Attempt) -> None:
+    async def _review(self, claim, state: AttemptUsage) -> None:
         job = claim.job
         gone = await self.store.review_owner_gone(claim)
         if gone is not None:
@@ -151,7 +153,7 @@ class MemoryReviewer:
             return
         if ({"provider": job.provider, "model": job.model} not in profile.models
                 or job.provider not in self.providers.names()):
-            raise _Failed("model_unavailable", "The run's model is no longer enabled for this profile.", retry=False)
+            raise JobFailed("model_unavailable", "The run's model is no longer enabled for this profile.", retry=False)
         provider = self.providers.get(job.provider)
         window = provider.capabilities(job.model).context_window
         rows, complete = await self.store.review_rows(claim, limit=SOURCE_ROWS)
@@ -186,7 +188,7 @@ class MemoryReviewer:
         for _ in range(ITERATIONS):
             estimate = base + sum(message_tokens(message) for message in messages)
             if state.reserved + estimate > INPUT_TOKENS or estimate > window - OUTPUT_TOKENS:
-                raise _Failed("budget", "The review ran out of its input budget.", retry=True)
+                raise JobFailed("budget", "The review ran out of its input budget.", retry=True)
             state.reserved += estimate
             state.requests += 1
             request = ModelRequest(provider=job.provider, model=job.model, system=system, messages=tuple(messages),
@@ -208,7 +210,7 @@ class MemoryReviewer:
             messages.append(Message("assistant", (TextPart("".join(text)),) if text else (), tool_calls=tuple(calls),
                                     reasoning=tuple(reasoning)))
             if cut_off:
-                raise _Failed("incomplete", "The review's response was cut off.", retry=True)
+                raise JobFailed("incomplete", "The review's response was cut off.", retry=True)
             if not calls:
                 outcome = await self.store.commit_review(claim, stage.proposals(), end=end, done=chunk.done,
                                                          evidence=chunk.last_message,
@@ -225,4 +227,4 @@ class MemoryReviewer:
                 else:
                     content = json.dumps({"error": f"Unknown tool: {call.name}"})
                 messages.append(Message("tool", (TextPart(content),), tool_call_id=call.id, tool_name=call.name))
-        raise _Failed("iteration_limit", "The review did not finish within its iterations.", retry=True)
+        raise JobFailed("iteration_limit", "The review did not finish within its iterations.", retry=True)
