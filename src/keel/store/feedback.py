@@ -4,10 +4,13 @@ write takes the profile lock and checks admission and incarnation in one transac
 
 from __future__ import annotations
 
+from dataclasses import astuple
+
 from keel.observations import FEEDBACK_TOPIC, STATS_SECONDS, SUSPEND_DOWN
 from keel.review_observe import StagedObservation
 from keel.store.base import TERMINAL, RunFeedback, SkillOutcome, SkillSource
 
+_NO_OUTCOME = SkillOutcome(0, 0, 0, 0, 0, 0)
 _COLUMNS = "run_id, session_id, rating, comment, observation_id, created_at, updated_at"
 
 
@@ -125,6 +128,17 @@ class FeedbackStoreMixin:
         return {(row["skill_id"], row["version"]): SkillOutcome(row["loads"], row["up"], row["down"],
                                                                 row["completed"], row["failed"], row["cancelled"])
                 for row in rows}
+
+    async def skill_text_outcomes(self, profile_id: str) -> dict[str, SkillOutcome]:
+        """Per skill, the 30-day outcomes of its current text: every version from where the text began onward."""
+        by_version = await self.skill_outcomes(profile_id, self.clock() - STATS_SECONDS)
+        starts = await self.skill_text_versions(profile_id)
+        totals: dict[str, SkillOutcome] = {}
+        for (skill_id, version), outcome in by_version.items():
+            if version >= starts.get(skill_id, 1):
+                totals[skill_id] = SkillOutcome(*(a + b for a, b in zip(astuple(totals.get(skill_id, _NO_OUTCOME)),
+                                                                        astuple(outcome))))
+        return totals
 
     async def skill_text_versions(self, profile_id: str) -> dict[str, int]:
         """For each skill, the version at which its current text began. State changes (suspend, resume, retire) copy

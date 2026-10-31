@@ -4,12 +4,9 @@ enabled, like the memory routes."""
 
 from __future__ import annotations
 
-from dataclasses import astuple
-
 from fastapi import FastAPI, Request
 
 from keel.api import ApiError, _json_body
-from keel.observations import STATS_SECONDS
 from keel.store.base import ProfileIncarnationMismatch, SkillOutcome, SkillSource
 
 STATES = ("active", "suspended", "retired")
@@ -52,18 +49,6 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
     """Mount the learned-skill routes. `k` returns the Keel of a request; `profile_or_404` loads the caller's
     profile (a foreign or missing profile is the same 404)."""
 
-    async def outcomes(request: Request, profile_id: str) -> dict[str, SkillOutcome]:
-        """Per skill id, the outcomes of its current text: every version from where the text began to the current."""
-        store = k(request).store
-        by_version = await store.skill_outcomes(profile_id, since=store.clock() - STATS_SECONDS)
-        starts = await store.skill_text_versions(profile_id)
-        totals: dict[str, SkillOutcome] = {}
-        for (skill_id, version), outcome in by_version.items():
-            if version >= starts.get(skill_id, 1):
-                totals[skill_id] = SkillOutcome(*(a + b for a, b in zip(astuple(totals.get(skill_id, _NO_OUTCOME)),
-                                                                        astuple(outcome))))
-        return totals
-
     async def apply(request: Request, profile, op: dict):
         store = k(request).store
         try:
@@ -75,7 +60,7 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
             status, code = _ERRORS.get(result["code"], (400, "invalid_input"))
             raise ApiError(status, code, result["error"])
         skill = await store.learned_skill(profile.id, result["skill"]["id"])
-        counts = await outcomes(request, profile.id)
+        counts = await k(request).store.skill_text_outcomes(profile.id)
         return skill_json(skill, counts.get(skill.id, _NO_OUTCOME), body=True)
 
     async def change(request: Request, profile_id: str, skill_id: str, action: str, extra: tuple[str, ...] = ()):
@@ -92,7 +77,7 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
         if state is not None and state not in STATES:
             raise ApiError(400, "invalid_input", f"state must be one of {', '.join(STATES)}.")
         skills = await k(request).store.learned_skills(profile_id, states=None if state is None else (state,))
-        counts = await outcomes(request, profile_id)
+        counts = await k(request).store.skill_text_outcomes(profile_id)
         return {"skills": [skill_json(skill, counts.get(skill.id, _NO_OUTCOME)) for skill in skills]}
 
     @app.post("/v1/profiles/{profile_id}/skills/learned", status_code=201)
@@ -110,7 +95,7 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
         skill = await store.learned_skill(profile_id, skill_id)
         if skill is None:
             raise ApiError(404, "learned_skill_not_found", "No such learned skill.")
-        counts = await outcomes(request, profile_id)
+        counts = await k(request).store.skill_text_outcomes(profile_id)
         versions = await store.learned_skill_versions(profile_id, skill_id)
         return {**skill_json(skill, counts.get(skill.id, _NO_OUTCOME), body=True),
                 "versions": [version_json(version) for version in versions]}

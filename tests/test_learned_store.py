@@ -168,3 +168,31 @@ async def test_a_replay_after_learning_is_disabled_is_refused(store):
     again = await store.change_learned_skill("p1", create(), source=source, mutation_key="skill:r1:c1:y",
                                              require_learning=True)
     assert again["code"] == "learning_disabled"
+
+
+DREAM = SkillSource("dream", job_id="job-1")
+
+
+async def test_only_a_dream_merges_and_a_dream_change_reactivates_the_skill(store):
+    await profile(store)
+    made = (await store.change_learned_skill("p1", create("weekly-report"), source=CONSUMER))["skill"]
+    suspended = await store.change_learned_skill(
+        "p1", {"action": "suspend", "skill_id": made["id"], "expected_version": 1}, source=CONSUMER)
+    refused = await store.change_learned_skill(
+        "p1", {"action": "merge", "skill_id": made["id"], "expected_version": 2, "body": "2."}, source=CONSUMER)
+    assert refused["code"] == "invalid"
+    merged = await store.change_learned_skill(
+        "p1", {"action": "merge", "skill_id": made["id"], "expected_version": 2, "body": "2.",
+               "cited": [("obs-1", "s1"), ("obs-2", "s2")]}, source=DREAM)
+    assert suspended["skill"]["state"] == "suspended"
+    assert (merged["skill"]["state"], merged["skill"]["version"]) == ("active", 3)
+    [*_, last] = await store.learned_skill_versions("p1", made["id"])
+    assert (last.change, last.source_kind, last.job_id) == ("merge", "dream", "job-1")
+    assert last.observation_ids == ("obs-1", "obs-2") and last.message_ids == ()
+
+
+async def test_cited_observations_are_ignored_from_other_sources(store):
+    await profile(store)
+    made = await store.change_learned_skill("p1", create("weekly-report", cited=[("obs-1", "s1")]), source=CONSUMER)
+    [version] = await store.learned_skill_versions("p1", made["skill"]["id"])
+    assert version.observation_ids == ()
