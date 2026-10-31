@@ -197,6 +197,10 @@ Docker Desktop's socket is root-only.
 - When a command ends on its own, the supervisor also sends `TERM` to its process group, so background work does not
   outlive it. It then waits the grace period only while a member of that group is still alive; a command that leaves
   nothing behind returns at once instead of after the grace period.
+- A command run (`"kind": "command"`, see [api.md](api.md#starting-a-command-run)) executes one argv with no model.
+  Its arguments are passed as given, never through a shell. It starts in `/` and enters its `cwd` first, so a missing
+  directory is an ordinary exit with code 125. Its `env` is set over the policy `env` for that command only. A stop
+  ends it like a tool's command. Its output is not saved to a file: the run keeps the last 50,000 characters.
 
 ## Skills
 

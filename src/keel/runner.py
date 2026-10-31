@@ -9,9 +9,11 @@ from datetime import UTC, datetime
 import logging
 import time
 from typing import Awaitable, Callable
+import uuid
 
 from keel import prompts
 from keel import compress
+from keel.commands import output_tail, wrapped_argv
 from keel.compactor import Compactor, SessionContext
 from keel.compress import Boundaries
 from keel.memory import snapshot as memory_snapshot
@@ -23,7 +25,7 @@ from keel.prompt import DEFAULT_IDENTITY, build_system_prompt
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.retry import stream_with_retries
 from keel.sandbox.base import PolicyError, SandboxError, parse_policy, profile_mount_root
-from keel.sandbox.records import MAX_DIAGNOSTIC_CHARS, UseHandle
+from keel.sandbox.records import MAX_DIAGNOSTIC_CHARS, SandboxUncertain, UseHandle
 from keel.skills import discover_skills
 from keel.store.base import Event, ProfileIncarnationMismatch, Run, StoredMessage, TitleInUse, UnknownRun
 from keel.titles import (
@@ -39,6 +41,7 @@ LEASE_LOST_MESSAGE = "The run lost its sandbox lease."
 # The coordinator bounds an exec's one cancellation control (TERM grace + reap timeout + Docker transport); the
 # runner waits one second more for the outcome to be recorded, then leaves it to recovery.
 CONTROL_MARGIN_S = 1.0
+NO_USAGE = Usage(0, 0, 0, 0)  # a command run calls no model, so its usage is known to be zero
 __all__ = ["CANCELLED_TOOL_RESULT", "DEFAULT_IDENTITY", "DEFAULT_MAX_ITERATIONS", "RunExecutor", "RunFailure"]
 
 
@@ -163,10 +166,16 @@ class RunExecutor:
         termination and sandbox release are different events: release needs proven cleanup, so an uncertain
         execution leaves the usage protective for recovery."""
         state = _RunState(use=usage)
+        if run.kind == "command":
+            state.usage = NO_USAGE
         try:
-            await self.emit(run.id, "run.started", {"provider": run.provider, "model": run.model,
-                                                    "reasoning_effort": run.reasoning_effort})
-            await self._loop(run, state)
+            if run.kind == "command":
+                await self.emit(run.id, "run.started", {"kind": "command"})
+                await self._command(run, state)
+            else:
+                await self.emit(run.id, "run.started", {"provider": run.provider, "model": run.model,
+                                                        "reasoning_effort": run.reasoning_effort})
+                await self._loop(run, state)
         except (ModelError, RunFailure) as error:
             await self._shielded(run, self._fail(run, state, error), "record the failure")
         except (asyncio.CancelledError, _RunEnded):
@@ -420,6 +429,52 @@ class RunExecutor:
                     # against a generation whose state is now uncertain.
                     raise _sandbox_failure(outcome.sandbox_error)
         raise AssertionError("unreachable: the final iteration offers no tools")
+
+    async def _command(self, run: Run, state: _RunState) -> None:
+        """A command run (docs/design/2026-10-31-command-runs.md): one exec in the profile's sandbox and no model. The
+        output tail is the run's output; exit 0 completes the run and anything else fails it."""
+        profile = await self.store.get_profile(run.profile_id)
+        if self.coordinator is None or profile is None or not profile.sandbox:
+            raise RunFailure("sandbox_unavailable", "A command run needs a profile with a sandbox.")
+        try:
+            parse_policy(profile.sandbox, profile_mount_root(self.mount_root, profile.id))
+        except PolicyError as exc:
+            raise RunFailure("sandbox_unavailable", f"The sandbox policy is invalid: {exc}") from exc
+        if state.use is None:
+            # Only a coordinated claim reserves usage; never prepare a sandbox for a legacy claim.
+            raise RunFailure("sandbox_unavailable", "The run was claimed without sandbox usage.")
+        try:
+            state.sandbox = await self.coordinator.prepare(state.use)
+        except SandboxError as exc:
+            raise _sandbox_failure(exc) from exc
+        command = run.command
+        await self.emit(run.id, "command.started", {"argv": command["argv"], "cwd": command["cwd"]})
+        record = self._exec_recorder(run, state)
+        exec_id = "x" + uuid.uuid4().hex[:16]
+        await record(exec_id)  # set before dispatch, so a stop can always find the exec to cancel
+        try:
+            result = await self.coordinator.exec(state.sandbox, wrapped_argv(command), cwd="/",
+                                                 timeout_s=command["timeout_s"], exec_id=exec_id,
+                                                 env=command.get("env") or None)
+        except SandboxUncertain as exc:
+            await record(None)
+            raise RunFailure("sandbox_uncertain", "The sandbox could not confirm that the command ended; the sandbox "
+                                                  "is held for recovery.") from exc
+        except SandboxError as exc:
+            await record(None)
+            raise _sandbox_failure(exc) from exc
+        await record(None)
+        tail = output_tail(result.output)
+        await self.emit(run.id, "command.completed", {"exit_code": result.exit_code, "timed_out": result.timed_out,
+                                                      "duration_s": result.duration_s, "output": tail})
+        if result.timed_out:
+            state.text = [tail]  # _fail stores the text so far as the failed run's output
+            raise RunFailure("command_timed_out",
+                             f"The command ran longer than {command['timeout_s']:g} s and was stopped.")
+        if result.exit_code != 0:
+            state.text = [tail]
+            raise RunFailure("command_failed", f"The command exited with code {result.exit_code}.")
+        await self._finish(run, "completed", output=tail, usage=state.usage)
 
     async def _model_call(self, run: Run, turn: _Turn, state: _RunState, *,
                           final: bool) -> tuple[list[ToolCall], list, bool]:
