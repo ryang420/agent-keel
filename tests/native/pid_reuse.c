@@ -5,8 +5,10 @@
  * reused for an unrelated process during cleanup. This harness forces the allocation question instead of waiting
  * for random PID churn: it writes /proc/sys/kernel/ns_last_pid so the next fork receives a chosen PID.
  *
- *   1. A payload forks an escaping setsid descendant (it ignores TERM and survives the group KILL), prints its
- *      leader PID, and exits. Cleanup therefore stays open until the fixed deadline and must be uncertain.
+ *   1. A payload forks a descendant that escapes the group (it answers TERM by waiting briefly and then calling
+ *      setsid, so it survives the group KILL), prints its leader PID, and exits. Cleanup therefore stays open until
+ *      the fixed deadline and must be uncertain. The descendant stays in the group for a moment after TERM because
+ *      an empty group ends the grace at once, and step 2 needs the leader pinned while it runs.
  *   2. While the leader is pinned, the harness asks for the leader's PID. The kernel must hand out another PID;
  *      the probe is killed and reaped.
  *   3. After the supervisor reports leader_reaped, the harness asks again. This time the leader's PID is reused by
@@ -295,8 +297,11 @@ static const char *payload_script =
     "child = os.fork()\n"
     "if child == 0:\n"
     "    os.close(read_fd)\n"
-    "    os.setsid()\n"
-    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "    def escape(signum, frame):\n"
+    "        signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "        time.sleep(0.3)\n"
+    "        os.setsid()\n"
+    "    signal.signal(signal.SIGTERM, escape)\n"
     "    print('escaped', os.getpid(), flush=True)\n"
     "    os.write(write_fd, b'x')\n"
     "    os.close(write_fd)\n"
