@@ -9,6 +9,7 @@ import pytest
 from evals.dab import inputs
 from evals.dab.budget import Ledger
 from evals.dab.suite import Case, Dataset, Query
+from evals.learning import curve
 from evals.learning.curve import CurveError, execute_curve, metrics, split, summarize_curve
 from keel.models import Completed, TextDelta, Usage
 from keel.providers.base import ProviderRegistry
@@ -75,6 +76,13 @@ async def test_a_scripted_curve_runs_both_arms_and_summarises(tmp_path, pg_dsn):
     assert learning["feedback"] == 2 and learning["observations"] >= 2  # feedback became observations
     baseline = next(s for s in sequences if s["arm"] == "baseline")
     assert baseline["observations"] == 0
+    # forced reviews ran in both arms; a dream only in the learning arm
+    assert learning["reviews"] >= 1 and baseline["reviews"] >= 1
+    assert learning["dreams"] >= 1 and baseline["dreams"] == 0
+    assert learning["feedback_comments"] == ["Correct."] * 2 == baseline["feedback_comments"]
+    assert learning["overhead_tokens"] > 0 and baseline["overhead_tokens"] > 0
+    assert learning["retire"]["status"] == "retired" and baseline["retire"]["status"] == "retired"
+    assert (paths.root / "curve" / "records.jsonl").read_text().count("\n") == len(records)
     summary = summarize_curve(records)
     assert summary["complete"] and summary["errors"] == 0
     assert summary["learning"]["heldout_pass"] == summary["baseline"]["heldout_pass"] == 1.0
@@ -108,3 +116,71 @@ def test_the_summary_is_a_mean_over_repeats_of_dataset_means():
     assert summary["baseline"]["heldout_pass"] == pytest.approx(0.25)  # (0.0 + 0.5) / 2
     assert summary["learning"]["iterations"] == pytest.approx(3.5)
     assert summary["complete"]
+
+
+async def _run(tmp_path, pg_dsn, cases, repo, repeats=1, tokens=1_000_000):
+    registry = ProviderRegistry()
+    registry.register(FakeProvider(script=[[TextDelta("ANSWER: 42"), Completed(Usage(10, 2, 0, 0))]] * 400))
+    paths = inputs.Paths(tmp_path / "eval").ensure()
+    return await execute_curve(cases, repo=repo, paths=paths, ledger=Ledger.grant(paths.budget, tokens),
+                               mount_root=tmp_path / "mounts", admin_dsn=pg_dsn, provider="fake", model="m",
+                               repeats=repeats, sandbox="none", providers=registry, timeout_s=60)
+
+
+async def test_one_failing_task_keeps_the_rest_and_the_profile_is_retired(tmp_path, pg_dsn, monkeypatch):
+    repo, cases = toy(tmp_path)
+    real = curve.scoring.score
+
+    def flaky(case, repo, answer, **kw):
+        if case.query.number == "2":
+            raise RuntimeError("validator exploded")
+        return real(case, repo, answer, **kw)
+
+    monkeypatch.setattr(curve.scoring, "score", flaky)
+    records = await _run(tmp_path, pg_dsn, cases, repo)
+    failed = [r for r in records if r.get("status") == "setup_failed"]
+    assert len(failed) == 2 and all("validator exploded" in r["error"] for r in failed)
+    assert len([r for r in records if r.get("kind") == "task" and r["status"] == "executed"]) == 4
+    sequences = [r for r in records if r.get("kind") == "sequence"]
+    assert len(sequences) == 2 and all(s["retire"]["status"] == "retired" for s in sequences)
+    assert summarize_curve(records)["errors"] == 2
+
+
+async def test_an_isolation_failure_blocks_every_case(tmp_path, pg_dsn, monkeypatch):
+    repo, cases = toy(tmp_path)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("no mounts")
+
+    monkeypatch.setattr(curve, "isolation", broken)
+    records = await _run(tmp_path, pg_dsn, cases, repo)
+    tasks = [r for r in records if r.get("kind") == "task"]
+    assert len(tasks) == 6 and {r["status"] for r in tasks} == {"blocked"}
+    assert len([r for r in records if r.get("kind") == "sequence"]) == 2
+
+
+async def test_the_arm_order_alternates_per_repeat(tmp_path, pg_dsn):
+    repo, cases = toy(tmp_path)
+    records = await _run(tmp_path, pg_dsn, cases, repo, repeats=2)
+    order = [(s["repeat"], s["arm"]) for s in records if s.get("kind") == "sequence"]
+    assert order == [(0, "learning"), (0, "baseline"), (1, "baseline"), (1, "learning")]
+
+
+def test_error_records_are_excluded_and_make_the_summary_incomplete():
+    def run(arm, passed, status="executed"):
+        return {"kind": "task", "arm": arm, "dataset": "a", "repeat": 0, "phase": "heldout", "case": "a/q",
+                "status": status, "passed": passed, "iterations": 4, "tool_errors": 0, "tokens": 10}
+
+    seqs = [{"kind": "sequence", "arm": arm, "dataset": "a", "repeat": 0, "expected": 1, "ran": 1}
+            for arm in ("learning", "baseline")]
+    summary = summarize_curve([run("learning", True), run("baseline", False, "budget_exhausted"), *seqs])
+    assert not summary["complete"] and summary["baseline"]["heldout_errors"] == 1
+    assert summary["baseline"]["iterations"] is None and summary["learning"]["heldout_pass"] == 1.0
+
+
+async def test_a_budget_stop_is_recorded_as_budget_exhausted(tmp_path, pg_dsn):
+    repo, cases = toy(tmp_path)
+    records = await _run(tmp_path, pg_dsn, cases, repo, tokens=9_000)
+    statuses = {r["status"] for r in records if r.get("kind") == "task"}
+    assert "budget_exhausted" in statuses and "failed" not in statuses
+    assert len([r for r in records if r.get("kind") == "sequence"]) == 2
