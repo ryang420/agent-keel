@@ -169,3 +169,17 @@ async def test_session_deletion_removes_the_sessions_feedback(store):
     await store.put_feedback("p1", second.id, "up", None)
     assert await store.delete_session("p1", "a") is True
     assert await store.get_feedback("p1", first.id) is None and await store.get_feedback("p1", second.id) is not None
+
+
+async def test_text_versions_ignore_state_changes(store):
+    await profile(store)
+    skill_id = await skill(store)
+    assert await store.skill_text_versions("p1") == {skill_id: 1}
+    await store.change_learned_skill("p1", {"action": "suspend", "skill_id": skill_id, "expected_version": 1},
+                                     source=SkillSource("consumer"))
+    await store.change_learned_skill("p1", {"action": "resume", "skill_id": skill_id, "expected_version": 2},
+                                     source=SkillSource("consumer"))
+    assert await store.skill_text_versions("p1") == {skill_id: 1}
+    await store.change_learned_skill("p1", {"action": "revise", "skill_id": skill_id, "expected_version": 3,
+                                            "body": "2."}, source=SkillSource("consumer"))
+    assert await store.skill_text_versions("p1") == {skill_id: 4}

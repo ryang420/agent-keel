@@ -126,3 +126,11 @@ class FeedbackStoreMixin:
         return {(row["skill_id"], row["version"]): SkillOutcome(row["loads"], row["up"], row["down"],
                                                                 row["completed"], row["failed"], row["cancelled"])
                 for row in rows}
+
+    async def skill_text_versions(self, profile_id: str) -> dict[str, int]:
+        """For each skill, the version at which its current text began. State changes (suspend, resume, retire) copy
+        the text, so statistics for the current text add up every version from this one onward."""
+        rows = await self.db.fetch(
+            "SELECT skill_id, MAX(version) AS v FROM learned_skill_versions WHERE profile_id = ? "
+            "AND change IN ('create', 'revise', 'merge', 'rollback') GROUP BY skill_id", profile_id)
+        return {row["skill_id"]: row["v"] for row in rows}

@@ -108,6 +108,22 @@ async def test_three_down_ratings_suspend_a_learned_skill_and_show_in_stats(clie
     assert [r["suspended"] for r in responses] == [[], [], [skill_id]]
     skill = (await http.get(f"/v1/profiles/p1/skills/learned/{skill_id}")).json()
     assert skill["state"] == "suspended"
-    # statistics are per version: the suspension is version 2, which no run has loaded yet
-    assert skill["version"] == 2 and skill["stats"]["down_30d"] == 0 and skill["stats"]["loads_30d"] == 0
-    assert (await store.skill_outcomes("p1", 0))[(skill_id, 1)].down == 3
+    assert skill["stats"]["down_30d"] == 3 and skill["stats"]["loads_30d"] == 3  # the suspension keeps the text
+    listed = (await http.get("/v1/profiles/p1/skills/learned")).json()["skills"]
+    assert listed[0]["stats"]["down_30d"] == 3
+
+
+async def test_a_revision_starts_fresh_statistics(client):
+    http, store = client
+    made = await store.change_learned_skill("p1", {"action": "create", "name": "weekly-report",
+                                                   "description": "Weekly report", "body": "1."},
+                                            source=SkillSource("consumer"))
+    skill_id = made["skill"]["id"]
+    run = await finished_run(store)
+    await store.record_skill_load("p1", "s1", run.id, skill_id, 1)
+    await http.put(url(run.id), json={"rating": "up"})
+    base = f"/v1/profiles/p1/skills/learned/{skill_id}"
+    assert (await http.get(base)).json()["stats"]["up_30d"] == 1
+    patched = await http.patch(base, json={"body": "2. Better.", "expected_version": 1})
+    assert patched.json()["stats"] == {"loads_30d": 0, "up_30d": 0, "down_30d": 0, "completed_30d": 0,
+                                       "failed_30d": 0, "cancelled_30d": 0}
