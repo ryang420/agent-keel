@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Every sandbox command took at least the 3 s kill grace period: after a command ended on its own, the supervisor
+  waited the whole grace before its final `KILL` even when the command's process group was already empty. It now
+  ends the grace as soon as no live member of the group is left. A member that is still handling `TERM` gets the
+  grace as before, and completion is still proven by the child wait, not by the group check.
+
 ## [0.3.0] - 2026-10-24
 
 M3 is accepted (`docs/design/2026-10-12-m3-reliability-memory-compression.md`, acceptance record at the end). No

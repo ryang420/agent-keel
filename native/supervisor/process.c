@@ -12,9 +12,15 @@
  * invalidated and every timer that could issue a signal is cancelled; only then is the leader reaped. A
  * nonblocking waitpid(-1) then drains adopted children. Zero means children remain and is not success; only ECHILD
  * proves descendant completion. The fixed cleanup deadline is never extended by duplicate controls.
+ *
+ * Once the leader has exited, the TERM grace ends early when its pinned group has no live member left: the final
+ * KILL is then sent at once instead of after the whole grace. That check reads /proc and is advisory only. It never
+ * chooses whom to signal (the target is always the pinned group) and never proves completion (ECHILD does).
  */
 #include "supervisor.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -33,6 +39,8 @@
 #include <unistd.h>
 
 #define KEEL_POLL_INTERVAL_MS 500
+/* How often a group member that is handling TERM is looked for again; its exit need not wake the loop. */
+#define KEEL_GROUP_POLL_MS 20
 /*
  * A connected control client must send its fixed frame promptly. Without this idle deadline a silent same-uid
  * peer could occupy the single client slot indefinitely and block a legitimate cancellation.
@@ -159,6 +167,79 @@ static int signals_allowed(const struct keel_supervisor *supervisor)
 {
     return supervisor->handshake_ok && !supervisor->setup_failed && !supervisor->group_unverified &&
            supervisor->leader > 0 && !supervisor->leader_reaped;
+}
+
+/*
+ * Whether a process other than a zombie may still belong to the process group: any doubt (no /proc, an entry that
+ * cannot be parsed) answers yes, so the caller keeps waiting out the grace exactly as before.
+ */
+static int group_may_have_live_members(pid_t group)
+{
+    DIR *proc;
+    struct dirent *entry;
+    int live = 0;
+
+    proc = opendir("/proc");
+    if (proc == NULL) {
+        return 1;
+    }
+    errno = 0;
+    while (!live && (entry = readdir(proc)) != NULL) {
+        char path[64];
+        char record[512];
+        const char *cursor;
+        const char *name = entry->d_name;
+        char state;
+        int parent;
+        int member_group;
+        ssize_t length;
+        int fd;
+
+        if (!isdigit((unsigned char)name[0])) {
+            continue;
+        }
+        if (snprintf(path, sizeof(path), "/proc/%s/stat", name) >= (int)sizeof(path)) {
+            live = 1;
+            break;
+        }
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            live = errno != ENOENT && errno != ESRCH;
+            continue;
+        }
+        length = read(fd, record, sizeof(record) - 1);
+        close_fd(&fd);
+        if (length <= 0) {
+            live = length < 0 && errno != ESRCH;
+            continue;
+        }
+        record[length] = '\0';
+        /* The command name may hold spaces and parentheses; the fields after it start at the last ')'. */
+        cursor = strrchr(record, ')');
+        if (cursor == NULL || sscanf(cursor + 1, " %c %d %d", &state, &parent, &member_group) != 3) {
+            live = 1;
+            break;
+        }
+        if (member_group == (int)group && state != 'Z' && state != 'X' && state != 'x') {
+            live = 1;
+        }
+        errno = 0;
+    }
+    if (!live && errno != 0) {
+        live = 1;
+    }
+    (void)closedir(proc);
+    return live;
+}
+
+/* The leader has exited and its pinned group holds no live member, so waiting out the grace serves no one. */
+static int group_drained(const struct keel_supervisor *supervisor)
+{
+    if (!supervisor->leader_exit_observed || group_may_have_live_members(supervisor->leader)) {
+        return 0;
+    }
+    keel_test_trace("group_drained", NULL, (long)supervisor->leader, !supervisor->leader_reaped);
+    return 1;
 }
 
 static void begin_cleanup(struct keel_supervisor *supervisor, const char *reason);
@@ -695,7 +776,7 @@ static void handle_timers(struct keel_supervisor *supervisor)
         return;
     }
     if (!supervisor->kill_sent && signals_allowed(supervisor) &&
-        deadline_reached(now, supervisor->grace_deadline)) {
+        (deadline_reached(now, supervisor->grace_deadline) || group_drained(supervisor))) {
         keel_test_barrier("kill_before");
         /* The ownership invariant spans this syscall: the leader is unreaped, so its PGID cannot be reused. */
         keel_test_trace("kill", "SIGKILL", (long)supervisor->leader, !supervisor->leader_reaped);
@@ -754,6 +835,10 @@ static int poll_timeout_ms(const struct keel_supervisor *supervisor)
     }
     if (milliseconds > KEEL_POLL_INTERVAL_MS) {
         milliseconds = KEEL_POLL_INTERVAL_MS;
+    }
+    if (supervisor->leader_exit_observed && supervisor->cleanup_started && !supervisor->kill_sent &&
+        !supervisor->timers_cancelled && signals_allowed(supervisor) && milliseconds > KEEL_GROUP_POLL_MS) {
+        milliseconds = KEEL_GROUP_POLL_MS;
     }
     return (int)milliseconds;
 }
