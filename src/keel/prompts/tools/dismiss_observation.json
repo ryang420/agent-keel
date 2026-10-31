@@ -1,0 +1,12 @@
+{
+  "name": "dismiss_observation",
+  "description": "Mark an observation that should never become a skill (a one-off choice, a task fact, noise). It is not offered again.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "observation_id": {"type": "string", "description": "The observation to dismiss."},
+      "reason": {"type": "string", "description": "At most 300 characters."}
+    },
+    "required": ["observation_id", "reason"]
+  }
+}

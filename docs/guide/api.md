@@ -37,6 +37,13 @@ Errors have one shape, with a machine-readable code:
 | `GET /v1/profiles/{profile_id}/memory` | The profile's active memory entries per target, with usage and each entry's source. |
 | `PATCH /v1/profiles/{profile_id}/memory/{entry_id}` | Replace an entry's text: `{"text": "…", "expected_version": n}`. Returns the entry. |
 | `DELETE /v1/profiles/{profile_id}/memory/{entry_id}?expected_version=n` | Remove an entry: `{"deleted": true}`. |
+| `GET /v1/profiles/{profile_id}/skills/learned?state=` | The profile's learned skills, optionally of one state. |
+| `POST /v1/profiles/{profile_id}/skills/learned` | Create a learned skill (201). |
+| `GET /v1/profiles/{profile_id}/skills/learned/{skill_id}` | One learned skill with its version history. |
+| `PATCH /v1/profiles/{profile_id}/skills/learned/{skill_id}` | Edit a learned skill. |
+| `POST /v1/profiles/{profile_id}/skills/learned/{skill_id}/{rollback,suspend,resume}` | Change a learned skill's version or state. |
+| `DELETE /v1/profiles/{profile_id}/skills/learned/{skill_id}?expected_version=n` | Retire a learned skill: `{"retired": true}`. |
+| `PUT`, `GET`, `DELETE /v1/profiles/{profile_id}/runs/{run_id}/feedback` | Rate a finished run, read the rating, or remove it. |
 | `POST /v1/models/verify` | Check a model id: `{"provider", "model"}` → `{"supports_vision": bool}`. |
 
 ## Profile
@@ -49,7 +56,8 @@ Errors have one shape, with a machine-readable code:
   "sandbox": {"image": "python:3.12-slim", "workdir": "/work"},
   "soul": "You are a careful data assistant.",
   "skills": ["my-skill"],
-  "memory": false
+  "memory": false,
+  "learning": false
 }
 ```
 
@@ -63,12 +71,26 @@ Errors have one shape, with a machine-readable code:
 - `memory`: a boolean. When true, the model is offered a `memory` tool and a `session_search` tool (both with or
   without a sandbox) and the system prompt includes a snapshot of stored facts. The tool's `list` action shows entries
   with ids and versions, and a change can name an entry by `entry_id` with an `expected_version`. A write does not
-  change this session's stored prompt: it is visible in the next session's prompt, and after a compaction. Every
-  `KEEL_MEMORY_REVIEW_TURNS` completed runs (10 by default) of that profile, a background review may save facts. The
-  review does not add messages or events to the session, and one already running for that profile is skipped. Omitted,
-  the field is false, including on update. `null`, or anything other than a boolean, is 400 `invalid_input`.
+  change this session's stored prompt: it is visible in the next session's prompt, and after a compaction.
+  A completed run (including one cut off at the iteration cap) marks its new user and assistant text for a
+  background review. A session becomes eligible after `KEEL_MEMORY_REVIEW_TURNS` completed runs (10), 60 seconds
+  after its last completed run, or 10 minutes after its first unreviewed one. Failed and cancelled runs do not make
+  a session eligible; their text is reviewed with the next completed run's. The review is durable: it survives a
+  restart and runs on one instance at a time per profile. It reads only the new text, plus a little earlier text for
+  context. It never adds messages or events to the session. Its result is eventual: a session started right after a
+  run may not see it yet. Turning memory on starts reviews from the next completed run; older conversations are
+  searchable but never reviewed. Turning memory off and on again discards the profile's queued, failed and running
+  reviews. Omitted, the field is false, including on update. `null`, or anything other than a boolean, is
+  400 `invalid_input`.
 
-The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
+- `learning`: a boolean, default false (including on update), and it requires `memory`: `true` without `memory` is
+  400 `invalid_input` ("learning requires memory."). When true, the model is offered a `skill_manage` tool, and
+  `skills_list` and `skill_view` show the profile's active learned skills, and the background memory review may also record
+  observations about methods (see [Learned skills](#learned-skills) and [Run feedback](#run-feedback)).
+  Like `memory`, the tool is fixed per session until it compacts. `null`, or anything other than a boolean, is
+  400 `invalid_input`.
+
+The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory`, `learning` and `updated_at`.
 
 A replacement that changes the effective sandbox policy is refused with 409 `sandbox_busy` while the profile has a
 run queued, running or stopping, or sandbox work that has not been cleaned up yet; retry once it has finished.
@@ -196,10 +218,157 @@ looks like a secret or an instruction, or would exceed the target's character bu
 memory snapshot in their stored prompt until they compact; new sessions see the change. Removing an entry stops it
 being used; it does not erase the conversations it came from.
 
+### `GET /v1/profiles/{p}/memory/reviews`
+
+Background memory reviews, newest first. Query: `status` (`pending`, `running`, `done`, `failed`, `discarded`) and
+`limit` (1-100, default 20). No conversation text is returned.
+
+```json
+{"reviews": [{"id": "3f2a…", "session_id": "s1", "status": "failed", "attempts": 3, "error_code": "deadline",
+  "error": "The review did not finish in time.", "provider": "bedrock", "model": "…",
+  "source": {"after_message_id": 120, "through_message_id": 131}, "cursor": {"message_id": 120, "offset": 0},
+  "usage": [{"attempt": 3, "outcome": "deadline", "requests": 2,
+             "usage": {"input_tokens": 5210, "output_tokens": 180,
+                       "cache_read_tokens": null, "cache_write_tokens": null}}],
+  "created_at": 1761800000.0, "updated_at": 1761800300.0, "finished_at": 1761800300.0}]}
+```
+
+A job reviews the session's text after `after_message_id` up to `through_message_id`; `cursor` is how far it has
+got. `usage` lists the last 20 attempts; an unknown count is `null`. A `failed` job is retried automatically up to
+three attempts, then waits for an operator; while it waits, that session gets no new review. `discarded` means its
+profile, session or memory switch changed underneath it.
+
+### `POST /v1/profiles/{p}/memory/reviews/{id}/retry`
+
+Requeue a `failed` review with fresh attempts and return it. Retrying a `pending` or `running` review returns it
+unchanged. `404 review_not_found`; `409 review_not_retryable` for `done` or `discarded`; `409 review_source_gone`
+when its conversation was deleted or replaced.
+
 With `memory` on, new sessions are also offered `session_search`. It searches and reads the profile's earlier
 conversations: user and assistant text only, secrets redacted, never across profiles. A session keeps the tools it
 started with until it compacts, so open sessions do not gain `session_search` until then. Deleting a session removes
 its messages from search.
+
+## Learned skills
+
+A profile with `learning` on can keep methods as learned skills: text-only, private to the profile, and separate
+from the deployment's read-only `skills`. A skill has a `name` (lowercase slug, at most 64 characters), a one-line
+`description` (at most 200), an optional `category` (slug, at most 32) and a `body` (at most 8000 characters, no
+front matter). A profile holds at most 50 active or suspended skills. A deployment skill of the same name hides a
+learned one. Names, bodies and descriptions are checked like memory text: empty text, secrets and instruction-like text
+are refused.
+
+The model creates, revises and retires skills with `skill_manage` (`list`, `create`, `revise`, `retire`), only when
+the user explicitly asks it to keep a method; the guidance in its prompt says so. A skill is `active`, `suspended`
+(not offered, kept) or `retired`. Every change writes an immutable version (`create`, `revise`, `rollback`,
+`suspend`, `resume` or `retire`) with its source (`foreground` with the run, session and message, or `consumer`),
+evidence and rationale, so a skill can be inspected and reversed. A dream's changes appear in the versions with
+source `dream` and the dream's job id (`job_id`); `merge` is a dream-only change kind, written on the target of a
+merge after the merged skills are retired with the rationale "merged into <name>". A dream's revise or merge makes
+the skill active again if it was suspended. A merge, like a revise, starts the `stats` fresh.
+
+Active learned skills are listed under the category `learned` in `skills_list`, and `skill_view` shows the current
+version, with or without a sandbox, and records the load. A suspended or retired skill answers that it is no longer
+available. The system prompt's skills index is built at session start or compaction, so a change shows up in the
+index from the next session; `skill_view` always reads the current version. With `learning` off, nothing is
+offered or listed, and the stored skills are kept.
+
+The routes below work whether or not `learning` is enabled, like the memory routes. Consumer changes are
+authoritative and enter the history with source `consumer`.
+
+| Route | Body and result |
+|---|---|
+| `GET …/skills/learned?state=` | `state` is `active`, `suspended` or `retired`; any other value is 400. Returns `{"skills": […]}` (no bodies). |
+| `POST …/skills/learned` | `{"name", "description", "body", "category"?}`. 201 with the skill. |
+| `GET …/skills/learned/{skill_id}` | The skill with `body` and `versions`, each with `version`, `change`, `name`, `description`, `category`, `body`, `source` (`kind`, `run_id`, `session_id`, `job_id`), `evidence` (`message_ids`, `observation_ids`), `rationale`, `created_at`. |
+| `PATCH …/skills/learned/{skill_id}` | `{"expected_version": n, …}` with any of `name`, `description`, `body`, `category`. |
+| `POST …/{skill_id}/rollback` | `{"expected_version": n, "version": m}`: a new version equal to version `m`. |
+| `POST …/{skill_id}/suspend`, `…/resume` | `{"expected_version": n}`. |
+| `DELETE …/{skill_id}?expected_version=n` | Retire the skill: `{"retired": true}`. The history is kept until the profile is deleted. |
+
+Each skill is `{"id", "name", "description", "category", "state", "version", "origin", "created_at", "updated_at",
+"consumer_changed_at", "stats": {"loads_30d", "up_30d", "down_30d", "completed_30d", "failed_30d",
+"cancelled_30d"}}`; `origin` is who created it. The `stats` cover the last 30 days and add up the versions since the
+current text began (a rollback to older text starts again from that text; a suspend or resume does not reset them):
+`loads_30d` counts `skill_view` loads, the `up` and `down` counts are the ratings of the loading runs, and the other
+three are the loading runs' terminal statuses. Every change route except DELETE returns the
+skill with its `body`. A change names the version it expects: 409 `version_conflict` when the skill has moved on.
+Other errors: 404
+`learned_skill_not_found`, 409 `name_taken` (an active or suspended skill has the name), 409 `skill_limit` (50
+reached), 409 `skill_retired` (a retired skill cannot change), and 400 `invalid_input` for a missing or non-integer
+`expected_version`, an invalid field, an invalid `state`, a rollback to a version that does not exist, or a suspend
+or resume from the wrong state (resume needs a suspended skill, suspend an active one). All routes answer 404
+`profile_not_found` for a missing or foreign profile, and 409 `profile_deletion_busy` while the profile is being
+deleted.
+
+With `learning` on, the background memory review can also record observations: short notes of a method and how it
+turned out (`corrected`, `worked`, `failed` or `requested`), each citing messages of the reviewed text, at most 5 per
+review. They are stored privately, pending for 30 days, and are the input of the dream (see Dreams).
+
+A learned skill is suspended automatically when its current version has at least 3 `down` ratings in 30 days and more
+`down` than `up`, but only while `learning` is on. The change is recorded as a version with change `suspend` and
+source kind `automatic`; resume it like any suspended skill.
+Resuming writes a new version, and suspension counts only ratings on runs that loaded the current version, so a
+resumed skill is suspended again only after 3 new `down` ratings (and more `down` than `up`) on the resumed version.
+The `stats` still include the earlier ratings, because they cover the whole current text.
+
+## Run feedback
+
+A consumer can rate a finished run. One rating per run; a new `PUT` replaces the old one. The routes work whether or
+not `learning` is enabled, like the memory routes.
+
+| Route | Body and result |
+|---|---|
+| `PUT …/runs/{run_id}/feedback` | `{"rating": "up" or "down", "comment"?}`. Returns `{"run_id", "rating", "comment", "created_at", "updated_at", "suspended": […]}`; `suspended` lists the ids of learned skills this rating suspended (usually empty). |
+| `GET …/runs/{run_id}/feedback` | The same object without `suspended`. |
+| `DELETE …/runs/{run_id}/feedback` | `{"deleted": true}`. |
+
+`comment` is optional text of at most 2000 characters, checked like memory text (secrets and instruction-like text
+are refused); it is stored as data and never treated as instructions. Feedback is accepted once the run has finished
+(any terminal status). With `learning` on, a rating also records a `feedback_up` or `feedback_down` observation for
+the run's session, without a model call; replacing or deleting the rating drops its observation if still pending. A
+`down` rating on a run that loaded a learned skill counts toward that skill's automatic suspension. Deleting a
+session or a profile deletes its feedback.
+
+Errors: 400 `invalid_input` (a rating other than `up` or `down`, or an invalid comment), 404 `run_not_found`, 404
+`feedback_not_found` (`GET` or `DELETE` on a run with no rating), 404 `profile_not_found`, 409 `run_not_terminal`
+(the run has not finished), and 409 `profile_deletion_busy` while the profile is being deleted.
+
+## Dreams
+
+With `learning` on, a background job called a dream consolidates a profile's pending observations into learned
+skills: it creates, revises, merges and retires skills and dismisses observations that teach nothing. These routes
+inspect dreams and retry a failed one; they work whether or not `learning` is enabled, like the memory routes, and
+return no conversation text.
+
+| Route | Body and result |
+|---|---|
+| `GET …/dreams?status=&limit=` | Dreams newest first. `status` is `pending`, `running`, `done`, `failed` or `discarded`; `limit` is 1-100 (default 20). Returns `{"dreams": […]}`. |
+| `POST …/dreams/{dream_id}/retry` | Requeue a `failed` dream with fresh attempts and the profile's current model; returns it. Retrying a `pending` or `running` dream returns it unchanged. |
+
+```json
+{"dreams": [{"id": "9c1e…", "status": "done", "trigger": "observations", "attempts": 1, "error_code": null,
+  "error": null, "provider": "bedrock", "model": "…",
+  "usage": [{"attempt": 1, "outcome": "committed", "requests": 4,
+             "usage": {"input_tokens": 21040, "output_tokens": 910,
+                       "cache_read_tokens": null, "cache_write_tokens": null}}],
+  "changes": {"skills": [{"action": "create", "skill_id": "7ab…", "name": "release-notes", "version": 1}],
+              "consumed": ["3f0a…", "5d2c…", "b81e…"], "dismissed": ["c47d…"]},
+  "created_at": 1761800000.0, "updated_at": 1761800120.0, "finished_at": 1761800120.0}]}
+```
+
+`trigger` is why the dream was queued: `observations` (enough new pending observations), `interval` (a day since the
+last dream), `feedback` (a `down` rating on a run that loaded a learned skill) or `suspension` (a skill was
+suspended automatically). `changes` lists the skills the dream wrote (`action` is `create`, `revise`, `merge` or
+`retire`), the observations it used (`consumed`) and the ones it dismissed; it is empty until the dream is `done`.
+`usage` lists the last 20 attempts; an unknown count is `null`. A failed dream does not block the next one: when new
+evidence makes the profile due again, a new dream is queued beside the failed one, which stays until an operator
+retries it. After a `no_route` or `model_unavailable` failure no new dream is queued until the profile completes a
+run on another model or the failed one is retried. `discarded` means its profile, learning switch or memory switch changed underneath it.
+
+Errors: 400 `invalid_input` (an unknown `status`, or a `limit` outside 1-100), 404 `dream_not_found`, 404
+`profile_not_found`, 409 `dream_not_retryable` (the dream is `done` or `discarded`), 409 `dream_busy` (another dream
+of this profile is queued or running), and 409 `profile_deletion_busy` while the profile is being deleted.
 
 ## Verifying a model
 
@@ -220,7 +389,7 @@ not answer (rate limit, server error, timeout) is 503 `unavailable`.
 ## Deleting a profile
 
 `DELETE /v1/profiles/{profile_id}` with a JSON body `{"operation_id": "<uuid>"}` removes one profile's sessions,
-messages, runs, events, blobs, memory and model/persona configuration, and retires its sandbox by exact recorded
+messages, runs, events, blobs, memory, learned skills and model/persona configuration, and retires its sandbox by exact recorded
 container identity. It is tenant-owned and resumable: a retry with the same operation id continues from the
 persisted phase. A different operation id while a deletion is active is refused with 409 `profile_deletion_busy`.
 
@@ -251,8 +420,15 @@ remove a container by name alone.
 | 400 | `model_not_vision_capable` | The input has images and the model cannot read them. |
 | 401 | `unauthorized` | Missing or wrong key. |
 | 404 | `profile_not_found`, `session_not_found`, `run_not_found` | No such object. |
+| 404 | `dream_not_found` | No such dream in this profile. |
 | 404 | `memory_not_found` | No such memory entry in this profile. |
-| 409 | `version_conflict` | The memory entry changed since `expected_version`. |
+| 404 | `learned_skill_not_found` | No such learned skill in this profile. |
+| 404 | `feedback_not_found` | The run has no feedback. |
+| 409 | `run_not_terminal` | Feedback is accepted only once the run has finished. |
+| 409 | `version_conflict` | The memory entry or learned skill changed since `expected_version`. |
+| 409 | `name_taken`, `skill_limit`, `skill_retired` | A learned skill's name is in use, the profile has 50 active or suspended skills, or the skill is retired. |
+| 409 | `dream_not_retryable` | Only a failed dream can be retried. |
+| 409 | `dream_busy` | Another dream of the profile is queued or running. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |
 | 409 | `sandbox_busy` | `PUT /v1/profiles/{id}` would change the effective sandbox policy (including enabling or clearing it) while the profile has a queued, running or stopping run, unreleased sandbox usage, or unresolved sandbox work. Nothing in the request is applied. |
 | 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |

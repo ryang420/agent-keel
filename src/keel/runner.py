@@ -14,6 +14,7 @@ from keel import prompts
 from keel import compress
 from keel.compactor import Compactor, SessionContext
 from keel.compress import Boundaries
+from keel.learned import IndexEntry
 from keel.memory import snapshot as memory_snapshot
 from keel.models import (
     Completed, ImagePart, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
@@ -109,7 +110,7 @@ class RunExecutor:
                  max_iterations: int = DEFAULT_MAX_ITERATIONS, mount_root: str | None = None,
                  skills_ttl_s: float = 60.0, clock=time.monotonic,
                  now=lambda: datetime.now(UTC), compression_threshold: float = 0.75, background=None,
-                 memory_chars: int = 2200, user_chars: int = 1375, memory_review_turns: int = 10) -> None:
+                 memory_chars: int = 2200, user_chars: int = 1375) -> None:
         self.store = store
         self.bus = bus
         self.providers = providers
@@ -117,7 +118,6 @@ class RunExecutor:
         self.background = background
         self.memory_chars = memory_chars
         self.user_chars = user_chars
-        self.memory_review_turns = memory_review_turns
         self.max_iterations = max_iterations
         self.mount_root = mount_root
         self.skills_ttl_s = skills_ttl_s
@@ -152,10 +152,10 @@ class RunExecutor:
 
     async def _finish(self, run: Run, status: str, *, output: str, usage: Usage,
                       error_code: str | None = None, error: str | None = None,
-                      incomplete: bool = False) -> bool:
+                      incomplete: bool = False, capped: bool = False) -> bool:
         """Commit the terminal transition; True only when this executor won it, so completion work may run."""
         transition = await self.store.finish_run(run.id, status, output=output, usage=usage, error_code=error_code,
-                                                 error=error, incomplete=incomplete)
+                                                 error=error, incomplete=incomplete, capped=capped)
         if transition is None or transition.event is None:
             return False
         await self.bus.notify(run.id)
@@ -338,10 +338,15 @@ class RunExecutor:
                               session_id=run.session_id, run_id=run.id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
         desired: list[str] = []
+        sandboxed = ctx is not None
         if ctx is not None:
             desired.extend(prompts.TOOL_ORDER)
         if profile is not None and profile.memory:
             desired += ["memory", "session_search"]
+        learning = bool(profile is not None and profile.memory and profile.learning)
+        if learning:
+            desired += [name for name in ("skills_list", "skill_view") if name not in desired]
+            desired.append("skill_manage")
         if ctx is None:
             cwd = session.cwd if session and session.cwd else "/"
             ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id,
@@ -354,11 +359,20 @@ class RunExecutor:
             if profile is not None and profile.memory:
                 entries = await self.store.memory_entries(run.profile_id)
                 snapshot = memory_snapshot(entries["memory"], entries["user"])
+            index = list(skills)
+            if learning:
+                shipped = {skill.name for skill in skills}
+                for learned in await self.store.learned_skills(run.profile_id, states=("active",)):
+                    if learned.name in shipped:
+                        log.warning("profile %s: learned skill %s has a deployment skill's name and is not listed",
+                                    run.profile_id, learned.name)
+                        continue
+                    index.append(IndexEntry(learned.name, learned.description))
             return build_system_prompt(
                 soul=profile.soul if profile else "", model=run.model, provider=run.provider, now=self._now(),
-                tools=bool(desired), skills=skills, workdir=policy.workdir if policy else None,
+                tools=bool(desired), skills=index, workdir=policy.workdir if policy else None,
                 memory=bool(profile and profile.memory), memory_snapshot=snapshot,
-                history="session_search" in desired), tuple(desired)
+                history="session_search" in desired, learning=learning), tuple(desired)
 
         system = session.system_prompt if session else None
         if system is None:
@@ -367,9 +381,12 @@ class RunExecutor:
                                                           tools=built)
             system = session.system_prompt
         # The tool list is fixed with the prompt; a session stored before tool lists existed keeps the tools it
-        # was offered then (no session_search) until its next compaction.
-        offered = tuple(name for name in (session.tools if session.tools is not None else desired)
-                        if name in HANDLERS and (session.tools is not None or name != "session_search"))
+        # was offered then (no session_search, no learning tools) until its next compaction.
+        if session.tools is not None:
+            offered = tuple(name for name in session.tools if name in HANDLERS)
+        else:
+            later = {"session_search", "skill_manage"} | (set() if sandboxed else {"skills_list", "skill_view"})
+            offered = tuple(name for name in desired if name in HANDLERS and name not in later)
         stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
         # before this turn so the request pairs every call.
@@ -402,7 +419,8 @@ class RunExecutor:
                 state.pending = []
                 raise
             if not calls:
-                if await self._finish(run, "completed", output=output, usage=state.usage, incomplete=incomplete):
+                if await self._finish(run, "completed", output=output, usage=state.usage, incomplete=incomplete,
+                                     capped=final):
                     # The worker may cancel a terminal run at any moment; completion work still finishes.
                     await self._shielded(run, self._after_complete(run, profile), "finish the completed run")
                 return
@@ -571,10 +589,9 @@ class RunExecutor:
                 continue
 
     async def _after_complete(self, run: Run, profile) -> None:
-        """A completed run may be renamed, and every memory_review_turns runs may start a memory review.
+        """A completed run may be renamed. Its memory review was queued by finish_run itself.
 
-        A fenced profile starts no new background work: the deletion drains what
-        exists and must not race a review spawned by a just-finished run.
+        A fenced profile starts no new background work: the deletion drains what exists.
         """
         if run.profile_incarnation is None or await self.store.get_profile_deletion(run.profile_id) is not None:
             return
@@ -583,19 +600,6 @@ class RunExecutor:
                                and profile.incarnation != run.profile_incarnation):
             return
         await self._maybe_title(run)
-        if profile is not None and profile.memory and self.background is not None:
-            try:
-                due = await self.store.note_memory_turn(
-                    run.session_id, self.memory_review_turns, profile_incarnation=run.profile_incarnation)
-            except ProfileIncarnationMismatch:
-                return
-            if due:
-                from keel.review import claim, release, run_review
-                if claim(run.profile_id):
-                    if not self.background.spawn(run_review(self, run), f"keel-review-{run.profile_id}",
-                                                 profile_id=run.profile_id,
-                                                 profile_incarnation=run.profile_incarnation):
-                        release(run.profile_id)
 
     async def _maybe_title(self, run: Run) -> None:
         """After the first completed run, ask the model to name a session that still has a derived title, from every

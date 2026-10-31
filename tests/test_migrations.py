@@ -16,9 +16,11 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("history_backfill, message_tokens, message_search, sandbox_execs, sandbox_operations, sandbox_uses, "
-              "sandboxes, schema_version, memory_mutations, memory_changes, memory_revisions, memory_entries, "
-              "run_events, runs, messages, sessions, profiles, tenants, blobs")
+ALL_TABLES = ("dream_attempts, dream_jobs, run_feedback, skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, "
+              "learned_skills, memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, "
+              "sandbox_execs, "
+              "sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, memory_changes, "
+              "memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, tenants, blobs")
 
 # keel 0.2.0's schema as released (src/keel/store/sql.py at v0.2.0). Kept apart from migration 1, which must
 # reproduce it, so that an edit to migration 1 fails the schema comparison below.
@@ -95,6 +97,46 @@ async def restore_legacy_memories(db) -> None:
         await db.execute(f"DROP TABLE {table}")
     await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
+
+
+async def restore_pre_dreams(db) -> None:
+    """Undo migration 13 on a database that is being rewound to an older schema version."""
+    for table in ("dream_attempts", "dream_jobs"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("DROP INDEX lesson_observations_pending")
+    await db.execute("ALTER TABLE lesson_observations DROP COLUMN note")
+
+
+async def restore_pre_observations(db) -> None:
+    """Undo migrations 13 and 12 on a database that is being rewound to an older schema version."""
+    await restore_pre_dreams(db)
+    await db.execute("DROP TABLE run_feedback")
+    await db.execute("DROP INDEX lesson_observations_job")
+    await db.execute("ALTER TABLE lesson_observations DROP COLUMN review_job_id")
+    await db.execute("ALTER TABLE lesson_observations DROP COLUMN run_id")
+    await db.execute("ALTER TABLE runs DROP COLUMN capped")
+
+
+async def restore_pre_learning(db) -> None:
+    """Undo migration 11 on a database that is being rewound to an older schema version."""
+    for table in ("skill_loads", "lesson_observations", "learned_skill_evidence", "learned_skill_versions",
+                  "learned_skills"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("ALTER TABLE profiles DROP COLUMN learning")
+
+
+async def insert_old_profile(db, profile_id: str, tenant_id: int) -> None:
+    """Write a profile row into a database older than migration 11, which `upsert_profile` can no longer reach."""
+    await db.execute("INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id, "
+                     "incarnation) VALUES (?, '[]', '{}', '', '[]', 1.0, 0, ?, ?)", profile_id, tenant_id, "inc")
+
+
+async def restore_pre_review_queue(db) -> None:
+    """Undo migration 10 on a database that is being rewound to an older schema version."""
+    for table in ("memory_review_jobs", "memory_reviews"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("ALTER TABLE sessions DROP COLUMN generation")
+    await db.execute("ALTER TABLE sessions ADD COLUMN turns_since_memory INTEGER NOT NULL DEFAULT 0")
 
 
 async def restore_pre_history_index(db) -> None:
@@ -386,7 +428,7 @@ async def test_m3_fields_read_their_defaults_on_a_fresh_database(db_url):
         session = await store.ensure_session("p1", "s1")
         assert (session.summary, session.summary_head_id, session.summary_tail_id) == (None, None, None)
         assert (session.context_tokens, session.context_message_id, session.compaction_failed_at) == (None, None, None)
-        assert session.turns_since_memory == 0
+        assert session.generation
         assert session.pruned_id is None
     finally:
         await store.close()
@@ -398,7 +440,7 @@ async def test_an_upgraded_0_2_0_database_gets_the_m3_defaults(db_url):
     try:
         assert (await store.get_profile("p1")).memory is False
         session = await store.get_session("p1", "s1")
-        assert session.summary is None and session.turns_since_memory == 0 and session.title == "Old chat"
+        assert session.summary is None and session.generation and session.title == "Old chat"
         assert session.pruned_id is None
     finally:
         await store.close()
@@ -408,6 +450,9 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await restore_pre_observations(store.db)
+    await restore_pre_learning(store.db)
+    await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
@@ -464,6 +509,9 @@ async def test_a_v4_database_gains_the_coordination_tables(db_url):
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await restore_pre_observations(store.db)
+    await restore_pre_learning(store.db)
+    await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
     await store.db.execute("ALTER TABLE runs DROP COLUMN profile_incarnation")
@@ -616,7 +664,7 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
     monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:7])
     monkeypatch.setattr(migrations, "LATEST_VERSION", 7)
     store = await open_store(db_url)
-    await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[], tenant_id=1)
+    await insert_old_profile(store.db, "p1", 1)
     await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
                            "p1", "user", json.dumps(["likes tea", "likes tea", "works late"]), 5.0)
     await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
@@ -626,7 +674,7 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
 
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == 9
+        assert await schema_version(upgraded.db) == LATEST_VERSION
         # Order and duplicates survive exactly; the rendered snapshot is unchanged.
         assert await upgraded.memory_entries("p1") == {"memory": [], "user": ["likes tea", "likes tea", "works late"]}
         items = await upgraded.memory_items("p1")
@@ -646,7 +694,7 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
     monkeypatch.setattr(migrations, "LATEST_VERSION", 8)
     store = await open_store(db_url)
     for profile in ("p1", "p2"):
-        await store.upsert_profile(profile, models=[], sandbox={}, soul="", skills=[], tenant_id=1)
+        await insert_old_profile(store.db, profile, 1)
         await store.ensure_session(profile, f"{profile}-s")
     ids = {}
     for profile in ("p1", "p2"):
@@ -661,7 +709,7 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
 
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == 9
+        assert await schema_version(upgraded.db) == LATEST_VERSION
         rows = await upgraded.db.fetch(
             "SELECT profile_id, done_through, ceiling FROM history_backfill ORDER BY profile_id")
         assert [(r["profile_id"], r["done_through"], r["ceiling"]) for r in rows] == [
@@ -674,3 +722,96 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
         assert (await upgraded.db.fetchrow("SELECT COUNT(*) AS n FROM message_search"))["n"] == 4
     finally:
         await upgraded.close()
+
+
+async def test_migration_10_adds_review_tables_and_session_generations(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.ensure_session("p1", "s1")
+        await store.ensure_session("p1", "s2")
+        await store.db.execute("UPDATE schema_version SET version = 9")
+        await restore_pre_observations(store.db)
+        await restore_pre_learning(store.db)
+        await restore_pre_review_queue(store.db)
+    finally:
+        await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        assert {"memory_reviews", "memory_review_jobs"} <= await database_table_names(upgraded.db)
+        first, second = [await upgraded.get_session("p1", name) for name in ("s1", "s2")]
+        assert first.generation and second.generation and first.generation != second.generation
+        columns = {row["column_name"] for row in await upgraded.db.fetch(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'sessions'")}
+        assert "turns_since_memory" not in columns
+        assert await upgraded.db.fetchrow("SELECT 1 AS n FROM memory_reviews") is None  # no auto-review of old history
+    finally:
+        await upgraded.close()
+
+
+async def test_migration_11_adds_the_learning_flag_and_tables(db_url):
+    store = await open_store(db_url)
+    try:
+        assert (await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])).learning is False
+        for table in ("learned_skills", "learned_skill_versions", "learned_skill_evidence", "lesson_observations",
+                      "skill_loads"):
+            assert (await store.db.fetchrow(f"SELECT COUNT(*) AS n FROM {table}"))["n"] == 0
+    finally:
+        await store.close()
+
+
+async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.db.execute("UPDATE schema_version SET version = 10")
+        await restore_pre_observations(store.db)
+        await restore_pre_learning(store.db)
+    finally:
+        await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        assert (await upgraded.get_profile("p1")).learning is False
+        assert {"learned_skills", "learned_skill_versions", "learned_skill_evidence", "lesson_observations",
+                "skill_loads"} <= await database_table_names(upgraded.db)
+    finally:
+        await upgraded.close()
+
+
+async def test_migration_12_adds_capped_runs_feedback_and_observation_sources(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.ensure_session("p1", "s1")
+        run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                     reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                     instructions=None)
+        assert (await store.get_run("p1", run.id)).capped is False
+        assert (await store.db.fetchrow("SELECT COUNT(*) AS n FROM run_feedback"))["n"] == 0
+        await store.db.fetchrow("SELECT review_job_id, run_id FROM lesson_observations LIMIT 1")
+    finally:
+        await store.close()
+
+
+async def test_migration_13_adds_dream_jobs_to_a_version_12_database(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[], memory=True, learning=True)
+        await store.db.execute("UPDATE schema_version SET version = 12")
+        await restore_pre_dreams(store.db)
+    finally:
+        await store.close()
+    store = await open_store(db_url)
+    try:
+        assert await schema_version(store.db) == LATEST_VERSION == 13
+        assert await store.db.fetch("SELECT * FROM dream_jobs") == []
+        assert await store.db.fetch("SELECT * FROM dream_attempts") == []
+        column = await store.db.fetchrow(
+            "SELECT 1 AS found FROM information_schema.columns WHERE table_name = 'lesson_observations' "
+            "AND column_name = 'note'")
+        assert column is not None
+        assert (await store.get_profile("p1")).learning
+    finally:
+        await store.close()

@@ -19,9 +19,14 @@ from keel.store.base import (
 )
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
+from keel.store.feedback import FeedbackStoreMixin
 from keel.store.history import HistoryStoreMixin
+from keel.store.learned import LearnedSkillStoreMixin
 from keel.store.memory import MemoryStoreMixin
+from keel.store.observations import ObservationStoreMixin
 from keel.store.migrations import migrate
+from keel.store.dreams import DreamStoreMixin
+from keel.store.reviews import ReviewStoreMixin
 from keel.store.sandboxes import SandboxStoreMixin
 from keel.store.deletions import ProfileDeletionAuthority, ProfileDeletionStoreMixin
 
@@ -35,7 +40,8 @@ def _j(value) -> str:
 def _profile(row: dict) -> Profile:
     return Profile(id=row["id"], models=json.loads(row["models"]), sandbox=json.loads(row["sandbox"]),
                    soul=row["soul"], skills=json.loads(row["skills"]), updated_at=row["updated_at"],
-                   memory=bool(row["memory"]), tenant_id=row["tenant_id"], incarnation=row.get("incarnation"))
+                   memory=bool(row["memory"]), tenant_id=row["tenant_id"], incarnation=row.get("incarnation"),
+                   learning=bool(row["learning"]))
 
 
 def _session(row: dict) -> Session:
@@ -45,9 +51,9 @@ def _session(row: dict) -> Session:
         system_prompt=row["system_prompt"], provider=row["provider"], model=row["model"], cwd=row["cwd"],
         summary=row["summary"], summary_head_id=row["summary_head_id"], summary_tail_id=row["summary_tail_id"],
         context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
-        compaction_failed_at=row["compaction_failed_at"], turns_since_memory=row["turns_since_memory"],
-        pruned_id=row["pruned_id"],
+        compaction_failed_at=row["compaction_failed_at"], pruned_id=row["pruned_id"],
         tools=tuple(json.loads(row["tools"])) if row.get("tools") is not None else None,
+        generation=row.get("generation"),
     )
 
 
@@ -69,7 +75,7 @@ def _run(row: dict) -> Run:
         row["reasoning_effort"], json.loads(row["input"]), row["instructions"], row["output"],
         Usage.from_dict(json.loads(row["usage"])), row["error_code"], row["error"], row["lease_owner"],
         row["lease_expires_at"], row["created_at"], row["started_at"], row["finished_at"],
-        row["current_exec_id"], row["profile_incarnation"],
+        row["current_exec_id"], row["profile_incarnation"], bool(row["capped"]),
     )
 
 
@@ -77,7 +83,9 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
+class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin,
+               ObservationStoreMixin, ReviewStoreMixin, DreamStoreMixin, SandboxStoreMixin,
+               ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
@@ -116,22 +124,27 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDe
     # profiles
 
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
-                             skills: list[str], memory: bool = False, tenant_id: int | None = None) -> Profile:
+                             skills: list[str], memory: bool = False, learning: bool = False,
+                             tenant_id: int | None = None) -> Profile:
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             await self.assert_profile_writable(profile_id)
             incarnation = uuid.uuid4().hex
-            await self.db.execute(
-            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id, incarnation) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            previous = await self.db.fetchrow("SELECT memory FROM profiles WHERE id = ?", profile_id)
+            written = await self.db.fetchrow(
+            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, learning, tenant_id, "
+            "incarnation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET models = excluded.models, sandbox = excluded.sandbox, "
             "soul = excluded.soul, skills = excluded.skills, updated_at = excluded.updated_at, "
-            "memory = excluded.memory, tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id), "
+            "memory = excluded.memory, learning = excluded.learning, "
+            "tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id), "
             "incarnation = COALESCE(profiles.incarnation, excluded.incarnation) "
             "WHERE excluded.tenant_id IS NULL OR profiles.tenant_id IS NULL "
-            "OR profiles.tenant_id = excluded.tenant_id",
-                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), tenant_id,
-                incarnation)
+            "OR profiles.tenant_id = excluded.tenant_id RETURNING id",
+                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), int(learning),
+                tenant_id, incarnation)
+            if written is not None and memory and (previous is None or not previous["memory"]):
+                await self._restart_reviews(profile_id)
         saved = await self.get_profile(profile_id)
         if tenant_id is not None and (saved is None or saved.tenant_id != tenant_id):
             raise ProfileTenantMismatch(profile_id)
@@ -196,39 +209,6 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDe
                     and create["cleanup_operation_id"] == row["id"]):
                 continue
             raise SandboxBusy("the profile has unresolved sandbox lifecycle work")
-
-    # memory
-
-    async def reset_memory_turns(self, session_id: str, *, profile_incarnation: str | None = None) -> None:
-        async with self.db.transaction():
-            session = await self.db.fetchrow("SELECT profile_id FROM sessions WHERE id = ?", session_id)
-            if session is None:
-                return
-            profile_id = session["profile_id"]
-            if profile_incarnation is not None:
-                await self.lock_profile(profile_id)
-                await self._check_profile_incarnation(profile_id, profile_incarnation)
-            await self.db.execute(
-                "UPDATE sessions SET turns_since_memory = 0 WHERE id = ? AND profile_id = ?",
-                session_id, profile_id)
-
-    async def note_memory_turn(self, session_id: str, threshold: int, *,
-                               profile_incarnation: str | None = None) -> bool:
-        """Count one completed run toward the next review. At the threshold the counter returns to 0 and this
-        is True."""
-        async with self.db.transaction():
-            session = await self.db.fetchrow("SELECT profile_id FROM sessions WHERE id = ?", session_id)
-            if session is None:
-                return False
-            profile_id = session["profile_id"]
-            if profile_incarnation is not None:
-                await self.lock_profile(profile_id)
-                await self._check_profile_incarnation(profile_id, profile_incarnation)
-            row = await self.db.fetchrow(
-                "UPDATE sessions SET turns_since_memory = CASE WHEN turns_since_memory + 1 >= ? THEN 0 "
-                "ELSE turns_since_memory + 1 END WHERE id = ? AND profile_id = ? RETURNING turns_since_memory",
-                threshold, session_id, profile_id)
-        return row is not None and row["turns_since_memory"] == 0
 
     # sessions
 
@@ -391,6 +371,13 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDe
                 "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute(
                 "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            for table in ("lesson_observations", "skill_loads", "learned_skill_evidence", "run_feedback"):
+                await self.db.execute(f"DELETE FROM {table} WHERE profile_id = ? AND session_id = ?",
+                                      profile_id, session_id)
+            await self.db.execute(
+                "UPDATE learned_skill_versions SET run_id = NULL, session_id = NULL, tool_call_id = NULL "
+                "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            await self._forget_session_reviews(profile_id, session_id)
             await self.db.execute("DELETE FROM sessions WHERE id = ?", session_id)
         return True
 
@@ -586,7 +573,7 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDe
 
     async def finish_run(self, run_id: str, status: str, *, output: str = "", usage: Usage = Usage(),
                          error_code: str | None = None, error: str | None = None,
-                         incomplete: bool = False,
+                         incomplete: bool = False, capped: bool = False,
                          deletion_authority: ProfileDeletionAuthority | None = None) -> RunTransition | None:
         """Finish an active run and insert its terminal event in one transaction.
 
@@ -599,6 +586,8 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDe
             raise ValueError("a failed run needs an error code and a message")
         if incomplete and status != "completed":
             raise ValueError("only a completed run can be incomplete")
+        if capped and status != "completed":
+            raise ValueError("only a completed run can be capped")
         async with self.db.transaction():
             if deletion_authority is not None:
                 profile_id = await self.db.fetchrow("SELECT profile_id FROM runs WHERE id = ?", run_id)
@@ -614,11 +603,13 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDe
             now = self.clock()
             updated = await self.db.fetchrow(
                 "UPDATE runs SET status = ?, output = ?, usage = ?, error_code = ?, error = ?, finished_at = ?, "
-                f"lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN {_IN_FLIGHT} RETURNING *",
-                status, output, _j(usage.to_dict()), error_code, error, now, run_id)
+                f"capped = ?, lease_owner = NULL, lease_expires_at = NULL "
+                f"WHERE id = ? AND status IN {_IN_FLIGHT} RETURNING *",
+                status, output, _j(usage.to_dict()), error_code, error, now, int(capped), run_id)
             if updated is None:  # unreachable under the lock; never invent an event
                 return RunTransition(_run(row), None)
             if status == "completed":
+                await self._mark_review_dirty(updated)
                 data = {"output": output, "usage": usage.to_dict()}
                 if incomplete:
                     data["incomplete"] = True

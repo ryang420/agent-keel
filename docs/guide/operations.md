@@ -121,6 +121,152 @@ SELECT profile_id, done_through, ceiling FROM history_backfill WHERE done_throug
 
 Every instance must run this release: an older instance writes messages the index never sees.
 
+## Memory reviews
+
+Memory-enabled profiles review new conversation text in the background (cross-session memory design §4). The work is
+in PostgreSQL: `memory_reviews` keeps each session's reviewed and unreviewed range, and `memory_review_jobs` holds the
+jobs. Each instance runs `KEEL_MEMORY_REVIEW_WORKERS` review loops (default 1) beside its run workers. A job holds a
+lease on database time, renewed every third of `KEEL_LEASE_SECONDS`; a worker that stops renewing loses the job to
+another instance and cannot write afterwards. At most one review runs per profile across all instances.
+
+A job tries at most three times; failed attempts back off 30 s, then 60 s, while a job whose lease expired is
+retried at once with no backoff. A model that is no longer enabled for the profile
+(`model_unavailable`) and provider errors that are not transient fail at once. A review whose input would exceed its
+budget ends the attempt with `budget` and is retried, each retry of the same chunk reviewing half as much new text
+(down to 250 tokens). Inspect jobs with `GET /v1/profiles/{p}/memory/reviews` and requeue a failed one with
+`POST …/reviews/{id}/retry`. A failed job holds back its session's later reviews until it is retried; other sessions
+are unaffected. Each attempt's token usage is on the job.
+
+Deleting a session removes its review state and jobs; deleting a profile removes all of them and fences any review
+still running. Turning memory off and on again discards the profile's queued, failed and running reviews (a running
+one cannot write afterwards) and starts again from the next completed run. Migration 10 queues nothing for existing
+conversations. It rewrites the `sessions` table (each row gets its own generation) under an exclusive lock, so
+expect it to take time on large tables. Like migration 9, it needs every instance on this version before runs
+start again (no mixed-version rollout): an older binary still counts turns in a column that no longer exists.
+
+## Learned skills
+
+Profiles with `learning` on keep learned skills in PostgreSQL (migration 11: `learned_skills`, their immutable
+`learned_skill_versions` and `learned_skill_evidence`, `lesson_observations` and `skill_loads`). Migration 11
+adds a column and tables only, and needs no backfill. Inspect a profile's skills with `GET /v1/profiles/{p}/skills/learned` (state, version, origin and 30-day
+load counts) and one skill's full history with `GET …/skills/learned/{id}`: each version has its source (the run,
+session and message, or `consumer`), evidence and rationale. Act on a bad skill through the same API:
+
+- `POST …/{id}/suspend` takes it out of the prompt index, `skills_list` and `skill_view` at once for new sessions
+  and for `skill_view` in open ones, keeping it for `…/resume`.
+- `POST …/{id}/rollback` with a `version` writes a new version equal to the old one; nothing is rewritten.
+- `DELETE …/{id}?expected_version=n` retires it, which frees its name and its place in the limit of 50. Versions
+  stay.
+
+Each call needs the skill's current `expected_version`; a 409 `version_conflict` means it changed, so re-read it.
+Sessions already open keep the skills index in their stored prompt until they compact.
+
+Turning `learning` off removes `skill_manage` and hides every learned skill from `skills_list` and `skill_view`
+(for new sessions, and for open ones at their next call); nothing is deleted, and turning it on again restores the
+active skills. The routes keep working while learning is off. Deleting a profile deletes its skills, versions and
+load counts. Deleting a session removes that session's skill loads, observations and evidence rows, and its version
+rows lose their run and session provenance; the skills and their text stay.
+
+Before enabling `learning` on any profile (and before deleting a profile that has learned skills), upgrade every
+serving and worker instance to this version, as for migrations 9 and 10. An instance still on migration 10 deletes
+sessions and profiles without touching the learned tables.
+
+### Observations, feedback and suspension
+
+With `learning` on, the memory review also offers the model an `observe` tool, staged with its memory proposal and
+committed with it (a failed review leaves none): at most 5 per review, each citing messages of the reviewed text, and
+`worked` only for a run that completed without reaching its iteration cap. They are private to the profile and
+visible through the store only; the dream (below) consumes them. A pending observation not
+consumed within 30 days expires; the worker's hourly maintenance pass does this (it now always runs, with or without
+`KEEL_EVENT_RETENTION_DAYS`), on any instance, and repeating it is harmless.
+
+Consumers rate runs with `PUT /v1/profiles/{p}/runs/{r}/feedback`, which with learning on also records an observation.
+A learned skill whose current version has 3 or more `down` ratings in 30 days, and more `down` than `up`, is
+suspended automatically while learning is on: its versions list a `suspend` change with source `automatic` and a
+rationale giving the counts. To bring it back, fix or roll back the text and `POST …/{id}/resume`. Resuming writes
+a new version, and suspension counts only ratings on runs that loaded the current version, so a resumed skill is
+suspended again only after 3 new `down` ratings (and more `down` than `up`) on the resumed version. The `stats` still
+include the earlier ratings, because they cover the whole current text. Ratings are removed with
+`DELETE …/runs/{r}/feedback`, or with the session or profile.
+
+Migration 12 adds `runs.capped`, the observation's review job and run columns, and the `run_feedback` table. It needs
+no backfill; runs that finished earlier count as not capped. Upgrade every serving and worker instance before relying
+on feedback and observations, as for migration 11: an instance still on migration 11 deletes sessions and profiles
+without removing feedback, and does not record whether a run reached its cap.
+
+### Dreams
+
+With `learning` on, the memory review workers also run dreams (migration 13: `dream_jobs` and `dream_attempts`, with
+the observations' `consumed_by` and `note` columns written by the commit). A dream reads the profile's pending
+observations and writes learned skills; no new process or setting turns it on.
+
+A profile becomes due when it has pending observations, the newest is at least `KEEL_DREAM_DEBOUNCE_SECONDS` (one
+hour) old, and one of these holds. The first three count only evidence newer than the input of the last completed
+dream:
+
+- `feedback`: a pending `feedback_down` observation of a run that loaded a learned skill.
+- `suspension`: a learned skill was suspended automatically.
+- `observations`: at least `KEEL_DREAM_MIN_OBSERVATIONS` (8) pending observations.
+- `interval`: the oldest pending observation and the last completed dream are both at least a day old
+  (`KEEL_DREAM_INTERVAL_SECONDS`), so even one observation is eventually consolidated. This rule looks at ages, not
+  at what is new.
+
+A failed dream does not block the next one. A profile has at most one open (pending or running) dream, and a dream
+never runs beside a memory review of the same profile; they share the profile's lease. A profile starts at most
+`KEEL_DREAM_DAILY_ATTEMPTS` (4) attempts in a rolling 24 hours; an attempt that is given back at shutdown does not
+count. Attempts use the memory review retry rules: three attempts, 30 s then 60 s backoff, a lapsed lease retried at
+once. The model is that of the profile's most recently completed run, checked again at each attempt.
+
+An attempt may take `KEEL_DREAM_ITERATIONS` (12) model iterations, `KEEL_DREAM_INPUT_TOKENS` (60,000) estimated input
+tokens in total, `KEEL_DREAM_OUTPUT_TOKENS` (4,000) output tokens per request and `KEEL_DREAM_DEADLINE_SECONDS`
+(5 minutes). It reads at most 40 pending observations, oldest first, each with the ids of the messages it cites; the
+profile's skill index with 30-day stats; at most 10 skill bodies; and the names of the deployment skills. It has
+`session_search` and `skill_view` to check evidence. A proposal cut off by a limit commits nothing.
+
+Error codes on a dream (`error_code`): `no_route` (the profile has no completed run to take a model from; not
+retried automatically), `model_unavailable` (the model is no longer enabled for the profile; not retried
+automatically), `budget` (the input budget ran out), `deadline`, `iteration_limit` and `incomplete` (the response was
+cut off), all retried; `conflict` (a skill changed after the dream read it, an observation was used elsewhere, or a
+name was taken; the retry re-reads current state); `lease_expired` (the worker stopped renewing its lease);
+`learning_disabled` and `profile_gone` (the dream is `discarded`: learning or memory was turned off, or the profile
+was replaced or is being deleted). After a `no_route` or `model_unavailable` failure no new dream is queued for the
+profile while its most recently completed run names the same model as the failed job (or still none); a completed run
+on another model, or `POST …/dreams/{id}/retry`, lifts that.
+
+Gates. When the dream stages a change, it is refused unless:
+
+- Evidence: `create`, `revise` and `merge` (which writes new text on its target) cite at least 2 observations from
+  at least 2 different sessions, or 1 `requested` observation, or 1 `feedback_up` observation with a comment.
+  `retire` cites a contradicting observation or is part of a merge. Every cited observation belongs to this dream's
+  input.
+- A new skill whose name or description overlaps a live learned skill (token overlap of 0.6) is not created.
+  Against deployment skills only an exact name clash is checked (next item); their text is not compared.
+- The text is validated like a consumer's (size limits, no secrets, no instruction-like text), and a name that a
+  deployment skill, a live learned skill or another staged change already has is refused for create, revise and
+  merge. A create is also refused when the profile already holds 50 live skills.
+- Consumer precedence: a change to a skill whose last consumer edit, rollback, suspension or resumption is newer than
+  every cited observation is refused.
+- One change per skill per dream. A revise or merge makes a suspended skill active again; a merge retires its sources
+  with the rationale "merged into <name>" and writes a `merge` version on the target.
+
+At commit, nothing is written unless the lease, the profile's incarnation, the learning flag and deletion admission
+still hold, every skill the dream read is still at the version it read (and not retired), and every used observation
+is still pending. A consumer edit made while the dream ran therefore shows up as a version conflict. The text is
+validated again, and a name taken or the skill limit reached in the meantime also fails the commit. On any conflict
+the whole proposal is discarded and the attempt fails as `conflict`; the retry re-reads current state. The changes,
+observation states and the job's completion are written in one transaction.
+
+Used observations become `consumed` with `consumed_by` set to `dream:<job id>`; dismissed ones become `dismissed`
+with the reason in `note`. Inspect dreams with `GET /v1/profiles/{p}/dreams` and requeue a failed one with `POST
+…/dreams/{id}/retry`; the learned skill's versions show each change with source `dream`. Rolling back a bad dream
+change is the consumer's lever (`POST …/skills/learned/{id}/rollback`): consumer precedence keeps a later dream
+from reapplying it from older observations. Deleting a profile removes its dream jobs and fences a running one.
+
+Migration 13 adds tables and columns only and needs no backfill. As for earlier learning migrations, upgrade every
+serving and worker instance before relying on dreams: an older instance deletes profiles without removing dream
+jobs, and leases memory reviews without checking dream jobs, so a review and a dream of one profile can overlap until
+every instance is upgraded.
+
 ## Complete profile deletion
 
 A consumer may ask the service to remove one profile completely through the delete/complete contract in

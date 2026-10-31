@@ -53,6 +53,22 @@ class ProfileIncarnationMismatch(StoreError):
     """A delayed writer belongs to an older incarnation of a deterministic profile id."""
 
 
+class ReviewNotRetryable(StoreError):
+    """Only a failed memory review can be retried."""
+
+
+class ReviewSourceGone(StoreError):
+    """The session a memory review read no longer exists in that generation."""
+
+
+class DreamNotRetryable(StoreError):
+    """Only a failed dream can be retried."""
+
+
+class DreamBusy(StoreError):
+    """Another dream of the profile is already queued or running."""
+
+
 class UniqueViolation(Exception):
     """Raised by the database adapter when a unique constraint rejects a write."""
 
@@ -72,6 +88,7 @@ class Profile:
     memory: bool = False
     tenant_id: int | None = None
     incarnation: str | None = None
+    learning: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,9 +110,9 @@ class Session:
     context_tokens: int | None = None
     context_message_id: int | None = None
     compaction_failed_at: float | None = None
-    turns_since_memory: int = 0
     pruned_id: int | None = None
     tools: tuple[str, ...] | None = None
+    generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +173,155 @@ class MemoryItem:
 
 
 @dataclass(frozen=True)
+class ReviewJob:
+    """A memory review job as operators see it: bounds, status and usage, never transcript text."""
+    id: str
+    profile_id: str
+    session_id: str
+    status: str  # "pending", "running", "done", "failed" or "discarded"
+    provider: str
+    model: str
+    source_from: int  # exclusive
+    source_through: int  # inclusive
+    cursor_message: int
+    cursor_offset: int
+    attempts: int
+    error_code: str | None
+    error: str | None
+    usage: list[dict]
+    created_at: float
+    updated_at: float
+    finished_at: float | None
+
+
+@dataclass(frozen=True)
+class ReviewClaim:
+    """A leased job. The token fences every later write: a worker whose lease lapsed cannot commit."""
+    job: ReviewJob
+    token: str
+    generation: str
+    profile_incarnation: str
+
+
+@dataclass(frozen=True)
+class DreamJob:
+    """A dream job as operators see it: trigger, route, status, usage and the changes it made; never transcript text."""
+    id: str
+    profile_id: str
+    status: str  # "pending", "running", "done", "failed" or "discarded"
+    trigger: str  # "observations", "interval", "feedback" or "suspension"
+    provider: str | None
+    model: str | None
+    attempts: int
+    error_code: str | None
+    error: str | None
+    usage: list
+    changes: dict
+    created_at: float
+    updated_at: float
+    finished_at: float | None
+
+
+@dataclass(frozen=True)
+class DreamClaim:
+    """A leased dream. The token fences every later write; `input_at` is when this attempt read its input, on the
+    content clock."""
+    job: DreamJob
+    token: str
+    profile_incarnation: str
+    input_at: float
+
+
+@dataclass(frozen=True)
+class RunFeedback:
+    run_id: str
+    session_id: str
+    rating: str  # "up" or "down"
+    comment: str | None
+    observation_id: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """One learned skill version over the statistics window: runs that loaded it, their ratings and end states."""
+    loads: int
+    up: int
+    down: int
+    completed: int
+    failed: int
+    cancelled: int
+
+
+@dataclass(frozen=True)
+class Observation:
+    """A lesson observation: what a review, feedback or a skill request saw, awaiting or past the dream."""
+    id: str
+    session_id: str
+    topic: str
+    situation: str
+    approach: str
+    outcome: str
+    evidence: tuple[int, ...]
+    loaded: tuple[tuple[str, int], ...]  # (learned skill id, version) loaded by the cited runs
+    state: str
+    review_job_id: str | None
+    run_id: str | None
+    consumed_by: str | None
+    created_at: float
+    note: str | None = None  # why a dream dismissed it
+
+
+@dataclass(frozen=True)
+class SkillSource:
+    """Who changed a learned skill. Set from trusted context, never from model arguments."""
+    kind: str  # "foreground", "dream", "consumer" or "automatic"
+    run_id: str | None = None
+    session_id: str | None = None
+    message_id: int | None = None
+    tool_call_id: str | None = None
+    job_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LearnedSkill:
+    id: str
+    name: str
+    description: str
+    category: str | None
+    body: str
+    version: int
+    state: str  # "active", "suspended" or "retired"
+    origin: str  # "foreground", "dream" or "consumer"
+    consumer_changed_at: float | None
+    created_at: float
+    updated_at: float
+
+    def summary(self) -> dict:
+        return {"id": self.id, "name": self.name, "description": self.description, "category": self.category,
+                "state": self.state, "version": self.version}
+
+
+@dataclass(frozen=True)
+class LearnedSkillVersion:
+    version: int
+    name: str
+    description: str
+    category: str | None
+    body: str
+    change: str
+    source_kind: str
+    run_id: str | None
+    session_id: str | None
+    job_id: str | None
+    rationale: str | None
+    created_at: float
+    message_ids: tuple[int, ...]
+    observation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ImportResult:
     """What SqlStore.import_session did with one conversation."""
 
@@ -187,6 +353,7 @@ class Run:
     finished_at: float | None
     current_exec_id: str | None = None
     profile_incarnation: str | None = None
+    capped: bool = False
 
 
 @dataclass(frozen=True)

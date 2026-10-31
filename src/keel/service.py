@@ -11,10 +11,13 @@ from fastapi import FastAPI
 from keel.api import Keel, create_app
 from keel.background import Background
 from keel.config import Settings
+from keel.dream import Dreamer, DreamSettings
+from keel.dream_gates import DreamRules
 from keel.events import PostgresEventBus
 from keel.providers.base import ProviderRegistry
 from keel.providers.bedrock import BedrockMantleProvider
 from keel.providers.openai import OpenAIProvider
+from keel.review import MemoryReviewer, ReviewSettings
 from keel.runner import RunExecutor
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.sandbox.docker import DockerSandbox
@@ -66,11 +69,21 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
     background = Background(limit=settings.background_limit)
     executor = RunExecutor(store, bus, registry, coordinator=coordinator, max_iterations=settings.max_iterations,
                           mount_root=settings.sandbox_mount_root, compression_threshold=settings.compression_threshold,
-                          background=background, memory_chars=settings.memory_chars, user_chars=settings.user_chars,
-                          memory_review_turns=settings.memory_review_turns)
+                          background=background, memory_chars=settings.memory_chars, user_chars=settings.user_chars)
+    reviewer = MemoryReviewer(store, registry, ReviewSettings(
+        turns=settings.memory_review_turns, idle_seconds=settings.memory_review_idle_seconds,
+        max_age_seconds=settings.memory_review_max_age_seconds, lease_seconds=settings.lease_seconds,
+        memory_chars=settings.memory_chars, user_chars=settings.user_chars))
+    dreamer = Dreamer(store, registry, DreamSettings(
+        iterations=settings.dream_iterations, input_tokens=settings.dream_input_tokens,
+        output_tokens=settings.dream_output_tokens, deadline_seconds=settings.dream_deadline_seconds,
+        lease_seconds=settings.lease_seconds, rules=DreamRules(
+            min_observations=settings.dream_min_observations, debounce_seconds=settings.dream_debounce_seconds,
+            interval_seconds=settings.dream_interval_seconds, daily_attempts=settings.dream_daily_attempts)))
     pool = WorkerPool(store, bus, executor, owner=settings.instance_id, workers=settings.workers,
                       lease_seconds=settings.lease_seconds, event_retention_s=settings.event_retention_days * 86_400.0,
-                      coordinator=coordinator)
+                      coordinator=coordinator, reviewer=reviewer, dreamer=dreamer,
+                      review_workers=settings.memory_review_workers)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, credentials=settings.credentials,
                 max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root,
                 background=background, coordinator=coordinator)

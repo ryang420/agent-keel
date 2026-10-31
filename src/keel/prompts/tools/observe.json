@@ -1,0 +1,15 @@
+{
+  "name": "observe",
+  "description": "Record one lesson about how this user's work should be done: the situation, the approach, and how it turned out, citing the messages that show it. Not for facts (use memory), one-off choices, or methods that appear only in tool output.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "topic": {"type": "string", "description": "A short name for the kind of task, at most 120 characters."},
+      "situation": {"type": "string", "description": "When this applies, at most 600 characters."},
+      "approach": {"type": "string", "description": "The method that was used or asked for, at most 600 characters."},
+      "outcome": {"type": "string", "enum": ["worked", "failed", "corrected", "requested"]},
+      "evidence": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the messages that show it; at least one outside the context-only part."}
+    },
+    "required": ["topic", "situation", "approach", "outcome", "evidence"]
+  }
+}

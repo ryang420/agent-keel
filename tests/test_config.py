@@ -170,9 +170,15 @@ def test_a_direct_service_credential_requires_an_integer_tenant_id():
 def test_memory_limits_default_and_must_be_positive():
     settings = Settings.from_env(BASE)
     assert (settings.memory_review_turns, settings.memory_chars, settings.user_chars) == (10, 2200, 1375)
+    assert (settings.memory_review_idle_seconds, settings.memory_review_max_age_seconds,
+            settings.memory_review_workers) == (60.0, 600.0, 1)
     custom = Settings.from_env({**BASE, "KEEL_MEMORY_REVIEW_TURNS": "3", "KEEL_MEMORY_CHARS": "100",
-                                "KEEL_USER_CHARS": "80"})
+                                "KEEL_USER_CHARS": "80",
+                                "KEEL_MEMORY_REVIEW_IDLE_SECONDS": "5", "KEEL_MEMORY_REVIEW_MAX_AGE_SECONDS": "50",
+                                "KEEL_MEMORY_REVIEW_WORKERS": "2"})
     assert (custom.memory_review_turns, custom.memory_chars, custom.user_chars) == (3, 100, 80)
+    assert (custom.memory_review_idle_seconds, custom.memory_review_max_age_seconds,
+            custom.memory_review_workers) == (5.0, 50.0, 2)
     with pytest.raises(ValueError, match="KEEL_USER_CHARS"):
         Settings.from_env({**BASE, "KEEL_USER_CHARS": "0"})
 
@@ -203,3 +209,15 @@ def test_sandbox_reap_timeout_has_finite_positive_default_and_override():
 def test_sqlite_database_urls_are_rejected(url):
     with pytest.raises(ValueError, match="KEEL_DATABASE_URL"):
         Settings.from_env({**BASE, "KEEL_DATABASE_URL": url})
+
+
+def test_dream_settings_default_to_the_spec_and_parse_from_the_environment():
+    base = Settings.from_env(BASE)
+    assert (base.dream_iterations, base.dream_input_tokens, base.dream_output_tokens, base.dream_deadline_seconds,
+            base.dream_min_observations, base.dream_debounce_seconds, base.dream_interval_seconds,
+            base.dream_daily_attempts) == (12, 60_000, 4_000, 300.0, 8, 3600.0, 86_400.0, 4)
+    tuned = Settings.from_env({**BASE, "KEEL_DREAM_ITERATIONS": "6", "KEEL_DREAM_DAILY_ATTEMPTS": "2",
+                               "KEEL_DREAM_DEBOUNCE_SECONDS": "60"})
+    assert (tuned.dream_iterations, tuned.dream_daily_attempts, tuned.dream_debounce_seconds) == (6, 2, 60.0)
+    with pytest.raises(ValueError, match="KEEL_DREAM_ITERATIONS"):
+        Settings.from_env({**BASE, "KEEL_DREAM_ITERATIONS": "0"})

@@ -1,7 +1,6 @@
 """Drain, sandbox retirement and owned-data purge for one complete profile deletion."""
 
 import asyncio
-import json
 import uuid
 
 import pytest
@@ -12,12 +11,7 @@ from keel.deletion import (
     ProfileDeletionService,
     ProfileDeletionUnavailableError,
 )
-from keel.events import InMemoryEventBus
-from keel.models import Message, TextPart, ToolCall
-from keel.providers.base import ProviderRegistry
-from keel.providers.fake import FakeProvider
-from keel.review import run_review
-from keel.runner import RunExecutor
+from keel.models import Message, TextPart
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import ProfileDeletionBusy, ProfileDeletionConflict
 from keel.store import open_store
@@ -208,97 +202,6 @@ async def test_a_completed_reset_rejects_a_late_memory_write(store):
     await put_profile(store)
     await store.apply_memory("p1", "memory", 2200, [{"action": "add", "content": "fresh"}])
     assert (await store.memory_entries("p1"))["memory"] == ["fresh"]
-
-
-class BlockingProvider(FakeProvider):
-    """A provider whose review call waits until the test releases it."""
-
-    def __init__(self, release):
-        call = ToolCall("c1", "memory", json.dumps(
-            {"target": "user", "action": "add", "content": "Deleted old profile likes tea"}))
-        from keel.models import ToolCallReady
-
-        super().__init__(script=[[ToolCallReady(call)]])
-        self.started = asyncio.Event()
-        self.release = release
-
-    async def stream(self, request):
-        self.started.set()
-        await self.release.wait()
-        async for event in super().stream(request):
-            yield event
-
-
-async def test_background_review_is_drained_before_a_reset(store):
-    await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
-                               memory=True, tenant_id=1)
-    await store.ensure_session("p1", "s1")
-    await store.set_session_prompt("s1", "system prompt", "fake", "m")
-    run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
-                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
-                                 instructions=None)
-    release = asyncio.Event()
-    provider = BlockingProvider(release)
-    registry = ProviderRegistry()
-    registry.register(provider)
-    background = Background()
-    executor = RunExecutor(store, InMemoryEventBus(), registry, background=background)
-    assert background.spawn(run_review(executor, run), "keel-review-p1", profile_id="p1")
-    await asyncio.wait_for(provider.started.wait(), timeout=5)
-
-    service = ProfileDeletionService(store, background=background)
-    await service.delete("p1", 1, OP_A, timeout_seconds=5)
-    await service.complete("p1", 1, OP_A)
-    # The platform user is provisioned again, then the old review would resume.
-    await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
-                               memory=True, tenant_id=1)
-    release.set()
-    await asyncio.sleep(0.1)
-
-    assert (await store.memory_entries("p1"))["user"] == []
-    assert background.profile_tasks("p1") == []
-
-
-async def test_other_instance_cannot_resume_an_old_background_review_into_a_reused_session(store):
-    profile = await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
-                                         memory=True, tenant_id=1)
-    await store.ensure_session("p1", "reused-session")
-    await store.set_session_prompt("reused-session", "system prompt", "fake", "m")
-    run = await store.create_run(profile_id="p1", session_id="reused-session", provider="fake", model="m",
-                                 reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
-                                 instructions=None)
-    release = asyncio.Event()
-    provider = BlockingProvider(release)
-    registry = ProviderRegistry()
-    registry.register(provider)
-    background_a, background_b = Background(), Background()
-    executor = RunExecutor(store, InMemoryEventBus(), registry, background=background_a, memory_review_turns=1)
-    service_b = ProfileDeletionService(store, background=background_b)
-    try:
-        # Exercise the real post-completion scheduling path on instance A. Instance B has an
-        # independent in-memory tracker, so its DELETE cannot drain this task.
-        assert await store.finish_run(run.id, "completed") is not None
-        await executor._after_complete(run, profile)
-        await asyncio.wait_for(provider.started.wait(), timeout=5)
-        await service_b.delete("p1", 1, OP_A, timeout_seconds=5)
-        await service_b.complete("p1", 1, OP_A)
-
-        current = await store.upsert_profile("p1", models=MODELS, sandbox={}, soul="s", skills=[],
-                                             memory=True, tenant_id=1)
-        assert current.incarnation != run.profile_incarnation
-        await store.ensure_session("p1", "reused-session")
-        await store.set_session_prompt("reused-session", "new system prompt", "fake", "m")
-        release.set()
-        old_task = background_a.profile_tasks("p1")
-        assert len(old_task) == 1
-        await asyncio.wait_for(asyncio.gather(*old_task), timeout=5)
-
-        assert (await store.memory_entries("p1"))["user"] == []
-        assert await store.get_session("p1", "reused-session") is not None
-    finally:
-        release.set()
-        await background_a.close()
-        await background_b.close()
 
 
 async def test_an_inflight_delete_cannot_cancel_a_recreated_incarnations_queued_run(tmp_path, pg_dsn):

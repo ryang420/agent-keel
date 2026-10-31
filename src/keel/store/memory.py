@@ -130,3 +130,30 @@ class MemoryStoreMixin:
             "SELECT MAX(id) AS id FROM messages WHERE session_id = ? AND run_id = ? AND role = 'user'",
             session_id, run_id)
         return row["id"] if row else None
+
+    async def review_memory(self, profile_id: str) -> tuple[dict[str, list[Slot]], dict[str, int]]:
+        """Active entries per target in order, and each target's revision, read together under the profile lock."""
+        async with self.db.transaction():
+            await self.lock_profile(profile_id)
+            rows = await self.db.fetch(
+                "SELECT id, target, text, version FROM memory_entries WHERE profile_id = ? AND state = 'active' "
+                "ORDER BY target, position", profile_id)
+            revisions = {target: await self._memory_revision(profile_id, target) for target in TARGETS}
+        slots: dict[str, list[Slot]] = {target: [] for target in TARGETS}
+        for row in rows:
+            slots[row["target"]].append(Slot(row["id"], row["text"], row["version"]))
+        return slots, revisions
+
+    async def corrected_texts(self, profile_id: str, *, after_message: int,
+                              after_time: float) -> dict[str, set[str]]:
+        """Text that a foreground or consumer correction replaced or removed after the given evidence: a message id
+        when the change has one, else its time. A review of older text must not bring it back."""
+        rows = await self.db.fetch(
+            "SELECT target, old_text FROM memory_changes WHERE profile_id = ? AND action IN ('remove', 'replace') "
+            "AND source_kind IN ('foreground', 'consumer') AND old_text IS NOT NULL "
+            "AND (message_id > ? OR (message_id IS NULL AND created_at > ?))",
+            profile_id, after_message, after_time)
+        found: dict[str, set[str]] = {}
+        for row in rows:
+            found.setdefault(row["target"], set()).add(row["old_text"])
+        return found

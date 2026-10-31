@@ -25,8 +25,9 @@ from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict,
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
     ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch,
-    ProfileTenantMismatch, MemorySource, SessionBusy, SessionNotFound, TitleInUse,
+    ProfileTenantMismatch, MemorySource, ReviewNotRetryable, ReviewSourceGone, SessionBusy, SessionNotFound, TitleInUse,
 )
+from keel.store.reviews import REVIEW_STATUSES
 from keel.titles import sanitize_title
 from keel.verify import VerifyError, verify_model
 
@@ -110,6 +111,15 @@ def memory_item_json(item) -> dict:
     return {"id": item.id, "text": item.text, "version": item.version, "created_at": item.created_at,
             "updated_at": item.updated_at, "source": {"kind": item.source_kind, "run_id": item.run_id,
                                                       "session_id": item.session_id, "message_id": item.message_id}}
+
+
+def review_json(job) -> dict:
+    """Serialize a memory review job: its bounds, status, error and per-attempt usage, never transcript text."""
+    return {"id": job.id, "session_id": job.session_id, "status": job.status, "attempts": job.attempts,
+            "error_code": job.error_code, "error": job.error, "provider": job.provider, "model": job.model,
+            "source": {"after_message_id": job.source_from, "through_message_id": job.source_through},
+            "cursor": {"message_id": job.cursor_message, "offset": job.cursor_offset}, "usage": job.usage,
+            "created_at": job.created_at, "updated_at": job.updated_at, "finished_at": job.finished_at}
 
 
 def session_json(session) -> dict:
@@ -314,10 +324,12 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.put("/v1/profiles/{profile_id}")
     async def put_profile(request: Request, profile_id: str):
-        """Create or replace a profile's models, sandbox policy, persona, memory flag and enabled skills.
+        """Create or replace a profile's models, sandbox policy, persona, memory and learning flags and enabled
+        skills.
 
-        Omitted fields reset to empty values, and an omitted memory flag is false. Validate the body and sandbox
-        policy before saving, returning 400 invalid_input on invalid configuration and the saved profile on success.
+        Omitted fields reset to empty values, and an omitted memory or learning flag is false. Validate the body and
+        sandbox policy before saving, returning 400 invalid_input on invalid configuration and the saved profile on
+        success.
         A change of the effective sandbox policy while the profile has runs in progress or unreleased sandbox work is
         409 sandbox_busy, and nothing is applied.
         """
@@ -327,7 +339,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         if not isinstance(models, list):
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
         skills, sandbox, soul = body.get("skills"), body.get("sandbox"), body.get("soul")
-        memory = body.get("memory", False)
+        memory, learning = body.get("memory", False), body.get("learning", False)
         skills = [] if skills is None else skills
         sandbox = {} if sandbox is None else sandbox
         soul = "" if soul is None else soul
@@ -345,6 +357,10 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "soul must be a string.")
         if not isinstance(memory, bool):
             raise ApiError(400, "invalid_input", "memory must be a boolean.")
+        if not isinstance(learning, bool):
+            raise ApiError(400, "invalid_input", "learning must be a boolean.")
+        if learning and not memory:
+            raise ApiError(400, "invalid_input", "learning requires memory.")
         if not all(isinstance(m, dict) and m.get("provider") and m.get("model") for m in models):
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
         store = k(request).store
@@ -383,11 +399,13 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                 try:
                     profile = await store.upsert_profile(
                         profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
-                        sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
+                        sandbox=sandbox, soul=soul, skills=skills, memory=memory,
+                        learning=learning, tenant_id=request.state.tenant_id)
                 except ProfileTenantMismatch:
                     raise ApiError(404, "profile_not_found", "No such profile.")
         return {"id": profile.id, "models": profile.models, "sandbox": profile.sandbox, "soul": profile.soul,
-                "skills": profile.skills, "memory": profile.memory, "updated_at": profile.updated_at}
+                "skills": profile.skills, "memory": profile.memory, "learning": profile.learning,
+                "updated_at": profile.updated_at}
 
     @app.post("/v1/profiles/{profile_id}/runs", status_code=202)
     async def start_run(request: Request, profile_id: str):
@@ -698,4 +716,37 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         await change_memory(request, profile, entry_id, {"action": "remove", "expected_version": expected_version})
         return {"deleted": True}
 
+    @app.get("/v1/profiles/{profile_id}/memory/reviews")
+    async def list_memory_reviews(request: Request, profile_id: str, status: str | None = None, limit: int = 20):
+        """List the profile's background memory reviews, newest first: status, bounds, errors and usage."""
+        await profile_or_404(request, profile_id)
+        if status is not None and status not in REVIEW_STATUSES:
+            raise ApiError(400, "invalid_input", f"status must be one of {', '.join(REVIEW_STATUSES)}.")
+        if not 1 <= limit <= 100:
+            raise ApiError(400, "invalid_input", "limit must be between 1 and 100.")
+        jobs = await k(request).store.list_reviews(profile_id, status=status, limit=limit)
+        return {"reviews": [review_json(job) for job in jobs]}
+
+    @app.post("/v1/profiles/{profile_id}/memory/reviews/{review_id}/retry")
+    async def retry_memory_review(request: Request, profile_id: str, review_id: str):
+        """Requeue a failed review. Repeating it, or retrying a pending or running one, starts nothing new."""
+        await profile_or_404(request, profile_id)
+        try:
+            job = await k(request).store.retry_review(profile_id, review_id)
+        except ReviewNotRetryable:
+            raise ApiError(409, "review_not_retryable", "Only a failed review can be retried.") from None
+        except ReviewSourceGone:
+            raise ApiError(409, "review_source_gone", "The review's conversation no longer exists.") from None
+        if job is None:
+            raise ApiError(404, "review_not_found", "No such review.")
+        return review_json(job)
+
+    # these import this module's error helpers
+    from keel.api_dreams import add_dream_routes
+    from keel.api_feedback import add_feedback_routes
+    from keel.api_learned import add_learned_routes
+
+    add_learned_routes(app, k, profile_or_404)
+    add_feedback_routes(app, k, profile_or_404, run_or_404)
+    add_dream_routes(app, k, profile_or_404)
     return app

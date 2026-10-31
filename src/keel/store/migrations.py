@@ -242,9 +242,116 @@ INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at)
     FROM messages m JOIN sessions s ON s.id = m.session_id GROUP BY s.profile_id
 """
 
+# Durable memory review (cross-session memory design §4): per-session review state written with a run's completion,
+# jobs that claim an immutable source range, and a generation per session so a deleted and recreated session id
+# never inherits old work. The old per-session turn counter is retired; existing history is not queued.
+_V10 = """
+ALTER TABLE sessions ADD COLUMN generation TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text);
+ALTER TABLE sessions DROP COLUMN turns_since_memory;
+CREATE TABLE memory_reviews (
+    profile_id TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL, profile_incarnation TEXT NOT NULL,
+    reviewed_through {bigint} NOT NULL, queued_through {bigint} NOT NULL, dirty_through {bigint} NOT NULL,
+    pending_turns INTEGER NOT NULL, first_dirty_at {real}, last_completed_at {real} NOT NULL,
+    provider TEXT NOT NULL, model TEXT NOT NULL,
+    PRIMARY KEY (profile_id, session_id));
+CREATE TABLE memory_review_jobs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL,
+    profile_incarnation TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'discarded')),
+    provider TEXT NOT NULL, model TEXT NOT NULL, source_from {bigint} NOT NULL, source_through {bigint} NOT NULL,
+    cursor_message {bigint} NOT NULL, cursor_offset INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at {real} NOT NULL, lease_owner TEXT, lease_token TEXT, lease_expires_at {real},
+    error_code TEXT, error TEXT, usage TEXT NOT NULL DEFAULT '[]',
+    created_at {real} NOT NULL, updated_at {real} NOT NULL, finished_at {real});
+CREATE UNIQUE INDEX memory_review_jobs_open ON memory_review_jobs (profile_id, session_id)
+    WHERE status IN ('pending', 'running', 'failed');
+CREATE UNIQUE INDEX memory_review_jobs_running ON memory_review_jobs (profile_id) WHERE status = 'running';
+CREATE INDEX memory_review_jobs_due ON memory_review_jobs (status, next_attempt_at);
+CREATE INDEX memory_review_jobs_profile ON memory_review_jobs (profile_id, created_at)
+"""
+
+# Procedural learning (learning design §2, §3): the profile switch, profile-private learned skills with an immutable
+# version per change, the evidence each version cites, lesson observations (written by skill_manage now, by review
+# and feedback later) and the learned skills each run loaded.
+_V11 = """
+ALTER TABLE profiles ADD COLUMN learning INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE learned_skills (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, category TEXT,
+    body TEXT NOT NULL, version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'suspended', 'retired')),
+    origin TEXT NOT NULL CHECK (origin IN ('foreground', 'dream', 'consumer')),
+    consumer_changed_at {real}, created_at {real} NOT NULL, updated_at {real} NOT NULL);
+CREATE UNIQUE INDEX learned_skills_name ON learned_skills (profile_id, name) WHERE state <> 'retired';
+CREATE INDEX learned_skills_profile ON learned_skills (profile_id, state);
+CREATE TABLE learned_skill_versions (
+    profile_id TEXT NOT NULL, skill_id TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL,
+    description TEXT NOT NULL, category TEXT, body TEXT NOT NULL,
+    change TEXT NOT NULL CHECK (change IN ('create', 'revise', 'merge', 'retire', 'rollback', 'suspend', 'resume')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('foreground', 'dream', 'consumer', 'automatic')),
+    run_id TEXT, session_id TEXT, tool_call_id TEXT, job_id TEXT, rationale TEXT, created_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, skill_id, version));
+CREATE INDEX learned_skill_versions_session ON learned_skill_versions (profile_id, session_id);
+CREATE TABLE learned_skill_evidence (
+    profile_id TEXT NOT NULL, skill_id TEXT NOT NULL, version INTEGER NOT NULL, session_id TEXT NOT NULL,
+    message_id {bigint}, observation_id TEXT);
+CREATE INDEX learned_skill_evidence_version ON learned_skill_evidence (profile_id, skill_id, version);
+CREATE INDEX learned_skill_evidence_session ON learned_skill_evidence (profile_id, session_id);
+CREATE TABLE lesson_observations (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL,
+    topic TEXT NOT NULL, situation TEXT NOT NULL, approach TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('worked', 'failed', 'corrected', 'requested', 'feedback_up',
+                                             'feedback_down')),
+    evidence TEXT NOT NULL DEFAULT '[]', loaded TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL CHECK (state IN ('pending', 'consumed', 'dismissed', 'expired')),
+    consumed_by TEXT, created_at {real} NOT NULL);
+CREATE INDEX lesson_observations_profile ON lesson_observations (profile_id, state, created_at);
+CREATE INDEX lesson_observations_session ON lesson_observations (profile_id, session_id);
+CREATE TABLE skill_loads (
+    profile_id TEXT NOT NULL, run_id TEXT NOT NULL, session_id TEXT NOT NULL, skill_id TEXT NOT NULL,
+    version INTEGER NOT NULL, loaded_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, run_id, skill_id));
+CREATE INDEX skill_loads_skill ON skill_loads (profile_id, skill_id, loaded_at);
+CREATE INDEX skill_loads_session ON skill_loads (profile_id, session_id)
+"""
+
+# Procedural learning, observations and feedback (learning design §4, §6): whether a run ended at the iteration cap,
+# which review job or run produced an observation, and one feedback row per run.
+_V12 = """
+ALTER TABLE runs ADD COLUMN capped INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE lesson_observations ADD COLUMN review_job_id TEXT;
+ALTER TABLE lesson_observations ADD COLUMN run_id TEXT;
+CREATE INDEX lesson_observations_job ON lesson_observations (profile_id, review_job_id);
+CREATE TABLE run_feedback (
+    profile_id TEXT NOT NULL, run_id TEXT NOT NULL, session_id TEXT NOT NULL,
+    rating TEXT NOT NULL CHECK (rating IN ('up', 'down')), comment TEXT, observation_id TEXT,
+    created_at {real} NOT NULL, updated_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, run_id));
+CREATE INDEX run_feedback_session ON run_feedback (profile_id, session_id)
+"""
+
+# Procedural learning, the dream (learning design §5, §7): profile-level dream jobs run on the memory review worker,
+# the start of every dream attempt (a few per profile per day) and the reason a dream dismissed an observation.
+_V13 = """
+CREATE TABLE dream_jobs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, profile_incarnation TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'discarded')),
+    trigger TEXT NOT NULL, provider TEXT, model TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at {real} NOT NULL, lease_owner TEXT, lease_token TEXT, lease_expires_at {real}, input_at {real},
+    error_code TEXT, error TEXT, usage TEXT NOT NULL DEFAULT '[]', changes TEXT NOT NULL DEFAULT '{{}}',
+    created_at {real} NOT NULL, updated_at {real} NOT NULL, finished_at {real});
+CREATE UNIQUE INDEX dream_jobs_open ON dream_jobs (profile_id) WHERE status IN ('pending', 'running');
+CREATE INDEX dream_jobs_due ON dream_jobs (status, next_attempt_at);
+CREATE INDEX dream_jobs_profile ON dream_jobs (profile_id, created_at);
+CREATE TABLE dream_attempts (profile_id TEXT NOT NULL, job_id TEXT NOT NULL, started_at {real} NOT NULL);
+CREATE INDEX dream_attempts_profile ON dream_attempts (profile_id, started_at);
+CREATE INDEX lesson_observations_pending ON lesson_observations (profile_id, created_at) WHERE state = 'pending';
+ALTER TABLE lesson_observations ADD COLUMN note TEXT
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9),
+    Migration(10, _V10), Migration(11, _V11), Migration(12, _V12), Migration(13, _V13))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

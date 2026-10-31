@@ -7,20 +7,48 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Learning acceptance: deterministic §10 acceptance tests, and opt-in evaluations in `evals/learning/` (protocol
+  `learning-eval-v1`): 32 conversation scenarios (English and Chinese) against a memory-only baseline, a DAB learning
+  curve against a learning-off baseline, and the combined release gate.
+- Dreams: with learning on, a profile's pending observations are consolidated into learned skills by a leased,
+  budgeted background job behind evidence, duplicate, validation, consumer-precedence and version gates, committed
+  atomically; `GET /v1/profiles/{p}/dreams` and `POST …/dreams/{id}/retry`; `KEEL_DREAM_*` settings (migration 13).
+- Observations and run feedback (schema migration 12): with `learning` on, the memory review records observations
+  of methods through an `observe` tool, `PUT`, `GET` and `DELETE /v1/profiles/{p}/runs/{r}/feedback` rate finished
+  runs, learned-skill `stats` add ratings and run outcomes over 30 days, a skill with repeated `down` ratings is
+  suspended automatically, and pending observations expire after 30 days in the worker's maintenance pass.
+- Learned skills (schema migration 11): a profile with the new `learning` flag (which requires `memory`) keeps
+  versioned, text-only skills with provenance and evidence. The `skill_manage` tool creates, revises and retires them
+  at the user's explicit request, `skills_list` and `skill_view` show active ones under `learned`, the prompt index
+  lists them from the next session, and `GET`, `POST`, `PATCH` and `DELETE /v1/profiles/{p}/skills/learned…` let a
+  consumer inspect, edit, roll back, suspend, resume and retire them.
+- Durable background memory review (schema migration 10): a completed run marks its session's new text, which is
+  reviewed after 10 completed runs, a minute idle, or ten minutes of activity, by a worker loop with database leases,
+  one review per profile at a time, staged edits committed atomically with the job, and bounded retries.
+  `GET /v1/profiles/{p}/memory/reviews` and `POST …/reviews/{id}/retry` inspect and requeue reviews. Settings:
+  `KEEL_MEMORY_REVIEW_IDLE_SECONDS`, `KEEL_MEMORY_REVIEW_MAX_AGE_SECONDS`, `KEEL_MEMORY_REVIEW_WORKERS`.
 - `session_search`: memory-enabled profiles can search and read their earlier conversations (lexical, English and
   Chinese), with a background index backfill (schema migration 9). Migration 9 adds the search index, so every
   instance must run this version before messages are written again (no mixed-version rollout): an older binary
   would leave the messages it writes unindexed; a downgrade is not supported.
 - `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
+- `evals/memory`: an evaluation-only harness for cross-session memory (protocol `memory-eval-v1`): 32
+  English and Chinese scenarios scored against a memory-off baseline with the design's release gate (a gated arm must
+  also be complete and error-free), and a 100,000-message lexical search benchmark with per-class latency. Deterministic
+  acceptance tests cover the design's §7 matrix in CI.
 - `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
   `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
   per-case PostgreSQL and MongoDB restores on an internal network with read-only roles, and unit tests. It runs
   outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
 
 ### Changed
+- Memory review no longer runs as a best-effort task that a busy or restarting instance could drop, and a foreground
+  memory write no longer postpones it. `KEEL_MEMORY_REVIEW_TURNS` is now one of three eligibility rules, and
+  `KEEL_BACKGROUND_LIMIT` covers titles only. Migration 10 drops the old per-session turn counter; every instance
+  must run this version before runs start again (no mixed-version rollout).
 - A session's tool list is fixed with its prompt and changes only at a compaction; sessions started before this
-  release have no stored list: their tools follow the profile, without `session_search`, until they compact. Tools now declare whether they need a sandbox, and a call to a tool
-  the session was not offered is refused.
+  release have no stored list: their tools follow the profile, without `session_search`, until they compact.
+  Tools now declare whether they need a sandbox, and a call to a tool the session was not offered is refused.
 - Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
   user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
   memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,

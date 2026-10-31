@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import logging
 import time
 
+from keel.observations import EXPIRY_SECONDS
 from keel.sandbox.records import LeaseStamp, RunClaim
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ _MAX_CLAIM_BACKOFF = 10.0
 SHUTDOWN_MESSAGE = "The service was shutting down."
 BACKFILL_BATCH = 200
 BACKFILL_IDLE_S = 30.0
+REVIEW_POLL_S = 5.0
 _BACKGROUND = ("keel-sweeper", "keel-maintenance", "keel-history-backfill")
 
 
@@ -46,7 +48,8 @@ def _confirmed(sent: float, stamp: LeaseStamp) -> float:
 class WorkerPool:
     def __init__(self, store, bus, executor, *, owner: str, workers: int = 4, lease_seconds: float = 30.0,
                  poll_seconds: float = 0.5, clock=time.time, monotonic=time.monotonic,
-                 event_retention_s: float | None = None, maintenance_s: float = 3600.0, coordinator=None) -> None:
+                 event_retention_s: float | None = None, maintenance_s: float = 3600.0, coordinator=None, reviewer=None,
+                 dreamer=None, review_workers: int = 1) -> None:
         if coordinator is None and getattr(executor, "coordinator", None) is not None:
             # A legacy claim reserves no usage; a sandbox-enabled worker must claim through the coordinator.
             raise ValueError("a sandbox-enabled executor needs a coordinated worker")
@@ -62,6 +65,9 @@ class WorkerPool:
         self.monotonic = monotonic
         self.event_retention_s = event_retention_s
         self.maintenance_s = maintenance_s
+        self.reviewer = reviewer
+        self.dreamer = dreamer
+        self.review_workers = review_workers
         self._tasks: list[asyncio.Task] = []
         self._closing = False
         self._stop = asyncio.Event()
@@ -74,8 +80,10 @@ class WorkerPool:
         self._tasks = [asyncio.create_task(self._work(), name=f"keel-worker-{i}") for i in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._sweep(), name="keel-sweeper"))
         self._tasks.append(asyncio.create_task(self._backfill(), name="keel-history-backfill"))
-        if self.event_retention_s is not None:
-            self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
+        if self.reviewer is not None or self.dreamer is not None:
+            self._tasks += [asyncio.create_task(self._review(), name=f"keel-memory-review-{i}")
+                            for i in range(self.review_workers)]
+        self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
 
     async def close(self, drain_seconds: float = 4.0) -> None:
         """Stop claiming, give runs in flight `drain_seconds` to finish, then fail what is left as worker_lost.
@@ -86,7 +94,8 @@ class WorkerPool:
         """
         self._closing = True
         self._stop.set()
-        background = [t for t in self._tasks if t.get_name() in _BACKGROUND]
+        background = [t for t in self._tasks
+                      if t.get_name() in _BACKGROUND or t.get_name().startswith("keel-memory-review")]
         workers = [t for t in self._tasks if t not in background]
         for task in background:
             task.cancel()
@@ -144,9 +153,13 @@ class WorkerPool:
         self._pruned_before = cutoff
         return deleted
 
+    async def expire_once(self) -> int:
+        """Expire pending observations older than the window, on the store clock they were stamped with."""
+        return await self.store.expire_observations(self.store.clock() - EXPIRY_SECONDS)
+
     async def _maintain(self) -> None:
-        """Hourly: delete old run events. Passes on several instances may overlap; deleting rows already gone is
-        harmless."""
+        """Hourly: delete old run events (when a retention is set) and expire old observations. Passes on several
+        instances may overlap; repeating them is harmless."""
         while not self._closing:
             try:
                 deleted = await self.prune_once()
@@ -154,7 +167,30 @@ class WorkerPool:
                     log.info("pruned %d run events older than the retention", deleted)
             except Exception:
                 log.exception("pruning old run events failed")
+            try:
+                expired = await self.expire_once()
+                if expired:
+                    log.info("expired %d pending observations", expired)
+            except Exception:
+                log.exception("expiring old observations failed")
             await self._idle(self.maintenance_s)
+
+    async def _review(self) -> None:
+        """Memory reviews and dreams, at most one of each per pass, beside the run workers; when neither was due,
+        poll every few seconds. A cancel at shutdown gives a running job back."""
+        jobs = [(job, name) for job, name in ((self.reviewer, "memory review"), (self.dreamer, "dream"))
+                if job is not None]
+        while not self._closing:
+            ran = False
+            for job, name in jobs:
+                try:
+                    ran = await job.run_once(self.owner) or ran
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("%s failed", name)
+            if not ran:
+                await self._idle(REVIEW_POLL_S)
 
     async def backfill_once(self) -> int | None:
         return await self.store.backfill_history(BACKFILL_BATCH)

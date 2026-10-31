@@ -7,14 +7,16 @@ from datetime import datetime
 from typing import Sequence
 
 from keel import prompts
+from keel.learned import IndexEntry
 from keel.skills import SkillInfo, render_index
 
 DEFAULT_IDENTITY = "You are a helpful assistant."
 
 
 def build_system_prompt(*, soul: str, model: str, provider: str, now: datetime, tools: bool,
-                        skills: Sequence[SkillInfo] = (), workdir: str | None = None, memory: bool = False,
-                        memory_snapshot: str = "", history: bool = False) -> str:
+                        skills: Sequence[SkillInfo | IndexEntry] = (), workdir: str | None = None,
+                        memory: bool = False, memory_snapshot: str = "", history: bool = False,
+                        learning: bool = False) -> str:
     identity = soul.strip() or DEFAULT_IDENTITY
     if not tools:
         return identity
@@ -23,6 +25,8 @@ def build_system_prompt(*, soul: str, model: str, provider: str, now: datetime, 
         parts.append(prompts.text("memory"))
     if history:
         parts.append(prompts.text("history"))
+    if learning:
+        parts.append(prompts.text("learning"))
     parts.append(prompts.text("platform"))
     if skills:
         parts += [prompts.text("skills_header"), render_index(skills), prompts.text("skills_footer")]

@@ -1,0 +1,17 @@
+{
+  "name": "revise_skill",
+  "description": "Stage a new version of a learned skill that observations show failing, corrected or incomplete. A suspended skill becomes active again.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "skill_id": {"type": "string", "description": "The skill to revise."},
+      "name": {"type": "string", "description": "Optional new slug, at most 64 characters."},
+      "description": {"type": "string", "description": "Optional new one-line description, at most 200 characters."},
+      "body": {"type": "string", "description": "Optional new Markdown without front matter, at most 8000 characters."},
+      "category": {"type": "string", "description": "Optional lowercase slug, at most 32 characters."},
+      "observations": {"type": "array", "items": {"type": "string"}, "description": "Ids of the supporting observations."},
+      "rationale": {"type": "string", "description": "Why, in a sentence."}
+    },
+    "required": ["skill_id", "observations", "rationale"]
+  }
+}
