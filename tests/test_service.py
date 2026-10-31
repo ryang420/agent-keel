@@ -3,6 +3,8 @@ import asyncio
 import httpx
 
 from keel.config import ServiceCredential, Settings
+from keel.dream import Dreamer, DreamSettings
+from keel.dream_gates import DreamRules
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.sandbox.records import ContainerObservation
@@ -39,7 +41,8 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path, pg_dsn):
 
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
                         database_url=pg_dsn, sandbox="none",
-                        compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3)
+                        compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3,
+                        dream_iterations=7, dream_daily_attempts=2)
     keel, pool, closables, backend = await build(settings)
     try:
         assert backend is None and keel.executor.coordinator is None and pool.coordinator is None
@@ -48,6 +51,9 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path, pg_dsn):
         assert (keel.executor.memory_chars, keel.executor.user_chars) == (100, 50)
         assert pool.event_retention_s == 7 * 86_400
         assert pool.reviewer is not None and pool.reviewer.settings.turns == 3
+        assert isinstance(pool.dreamer, Dreamer)
+        assert pool.dreamer.settings == DreamSettings(
+            iterations=7, rules=DreamRules(daily_attempts=2), lease_seconds=settings.lease_seconds)
     finally:
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")

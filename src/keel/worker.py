@@ -49,7 +49,7 @@ class WorkerPool:
     def __init__(self, store, bus, executor, *, owner: str, workers: int = 4, lease_seconds: float = 30.0,
                  poll_seconds: float = 0.5, clock=time.time, monotonic=time.monotonic,
                  event_retention_s: float | None = None, maintenance_s: float = 3600.0, coordinator=None, reviewer=None,
-                 review_workers: int = 1) -> None:
+                 dreamer=None, review_workers: int = 1) -> None:
         if coordinator is None and getattr(executor, "coordinator", None) is not None:
             # A legacy claim reserves no usage; a sandbox-enabled worker must claim through the coordinator.
             raise ValueError("a sandbox-enabled executor needs a coordinated worker")
@@ -66,6 +66,7 @@ class WorkerPool:
         self.event_retention_s = event_retention_s
         self.maintenance_s = maintenance_s
         self.reviewer = reviewer
+        self.dreamer = dreamer
         self.review_workers = review_workers
         self._tasks: list[asyncio.Task] = []
         self._closing = False
@@ -79,7 +80,7 @@ class WorkerPool:
         self._tasks = [asyncio.create_task(self._work(), name=f"keel-worker-{i}") for i in range(self.workers)]
         self._tasks.append(asyncio.create_task(self._sweep(), name="keel-sweeper"))
         self._tasks.append(asyncio.create_task(self._backfill(), name="keel-history-backfill"))
-        if self.reviewer is not None:
+        if self.reviewer is not None or self.dreamer is not None:
             self._tasks += [asyncio.create_task(self._review(), name=f"keel-memory-review-{i}")
                             for i in range(self.review_workers)]
         self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
@@ -175,16 +176,19 @@ class WorkerPool:
             await self._idle(self.maintenance_s)
 
     async def _review(self) -> None:
-        """Memory reviews, one at a time per loop, beside the run workers; when none is due, poll every few
-        seconds. A cancel at shutdown gives a running review's job back."""
+        """Memory reviews and dreams, at most one of each per pass, beside the run workers; when neither was due,
+        poll every few seconds. A cancel at shutdown gives a running job back."""
+        jobs = [(job, name) for job, name in ((self.reviewer, "memory review"), (self.dreamer, "dream"))
+                if job is not None]
         while not self._closing:
-            try:
-                ran = await self.reviewer.run_once(self.owner)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("memory review failed")
-                ran = False
+            ran = False
+            for job, name in jobs:
+                try:
+                    ran = await job.run_once(self.owner) or ran
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("%s failed", name)
             if not ran:
                 await self._idle(REVIEW_POLL_S)
 

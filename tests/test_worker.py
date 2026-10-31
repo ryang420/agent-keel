@@ -456,6 +456,51 @@ async def test_the_pool_runs_memory_review_loops_and_releases_on_close(pool_part
     await asyncio.wait_for(pool.close(), 5)
 
 
+class CountingJob:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = 0
+
+    async def run_once(self, owner):
+        self.calls += 1
+        return self.results.pop(0) if self.results else False
+
+
+async def test_the_review_loop_runs_reviews_and_dreams_and_survives_a_failing_one(pool_parts):
+    store, _, bus, executor = pool_parts
+
+    class Broken:
+        async def run_once(self, owner):
+            raise RuntimeError("boom")
+
+    dreamer = CountingJob([True, True])
+    pool = WorkerPool(store, bus, executor, owner="w1", workers=0, reviewer=Broken(), dreamer=dreamer)
+    await pool.start()
+    try:
+        for _ in range(50):
+            if dreamer.calls >= 3:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await pool.close()
+    assert dreamer.calls >= 3
+
+
+async def test_a_pool_with_only_a_dreamer_starts_the_loop(pool_parts):
+    store, _, bus, executor = pool_parts
+    dreamer = CountingJob([True])
+    pool = WorkerPool(store, bus, executor, owner="w1", workers=0, dreamer=dreamer)
+    await pool.start()
+    try:
+        for _ in range(50):
+            if dreamer.calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await pool.close()
+    assert dreamer.calls >= 1
+
+
 async def test_expire_once_expires_only_observations_older_than_the_window(store, clock):
     from keel.observations import EXPIRY_SECONDS
     from keel.review_observe import StagedObservation
