@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-31
+
+A patch on 0.3.1: command runs, one command in a profile's sandbox without a model
+(`docs/design/2026-10-31-command-runs.md`).
+
 ### Added
 
 - Command runs: `POST /v1/profiles/{p}/runs` with `"kind": "command"` and `command: {argv, cwd, timeout_s, env}`
@@ -228,7 +233,8 @@ daemon needs PostgreSQL and the stopped-service cutover in the operations guide.
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ryang420/agent-keel/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ryang420/agent-keel/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0
 [0.3.0-rc.3]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.2...v0.3.0-rc.3

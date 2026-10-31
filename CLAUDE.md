@@ -77,7 +77,8 @@ CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an 
   reliability and fault-injection tests, explicit tenant ownership with independent profiles (§12), complete
   profile deletion, the coordinated sandbox lifecycle, and Claude models on the `bedrock` provider
   (`docs/design/2026-10-23-bedrock-anthropic-messages.md`). 0.3.1 is a patch on 0.3.0: a sandbox command no
-  longer waits out the whole kill grace once its process group is empty.
+  longer waits out the whole kill grace once its process group is empty. 0.3.2 adds command runs (`kind:
+  "command"`: one sandbox command without a model; `docs/design/2026-10-31-command-runs.md`).
 - No milestone is open in keel itself; M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
