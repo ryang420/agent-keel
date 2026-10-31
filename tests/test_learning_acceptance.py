@@ -1,28 +1,35 @@
 """Procedural learning acceptance (design §10), deterministic rows. Scripted model output proves the plumbing; it is
 not evidence that learning helps.
 
-| §10 row | Proved by |
-|---|---|
-| 1 "from now on" → foreground skill, next session's index | tests/test_runner_learning.py::test_a_from_now_on_request_becomes_a_skill_listed_in_the_next_session_only |
-| 2 same correction in three sessions | test_the_same_correction_in_three_sessions_becomes_one_skill_and_never_a_duplicate |
-| 3 two overlapping skills | test_two_overlapping_skills_are_merged_and_the_other_retired |
-| 4 method only in a tool result | tests/test_review_observe.py::test_a_method_only_in_a_tool_result_cannot_be_cited |
-| 5 thin evidence | tests/test_dream.py::test_thin_evidence_is_refused_to_the_model_and_nothing_is_consumed |
-| 6 three down ratings | test_three_down_ratings_suspend_without_a_model_call_and_a_dream_revises |
-| 7 consumer rollback | test_a_consumer_rollback_stands_against_older_observations |
-| 8 foreground revise races a dream | test_a_foreground_revise_during_a_dream_discards_it_and_the_retry_uses_current_state |
-| 9 dream killed mid-proposal / after commit | test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_one |
-| 10 learning disabled mid-dream | tests/test_dream.py::test_learning_turned_off_mid_dream_commits_nothing |
-| 11 two tenants, two profiles | tests/test_learning_isolation_acceptance.py |
-| 12 session/profile deletion and recreation | tests/test_learning_isolation_acceptance.py |
-| 13 ordinary session with learning on | tests/test_runner_learning.py::test_a_from_now_on_request_becomes_a_skill_listed_in_the_next_session_only |
+Each row names the §10 case and the test that proves it; a test without a file is in this module.
+
+1. "from now on" → foreground skill, next session's index:
+   tests/test_runner_learning.py::test_a_from_now_on_request_becomes_a_skill_listed_in_the_next_session_only
+2. same correction in three sessions:
+   test_the_same_correction_in_three_sessions_becomes_one_skill_and_never_a_duplicate
+3. two overlapping skills: test_two_overlapping_skills_are_merged_and_the_other_retired
+4. method only in a tool result:
+   tests/test_review_observe.py::test_a_method_only_in_a_tool_result_cannot_be_cited
+5. thin evidence: tests/test_dream.py::test_thin_evidence_is_refused_to_the_model_and_nothing_is_consumed
+6. three down ratings: test_three_down_ratings_suspend_without_a_model_call_and_a_dream_revises
+7. consumer rollback: test_a_consumer_rollback_stands_against_older_observations
+8. foreground revise races a dream:
+   test_a_foreground_revise_during_a_dream_discards_it_and_the_retry_uses_current_state
+9. dream killed mid-proposal / after commit:
+   test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_one
+10. learning disabled mid-dream: tests/test_dream.py::test_learning_turned_off_mid_dream_commits_nothing
+11. two tenants, two profiles: tests/test_learning_isolation_acceptance.py
+12. session/profile deletion and recreation: tests/test_learning_isolation_acceptance.py and
+    tests/test_review_commit.py::test_a_recreated_profile_fences_an_old_claim
+13. ordinary session with learning on:
+    tests/test_runner_learning.py::test_a_from_now_on_request_becomes_a_skill_listed_in_the_next_session_only
 """
 
 import asyncio
 import json
 
 from keel.dream import Dreamer
-from keel.dream_stage import DreamProposal
+from keel.dream_stage import StagedDream
 from keel.providers.fake import FakeProvider
 from keel.store.base import SkillSource
 
@@ -221,5 +228,10 @@ async def test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_o
     [version] = await store.learned_skill_versions("p1", (await store.learned_skills("p1"))[0].id)
     assert version.version == 1
     committed = [claim for claim in claims if claim is not None][-1]
-    assert await store.commit_dream(committed, DreamProposal(), usage=None) == "lost"  # a spent claim commits nothing
+    staged = StagedDream(await store.observations("p1"), await store.learned_skills("p1"), set())
+    result, error = staged.call("create_skill", json.dumps({
+        "name": "invoice-summary", "description": "Summarise an invoice in three lines", "body": "1. Total first.",
+        "observations": ids, "rationale": "replayed"}))  # a real proposal citing the two sessions
+    assert not error, result
+    assert await store.commit_dream(committed, staged.proposal, usage=None) == "lost"  # a spent claim commits nothing
     assert [(s.version, s.name) for s in await store.learned_skills("p1")] == [(1, "csv-export")]
