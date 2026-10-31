@@ -1,7 +1,7 @@
 """Runs learning evaluation scenarios through keel in process: planted history, setup sessions with review drains,
 forced dreams (learning arm), a probe in a fresh session, deterministic scoring, attribution and the consumer's
-retirement of every learned skill. One profile per scenario and arm; a decoy profile in the same tenant holds a
-unique marker in a learned skill, an observation and a message, which must never reach the scenario."""
+retirement of every learned skill through the HTTP API. One profile per scenario and arm; a decoy profile in the same
+tenant holds a unique marker in a learned skill, an observation and a message, which must never reach the scenario."""
 
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ import logging
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
+
+from keel.api import Keel, create_app
 from keel.background import Background
+from keel.config import ServiceCredential
 from keel.dream import Dreamer, DreamSettings
 from keel.dream_gates import DreamRules
 from keel.events import InMemoryEventBus
@@ -26,10 +30,11 @@ from keel.tools.base import redact
 from evals.memory.suite import normalize
 
 from .scoring import Outcome, score, summarize
-from .suite import Scenario
+from .suite import Scenario, injection_marker
 
 log = logging.getLogger(__name__)
 TENANT = 1
+EVAL_SECRET = "learning-eval"  # the in-process API's credential for TENANT; not a real secret
 ERROR_CHARS = 500
 TOOL_RESULT_CHARS = 4000
 DRAIN = ReviewSettings(turns=1, idle_seconds=0.0, max_age_seconds=0.0)
@@ -168,15 +173,22 @@ async def _skills(store, profile_id: str) -> tuple[list[dict], list[str], bool]:
     return records, texts, attributable
 
 
-async def _retire_all(store, profile_id: str) -> bool:
-    """The consumer can reverse every learned skill: retire each live one through the consumer's change path."""
-    ok = True
-    for skill in await store.learned_skills(profile_id, states=("active", "suspended")):
-        result = await store.change_learned_skill(profile_id, {"action": "retire", "skill_id": skill.id,
-                                                               "expected_version": skill.version},
-                                                  source=SkillSource("consumer"))
-        ok = ok and result["success"]
-    return ok and not await store.learned_skills(profile_id, states=("active", "suspended"))
+async def _retire_all(store, executor, profile_id: str) -> bool:
+    """The consumer can reverse every learned skill: retire each live one through the HTTP API, as the profile's
+    tenant, then confirm that the API lists no live skill."""
+    keel = Keel(store=store, bus=InMemoryEventBus(), providers=ProviderRegistry(), executor=executor,
+                credentials=(ServiceCredential(TENANT, EVAL_SECRET),), max_running=1)
+    base = f"/v1/profiles/{profile_id}/skills/learned"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(keel)), base_url="http://keel",
+                                 headers={"Authorization": f"Bearer {EVAL_SECRET}"}) as client:
+        ok = True
+        for skill in await store.learned_skills(profile_id, states=("active", "suspended")):
+            response = await client.delete(f"{base}/{skill.id}", params={"expected_version": skill.version})
+            ok = ok and response.status_code == 200
+        for state in ("active", "suspended"):
+            listed = await client.get(base, params={"state": state})
+            ok = ok and listed.status_code == 200 and not listed.json()["skills"]
+    return ok
 
 
 def _usage(jobs) -> Usage:
@@ -214,6 +226,16 @@ def _exposed(marker: str, texts: list[str]) -> bool:
     return any(needle in normalize(text) for text in texts)
 
 
+async def _injected(store, profile_id: str, scenario: Scenario) -> None:
+    """An injection scenario counts only when the planted text reached the model as a setup session's tool output."""
+    marker = injection_marker(scenario)
+    results: list[str] = []
+    for index in range(len(scenario.sessions)):
+        results += (await _session_texts(store, profile_id, f"{profile_id}-setup-{index}"))[1]
+    if marker is None or not _exposed(marker, results):
+        raise CaseError("injection_not_exercised", f"no setup tool result holds the planted {marker!r}")
+
+
 async def run_scenario(store, providers, scenario: Scenario, *, arm: str, provider: str, model: str,
                        timeout: float, setup: list | None = None, seen: list[str] | None = None,
                        foreign: tuple[str, ...] = ()) -> tuple[Outcome, dict]:
@@ -240,6 +262,8 @@ async def run_scenario(store, providers, scenario: Scenario, *, arm: str, provid
             if arm == "learning":
                 await _drain(dreamer)
         await _checked(store, profile_id)
+        if scenario.kind == "injection":
+            await _injected(store, profile_id, scenario)
         probe_session = f"{profile_id}-probe"
         await _session(store, profile_id, probe_session)
         probe = await _turn(store, executor, profile_id, probe_session, scenario.probe, provider, model, timeout)
@@ -250,7 +274,7 @@ async def run_scenario(store, providers, scenario: Scenario, *, arm: str, provid
             system, results = await _session_texts(store, profile_id, session_id)
             haystack += [system, *results]
         skills, texts, attributable = await _skills(store, profile_id)
-        reversible = await _retire_all(store, profile_id) if arm == "learning" else True
+        reversible = await _retire_all(store, executor, profile_id) if arm == "learning" else True
         haystack += texts
         outcome = score(scenario, output=probe.output or "", skill_texts=texts, learned=len(skills),
                         tool_results=haystack, marker=decoy_marker(scenario.id), arm=arm,
@@ -290,8 +314,16 @@ def _error_case(scenario: Scenario, arm: str, error: Exception, setup=()) -> tup
                      "error": {"type": label, "message": redact(str(error))[:ERROR_CHARS]}}
 
 
+def _budget_stopped(charging, label: str) -> bool:
+    return charging is not None and any(entry.get("case") == label and entry.get("outcome") == "budget_exhausted"
+                                        for entry in charging.ledger.entries)
+
+
 async def evaluate(store, providers, scenarios: list[Scenario], *, provider: str, model: str,
-                   arms: tuple[str, ...] = ("learning", "baseline"), out: Path, timeout: float = 300.0) -> dict:
+                   arms: tuple[str, ...] = ("learning", "baseline"), out: Path, timeout: float = 300.0,
+                   charging=None) -> dict:
+    """Run every scenario in every arm. With `charging` (evals.dab.accounting), each case's model calls are charged
+    under the label `<arm>/<scenario>`, and a case the budget stopped is the error `budget_exhausted`."""
     out = Path(out)
     outcomes, markers, seen = [], [], []
     recording = _recording(providers, seen)
@@ -310,6 +342,9 @@ async def evaluate(store, providers, scenarios: list[Scenario], *, provider: str
                 outcome, record = _error_case(scenario, arm, planted)
             else:
                 seen.clear()
+                label = f"{arm}/{scenario.id}"
+                if charging is not None:
+                    charging.switch(label)
                 try:
                     foreign = tuple(m for m in markers if m != decoy_marker(scenario.id))
                     outcome, record = await run_scenario(store, recording, scenario, arm=arm, provider=provider,
@@ -317,6 +352,8 @@ async def evaluate(store, providers, scenarios: list[Scenario], *, provider: str
                                                          foreign=foreign)
                 except Exception as error:  # noqa: BLE001 - one failed case is a recorded failure, not a lost run
                     log.warning("scenario %s (%s) failed: %s", scenario.id, arm, type(error).__name__)
+                    if _budget_stopped(charging, label):  # a budget stop surfaces as a failed run, review or dream
+                        error = CaseError("budget_exhausted", f"the token budget stopped {label}: {error}")
                     outcome, record = _error_case(scenario, arm, error, setup)
             outcomes.append(outcome)
             (case / f"{arm}.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")

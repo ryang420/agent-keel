@@ -25,12 +25,14 @@ from .gate import combine
 from .report import write_conversations, write_curve
 from .runner import evaluate
 from .scoring import Outcome
-from .suite import SuiteError, load_suite
+from .suite import SuiteError, coverage, load_suite
 
 DEFAULT_ROOT = Path(".local/evals/learning")
 DEFAULT_SUITE = Path("evals/learning/suite.json")
+TRACKED_SUITE = Path(__file__).resolve().parent / "suite.json"  # the reviewed suite a gated run must use
+MAX_OUTPUT = 8192  # the output cap each model call reserves against the budget
 DEFAULT_DAB_ROOT = Path(".local/evals/dab")
-DEFAULT_DATASETS = "stockindex,music_brainz_20k"
+DEFAULT_DATASETS = "stockindex,music_brainz_20k,GITHUB_REPOS,stockmarket"  # file-backed, two or more learning tasks
 _MODEL_ENV = {"bedrock": "KEEL_LIVE_MODEL", "openai": "KEEL_LIVE_OPENAI_MODEL"}
 
 
@@ -84,11 +86,33 @@ def _stamp(started: datetime) -> str:
     return started.strftime("%Y%m%dT%H%M%SZ")
 
 
-async def _run(args) -> int:
-    from evals.dab.runner import temporary_database
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
+
+def _applicability(args, scenarios) -> dict:
+    """A conversations run claims the gate only when it is a full run of the tracked, reviewed suite and that suite is
+    large and broad enough (design §10)."""
+    full = not args.scenarios and args.arm == "both"
+    sha = _sha256(args.suite)
+    tracked = sha == _sha256(TRACKED_SUITE)
+    covered = coverage(scenarios)
+    reasons = [reason for reason, ok in (("subset run", full), ("not the tracked suite", tracked),
+                                         ("the suite lacks 30 scenarios, both languages or all six kinds",
+                                          covered["complete"])) if not ok]
+    return {"full_run": full, "suite_sha256": sha, "suite_tracked": tracked, "suite_coverage": covered,
+            "gate_applicable": not reasons, "not_applicable": reasons}
+
+
+async def _run(args) -> int:
+    from evals.dab.accounting import Charging
+    from evals.dab.budget import Ledger
+    from evals.dab.runner import _budgeted, temporary_database
+
+    if args.max_tokens <= 0:
+        raise SystemExit("--max-tokens must be a positive token budget")
     scenarios = load_suite(args.suite)
-    subset = bool(args.scenarios) or args.arm != "both"
+    applicability = _applicability(args, scenarios)
     if args.scenarios:
         wanted = {item for item in args.scenarios.split(",") if item}
         unknown = sorted(wanted - {s.id for s in scenarios})
@@ -102,28 +126,31 @@ async def _run(args) -> int:
     started = datetime.now(UTC)
     out = Path(args.root) / "runs" / _stamp(started)
     out.mkdir(parents=True, exist_ok=True)
+    ledger = Ledger.grant(out / "budget.json", args.max_tokens)
+    charging = Charging(ledger)
     async with temporary_database(admin) as dsn:
         settings = _settings(dsn)
         providers = default_providers(settings)
         store = await open_store(dsn)
         try:
             arms = ("learning", "baseline") if args.arm == "both" else (args.arm,)
-            summary = await evaluate(store, providers, scenarios, provider=args.provider, model=model, arms=arms,
-                                     out=out)
+            summary = await evaluate(store, _budgeted(providers, charging, MAX_OUTPUT), scenarios,
+                                     provider=args.provider, model=model, arms=arms, out=out, charging=charging)
         finally:
             await store.close()
             await providers.aclose()
     meta = {"protocol": PROTOCOL, "provider": args.provider, "model": model, "keel_version": keel.__version__,
-            "started": started.isoformat(), "scenarios": len(scenarios), "gate_applicable": not subset,
-            "suite_sha256": hashlib.sha256(Path(args.suite).read_bytes()).hexdigest(), "commit": _commit()}
+            "started": started.isoformat(), "scenarios": len(scenarios), **applicability,
+            "max_tokens": ledger.max_tokens, "spent_tokens": ledger.spent_tokens, "commit": _commit()}
     if args.provider == "bedrock":
         meta["region"] = settings.aws_region
     outcomes = [Outcome(**{**item, "failures": tuple(item["failures"])})
                 for item in json.loads((out / "outcomes.json").read_text(encoding="utf-8"))]
     write_conversations(out, summary, outcomes, meta)
     print(f"report: {out / 'report.md'}")
+    print(f"spent {ledger.spent_tokens}/{ledger.max_tokens} tokens")
     errors = sum(data["errors"] for data in summary.values())
-    if subset:  # a subset never claims the gate
+    if not meta["gate_applicable"]:  # a subset or an unreviewed suite never claims the gate
         return 0 if not errors else 1
     return 0 if summary["learning"]["gate"]["passed"] else 1
 
@@ -137,6 +164,7 @@ async def _curve(args) -> int:
     from .curve import execute_curve, summarize_curve
 
     model = _model(args, "openai")  # the DAB harness is openai-only
+    admin = _admin_dsn(args)  # every refusal happens before the run directory and the budget ledger exist
     suite = Suite.load(Path("evals/dab/suite.json"))
     names = tuple(name for name in args.datasets.split(",") if name)
     cases = suite.cases(names)
@@ -151,7 +179,7 @@ async def _curve(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     ledger = Ledger.grant(out / "budget.json", args.max_tokens)
     records = await execute_curve(cases, repo=dab.repo, paths=Paths(out), ledger=ledger, mount_root=out / "mounts",
-                                  admin_dsn=_admin_dsn(args), provider="openai", model=model, repeats=args.repeats,
+                                  admin_dsn=admin, provider="openai", model=model, repeats=args.repeats,
                                   image=args.image, sandbox=args.sandbox)
     summary = summarize_curve(records)
     meta = {"protocol": PROTOCOL, "provider": "openai", "model": model, "keel_version": keel.__version__,
@@ -163,6 +191,27 @@ async def _curve(args) -> int:
     return 0 if summary["complete"] and not summary["errors"] else 1
 
 
+def _meta_problems(curve_meta, conversation_meta) -> list[str]:
+    """The gate combines only results it can vouch for: both metas present, this protocol, the same model, and a
+    conversations run that was full and used the tracked suite."""
+    problems = [f"the {name} results have no meta" for name, meta in (("curve", curve_meta),
+                                                                       ("conversations", conversation_meta))
+                if not isinstance(meta, dict) or not meta]
+    if problems:
+        return problems
+    for name, meta in (("curve", curve_meta), ("conversations", conversation_meta)):
+        if meta.get("protocol") != PROTOCOL:
+            problems.append(f"the {name} results are protocol {meta.get('protocol')!r}, not {PROTOCOL}")
+    for field in ("provider", "model"):
+        if curve_meta.get(field) != conversation_meta.get(field):
+            problems.append(f"the curve and the conversations ran different {field}s "
+                            f"({curve_meta.get(field)!r} and {conversation_meta.get(field)!r})")
+    if conversation_meta.get("gate_applicable") is not True:
+        reasons = conversation_meta.get("not_applicable") or ["it does not claim the gate"]
+        problems.append(f"the conversations run is not gate-applicable: {', '.join(reasons)}")
+    return problems
+
+
 def _gate(args) -> int:
     try:
         curve_data = json.loads(Path(args.curve).read_text(encoding="utf-8"))
@@ -171,9 +220,8 @@ def _gate(args) -> int:
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"error: cannot read the result files: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
-    problems = []
-    if conversation_data.get("meta", {}).get("gate_applicable") is False:
-        problems.append("the conversations results are from a subset run")
+    curve_meta, conversation_meta = curve_data.get("meta"), conversation_data.get("meta")
+    problems = _meta_problems(curve_meta, conversation_meta)
     if not isinstance(conversations, dict) or not {"learning", "baseline"} <= set(conversations):
         problems.append("the conversations results need both the learning and the baseline arm")
     if not isinstance(curve, dict) or not curve.get("complete") or curve.get("errors"):
@@ -182,8 +230,11 @@ def _gate(args) -> int:
         print("error: the gate is refused: " + "; ".join(problems), file=sys.stderr)
         return 1
     verdict = combine(curve, conversations)
-    (Path(args.conversations).parent / "gate.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
+    record = {**verdict, "inputs": {"curve": str(args.curve), "conversations": str(args.conversations)},
+              "meta": {"curve": curve_meta, "conversations": conversation_meta}}
+    (Path(args.conversations).parent / "gate.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     print(f"gate {'PASSED' if verdict['passed'] else 'FAILED'}")
+    print(f"  correction delta (learning - baseline): {verdict['correction_delta']:+d}")
     for name, ok in verdict["checks"].items():
         print(f"  {'ok  ' if ok else 'FAIL'} {name}")
     return 0 if verdict["passed"] else 1
@@ -199,12 +250,13 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--provider", choices=sorted(_MODEL_ENV), required=True)
     run.add_argument("--model")
     run.add_argument("--arm", choices=("learning", "baseline", "both"), default="both")
+    run.add_argument("--max-tokens", type=int, required=True, help="cumulative token budget for this run")
     run.add_argument("--scenarios", help="comma-separated scenario ids (default: all)")
     run.add_argument("--root", default=str(DEFAULT_ROOT))
     run.add_argument("--database-admin-dsn")
     curve = commands.add_parser("curve", help="the DAB learning curve (openai only, needs a prepared DAB checkout)")
     curve.add_argument("--datasets", default=DEFAULT_DATASETS, help="comma-separated file-backed DAB datasets")
-    curve.add_argument("--repeats", type=int, default=3)
+    curve.add_argument("--repeats", type=int, default=5)
     curve.add_argument("--max-tokens", type=int, required=True, help="cumulative token budget for this run")
     curve.add_argument("--model")
     curve.add_argument("--root", default=str(DEFAULT_ROOT))

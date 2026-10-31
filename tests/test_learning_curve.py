@@ -10,7 +10,8 @@ from evals.dab import inputs
 from evals.dab.budget import Ledger
 from evals.dab.suite import Case, Dataset, Query
 from evals.learning import curve
-from evals.learning.curve import CurveError, execute_curve, metrics, split, summarize_curve
+from evals.learning.curve import CurveError, _task, execute_curve, metrics, split, summarize_curve
+from evals.learning.report import write_curve
 from keel.models import Completed, TextDelta, Usage
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
@@ -82,6 +83,7 @@ async def test_a_scripted_curve_runs_both_arms_and_summarises(tmp_path, pg_dsn):
     assert learning["feedback_comments"] == ["Correct."] * 2 == baseline["feedback_comments"]
     assert learning["overhead_tokens"] > 0 and baseline["overhead_tokens"] > 0
     assert learning["retire"]["status"] == "retired" and baseline["retire"]["status"] == "retired"
+    assert all(s["reviews_not_done"] == 0 == s["dreams_not_done"] for s in sequences)
     assert (paths.root / "curve" / "records.jsonl").read_text().count("\n") == len(records)
     summary = summarize_curve(records)
     assert summary["complete"] and summary["errors"] == 0
@@ -184,3 +186,61 @@ async def test_a_budget_stop_is_recorded_as_budget_exhausted(tmp_path, pg_dsn):
     statuses = {r["status"] for r in records if r.get("kind") == "task"}
     assert "budget_exhausted" in statuses and "failed" not in statuses
     assert len([r for r in records if r.get("kind") == "sequence"]) == 2
+
+
+class Stalled:
+    """An API client whose run never finishes on its own and stops at once when asked."""
+
+    def __init__(self):
+        self.stopped = False
+
+    async def post(self, url, json=None):
+        if url.endswith("/stop"):
+            self.stopped = True
+        return Reply(202, {"run_id": "r1"})
+
+    async def get(self, url, params=None):
+        if url.endswith("/messages"):
+            return Reply(200, {"data": [{"role": "assistant", "content": "partial"}]})
+        return Reply(200, {"run_id": "r1", "status": "stopped" if self.stopped else "running"})
+
+
+class Reply:
+    def __init__(self, status_code, body):
+        self.status_code, self._body = status_code, body
+
+    def json(self):
+        return self._body
+
+
+async def test_a_run_stopped_at_the_deadline_is_a_timeout_even_when_the_stop_is_quick():
+    client = Stalled()
+    outcome = await _task(client, "p", "s", "q", provider="fake", model="m", reasoning_effort="low", timeout_s=0.0)
+    assert client.stopped and outcome["status"] == "timeout"
+
+
+def _held(arm, status, passed, iterations, repeat=0):
+    return {"kind": "task", "arm": arm, "dataset": "a", "repeat": repeat, "phase": "heldout", "case": "a/q",
+            "status": status, "passed": passed, "iterations": iterations, "tool_errors": iterations,
+            "tokens": iterations * 10}
+
+
+def test_failed_and_timed_out_runs_are_wrong_answers_left_out_of_the_effort_means(tmp_path):
+    seqs = [{"kind": "sequence", "arm": arm, "dataset": "a", "repeat": 0, "expected": 3, "ran": 3,
+             "learned_skills": learned, "reviews_not_done": 1, "dreams_not_done": 2 if arm == "learning" else 0}
+            for arm, learned in (("learning", 2), ("baseline", 0))]
+    records = [_held("learning", "executed", True, 4), _held("learning", "failed", True, 60),
+               _held("learning", "timeout", False, 90), _held("baseline", "executed", True, 6), *seqs]
+    summary = summarize_curve(records)
+    learning = summary["learning"]
+    assert (learning["heldout_failed"], learning["heldout_timeout"], learning["heldout_errors"]) == (1, 1, 0)
+    assert learning["heldout_pass"] == pytest.approx(1 / 3)  # the failed run's passing text is still wrong
+    assert (learning["iterations"], learning["tool_errors"], learning["tokens"]) == (4, 4, 40)
+    assert learning["learned_by_sequence"] == [{"dataset": "a", "repeat": 0, "learned_skills": 2}]
+    assert (learning["reviews_not_done"], learning["dreams_not_done"]) == (1, 2)
+    assert summary["baseline"]["heldout_failed"] == summary["baseline"]["heldout_timeout"] == 0
+    write_curve(tmp_path, summary, records, {"protocol": "learning-eval-v1", "provider": "openai", "model": "m",
+                                             "keel_version": "x", "started": "now", "datasets": ["a"], "repeats": 1})
+    report = (tmp_path / "report.md").read_text()
+    assert "| Failed | Timeout |" in report and "| learning | 33% ± 0% (1 repeats) | 0 | 1 | 1 | 4.0 |" in report
+    assert "| a | 0 | learning | 2 | 1 | 2 |" in report

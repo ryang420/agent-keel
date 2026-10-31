@@ -4,11 +4,19 @@ attribution and the consumer's retirement."""
 import itertools
 import json
 
-from evals.learning.runner import decoy_marker, evaluate, run_scenario
+import pytest
+
+from evals.dab.accounting import Charging
+from evals.dab.budget import Ledger
+from evals.dab.runner import _budgeted
+from evals.learning.runner import TENANT, CaseError, _retire_all, decoy_marker, evaluate, run_scenario
 from evals.learning.suite import Scenario
+from keel.events import InMemoryEventBus
 from keel.models import Completed, TextDelta, ToolCall, ToolCallReady, Usage
 from keel.providers.base import ModelError, ProviderRegistry
 from keel.providers.fake import FakeProvider
+from keel.runner import RunExecutor
+from keel.store.base import SkillSource
 
 SKILL = {"name": "sql-assumptions", "description": "List assumptions before a SQL query",
          "body": "1. Assumptions: first.\n2. Then the query.\n3. Check: one sanity check."}
@@ -167,3 +175,41 @@ async def test_another_scenarios_decoy_marker_is_exposure_even_in_a_review_reque
     await evaluate(store, registry, [POSITIVE, second], provider="fake", model="m", arms=("baseline",), out=tmp_path)
     flagged = json.loads((tmp_path / "cases" / "req-z" / "baseline.json").read_text())["outcome"]
     assert flagged["exposure"] and "foreign decoy marker exposed" in flagged["failures"]
+
+
+async def test_an_injection_the_model_never_searched_for_is_an_error_not_a_pass(store, tmp_path):
+    registry, model = providers([text("I cannot find it."), text("ok")])
+    with pytest.raises(CaseError) as raised:
+        await run_scenario(store, registry, NEGATIVE, arm="learning", provider="fake", model="m", timeout=30)
+    assert raised.value.label == "injection_not_exercised" and not model.script  # no probe was asked
+    registry, _ = providers([text("I cannot find it."), text("ok")])
+    summary = await evaluate(store, registry, [NEGATIVE], provider="fake", model="m", arms=("baseline",),
+                             out=tmp_path)
+    assert summary["baseline"]["errors"] == 1 and not summary["baseline"]["gate"]["passed"]
+    case = json.loads((tmp_path / "cases" / "inj-x" / "baseline.json").read_text())
+    assert case["error"]["type"] == "injection_not_exercised"
+
+
+async def test_retirement_goes_through_the_api_as_the_profiles_tenant(store):
+    for profile, tenant in (("mine", TENANT), ("theirs", TENANT + 1)):
+        await store.upsert_profile(profile, models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="",
+                                   skills=[], memory=True, learning=True, tenant_id=tenant)
+        await store.change_learned_skill(profile, {"action": "create", **SKILL}, source=SkillSource("foreground"))
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    assert await _retire_all(store, executor, "mine")
+    [skill] = await store.learned_skills("mine")
+    *_, retired = await store.learned_skill_versions("mine", skill.id)
+    assert (skill.state, retired.change, retired.source_kind) == ("retired", "retire", "consumer")
+    assert not await _retire_all(store, executor, "theirs")  # another tenant's profile is a 404 to this credential
+    assert [s.state for s in await store.learned_skills("theirs")] == ["active"]
+
+
+async def test_a_budget_stop_is_a_budget_exhausted_case_error(store, tmp_path):
+    registry, model = providers([text("never sent")])
+    charging = Charging(Ledger.grant(tmp_path / "budget.json", 100))
+    summary = await evaluate(store, _budgeted(registry, charging, 8192), [POSITIVE], provider="fake", model="m",
+                             arms=("learning",), out=tmp_path, charging=charging)
+    case = json.loads((tmp_path / "cases" / "req-x" / "learning.json").read_text())
+    assert case["error"]["type"] == "budget_exhausted" and summary["learning"]["errors"] == 1
+    assert model.requests == []  # the reservation refused the call before the model saw it
+    assert any(entry["case"] == "learning/req-x" for entry in charging.ledger.entries)

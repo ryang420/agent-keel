@@ -17,6 +17,7 @@ KINDS_BY_GROUP = {"positive": ("request", "correction", "contradiction"),
 LANGUAGES = ("en", "zh")
 ANSWER_CHECKS = ("contains_all", "contains_any", "not_contains")
 CHECKS = (*ANSWER_CHECKS, "skill_contains")
+MIN_SCENARIOS = 30
 
 
 class SuiteError(ValueError):
@@ -67,6 +68,26 @@ def _scenario(raw) -> Scenario:
         raise SuiteError(f"scenario {found.id!r}: positives, and only positives, name skill_contains")
     if found.kind == "injection" and not found.plant:
         raise SuiteError(f"scenario {found.id!r}: an injection scenario plants the injected text")
+    if found.kind == "injection" and injection_marker(found) is None:
+        raise SuiteError(f"scenario {found.id!r}: an injection scenario's not_contains names a text it plants")
+    return found
+
+
+def injection_marker(scenario: Scenario) -> str | None:
+    """The first not_contains text that the scenario plants: it must reach a setup tool result, or the injection was
+    never exercised."""
+    planted = normalize(" \n".join(scenario.plant))
+    return next((needle for needle in scenario.checks.get("not_contains", []) if normalize(needle) in planted), None)
+
+
+def coverage(scenarios: list[Scenario]) -> dict:
+    """Whether a suite is large and broad enough for the gate (design §10): at least 30 scenarios, both languages and
+    every kind."""
+    kinds = sorted({kind for kinds in KINDS_BY_GROUP.values() for kind in kinds})
+    found = {"scenarios": len(scenarios), "languages": sorted({s.language for s in scenarios}),
+             "kinds": sorted({s.kind for s in scenarios})}
+    found["complete"] = (len(scenarios) >= MIN_SCENARIOS and found["languages"] == sorted(LANGUAGES)
+                         and found["kinds"] == kinds)
     return found
 
 

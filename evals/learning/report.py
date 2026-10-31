@@ -30,7 +30,9 @@ def write_conversations(out: Path, summary: dict, outcomes, meta: dict) -> None:
              f"- Model: `{meta['provider']}` / `{meta['model']}`", f"- keel: {meta['keel_version']}",
              *([f"- Region: {meta['region']}"] if meta.get("region") else []),
              f"- Started: {meta['started']}", f"- Scenarios: {meta['scenarios']}",
-             f"- Suite sha256: `{meta.get('suite_sha256', 'unknown')}`", f"- Commit: `{meta.get('commit', 'unknown')}`",
+             f"- Suite sha256: `{meta.get('suite_sha256', 'unknown')}`"
+             f"{' (tracked)' if meta.get('suite_tracked') else ''}", f"- Commit: `{meta.get('commit', 'unknown')}`",
+             *([f"- Tokens: {meta['spent_tokens']}/{meta['max_tokens']}"] if "max_tokens" in meta else []),
              "", "| Arm | Positive | Negative | English | Chinese | Overall |", "|---|---|---|---|---|---|"]
     for arm, data in summary.items():
         groups, languages = data["groups"], data["languages"]
@@ -42,7 +44,7 @@ def write_conversations(out: Path, summary: dict, outcomes, meta: dict) -> None:
         lines.append(f"| {arm} | {data['corrections']} | {data['negatives_learned']} | {data['exposure']} | "
                      f"{_yes(data['attributable'])} | {_yes(data['reversible'])} | {data['errors']} |")
     if not meta.get("gate_applicable", True):
-        lines += ["", "Gate: not applicable (subset run)"]
+        lines += ["", f"Gate: not applicable ({', '.join(meta.get('not_applicable') or ['subset run'])})"]
     elif "learning" in summary:
         verdict = "PASSED" if summary["learning"]["gate"]["passed"] else "FAILED"
         lines += ["", f"Conversation gate (learning arm): {verdict}. The combined release gate also needs the "
@@ -62,16 +64,25 @@ def write_curve(out: Path, summary: dict, records: list[dict], meta: dict) -> No
              f"- Model: `{meta['provider']}` / `{meta['model']}`", f"- keel: {meta['keel_version']}",
              f"- Started: {meta['started']}", f"- Datasets: {', '.join(meta['datasets'])}",
              f"- Repeats: {meta['repeats']}", f"- Commit: `{meta.get('commit', 'unknown')}`", "",
-             "| Arm | Held-out pass | Held-out errors | Iterations | Tool errors | Tokens | Overhead tokens | "
-             "Learned skills |", "|---|---|---|---|---|---|---|---|"]
+             "| Arm | Held-out pass | Held-out errors | Failed | Timeout | Iterations | Tool errors | Tokens | "
+             "Overhead tokens | Learned skills |", "|---|---|---|---|---|---|---|---|---|---|"]
     for arm in ("learning", "baseline"):
         data = summary[arm]
         lines.append(f"| {arm} | {data['heldout_pass']:.0%} ± {data['heldout_pass_sd']:.0%} "
-                     f"({data['repeats']} repeats) | {data['heldout_errors']} | {_num(data['iterations'])} | "
+                     f"({data['repeats']} repeats) | {data['heldout_errors']} | {data.get('heldout_failed', 0)} | "
+                     f"{data.get('heldout_timeout', 0)} | {_num(data['iterations'])} | "
                      f"{_num(data['tool_errors'])} | {_num(data['tokens'], 0)} | "
                      f"{_num(data['overhead_tokens'], 0)} | {_num(data['learned_skills'])} |")
-    lines += ["", f"Complete: {_yes(summary['complete'])}; errors: {summary['errors']}.", "",
-              "| Dataset | Arm | Held-out pass | Held-out runs | Iterations |", "|---|---|---|---|---|"]
+    lines += ["", f"Complete: {_yes(summary['complete'])}; errors: {summary['errors']}.",
+              "Failed and timed-out held-out runs count as wrong answers and are left out of the iteration, "
+              "tool-error and token means.", "",
+              "| Dataset | Repeat | Arm | Learned skills | Reviews not done | Dreams not done |",
+              "|---|---|---|---|---|---|"]
+    sequences = [r for r in records if r.get("kind") == "sequence"]
+    for item in sorted(sequences, key=lambda s: (s["dataset"], s["repeat"], s["arm"])):
+        lines.append(f"| {item['dataset']} | {item['repeat']} | {item['arm']} | {item.get('learned_skills', 0)} | "
+                     f"{item.get('reviews_not_done', 0)} | {item.get('dreams_not_done', 0)} |")
+    lines += ["", "| Dataset | Arm | Held-out pass | Held-out runs | Iterations |", "|---|---|---|---|---|"]
     held = [r for r in records if r.get("kind") == "task" and r["phase"] == "heldout"
             and r["status"] not in ("setup_failed", "blocked", "budget_exhausted")]
     for name in sorted({r["dataset"] for r in held}):
@@ -79,7 +90,8 @@ def write_curve(out: Path, summary: dict, records: list[dict], meta: dict) -> No
             mine = [r for r in held if r["dataset"] == name and r["arm"] == arm]
             if mine:
                 passed = sum(r["passed"] for r in mine)
-                iterations = [r["iterations"] for r in mine if r.get("iterations") is not None]
+                iterations = [r["iterations"] for r in mine
+                              if r.get("iterations") is not None and r["status"] not in ("failed", "timeout")]
                 lines.append(f"| {name} | {arm} | {passed}/{len(mine)} ({passed / len(mine):.0%}) | {len(mine)} | "
                              f"{_num(sum(iterations) / len(iterations) if iterations else None)} |")
     lines += ["", NOTE]

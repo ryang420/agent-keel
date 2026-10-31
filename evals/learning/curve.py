@@ -36,6 +36,7 @@ FORCE = DreamSettings(rules=DreamRules(min_observations=1, debounce_seconds=0.0,
                                        daily_attempts=1000))
 FEEDBACK = {True: ("up", "Correct."), False: ("down", "Not correct.")}
 ERROR_STATUSES = frozenset({"setup_failed", "blocked", "budget_exhausted"})
+UNMEASURED = frozenset({"failed", "timeout"})  # wrong answers for correctness, left out of the effort means
 
 
 class CurveError(RuntimeError):
@@ -79,12 +80,13 @@ async def _task(client, profile_id: str, session_id: str, prompt: str, *, provid
                                        "model": model, "reasoning_effort": reasoning_effort})
     if response.status_code != 202:
         return {"status": "setup_failed", "error": f"run: {response.status_code} {response.text[:300]}"}
-    run_id, started = response.json()["run_id"], time.monotonic()
+    run_id, started, late = response.json()["run_id"], time.monotonic(), False
     while True:
         run = (await client.get(f"/v1/profiles/{profile_id}/runs/{run_id}")).json()
         if run["status"] in TERMINAL:
             break
         if time.monotonic() - started > timeout_s:
+            late = True
             await client.post(f"/v1/profiles/{profile_id}/runs/{run_id}/stop")
             for _ in range(100):
                 run = (await client.get(f"/v1/profiles/{profile_id}/runs/{run_id}")).json()
@@ -95,8 +97,8 @@ async def _task(client, profile_id: str, session_id: str, prompt: str, *, provid
         await asyncio.sleep(0.2)
     messages = (await client.get(f"/v1/profiles/{profile_id}/sessions/{session_id}/messages",
                                  params={"limit": 500})).json()["data"]
-    status = "executed" if run["status"] == "completed" else ("timeout" if run["status"] not in TERMINAL
-                                                              else "failed")
+    # a run stopped at the deadline is a timeout however quickly the stop lands
+    status = "executed" if run["status"] == "completed" else ("timeout" if late else "failed")
     return {"status": status, "run": run, "messages": messages, "duration_s": time.monotonic() - started}
 
 
@@ -179,7 +181,8 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
                     emit({**base, "status": status, "passed": False, "error": redact(outcome.get("error", ""))})
                     continue
                 answer = extract_answer(messages).text
-                passed = bool(scoring.score(case, repo, answer)["official_validator_pass"])
+                # a failed or timed-out run is a wrong answer, whatever partial text it left
+                passed = bool(scoring.score(case, repo, answer)["official_validator_pass"]) and status == "executed"
                 record = {**base, "status": status, "passed": passed, "tokens": _tokens(run.get("usage")),
                           "duration_s": outcome.get("duration_s"), **metrics(messages)}
                 _artifact(paths, arm, dataset, repeat, case, record, messages)
@@ -200,10 +203,14 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
                 emit({**base, "status": "setup_failed", "passed": False, "error": _short(exc)})
     learned = await keel.store.learned_skills(profile_id)
     observations = await keel.store.observations(profile_id, limit=1000)
-    reviews = await keel.store.list_reviews(profile_id, status="done", limit=1000)
-    dreams = await keel.store.list_dreams(profile_id, status="done", limit=1000)
-    stats.update({"learned_skills": len(learned), "observations": len(observations), "reviews": len(reviews),
-                  "dreams": len(dreams), "overhead_tokens": _overhead(ledger, (review_label, dream_label)),
+    reviews = await keel.store.list_reviews(profile_id, limit=1000)
+    dreams = await keel.store.list_dreams(profile_id, limit=1000)
+    stats.update({"learned_skills": len(learned), "observations": len(observations),
+                  "reviews": sum(job.status == "done" for job in reviews),
+                  "reviews_not_done": sum(job.status != "done" for job in reviews),
+                  "dreams": sum(job.status == "done" for job in dreams),
+                  "dreams_not_done": sum(job.status != "done" for job in dreams),
+                  "overhead_tokens": _overhead(ledger, (review_label, dream_label)),
                   "skills": [{"name": s.name, "state": s.state, "version": s.version} for s in learned]})
     return stats
 
@@ -222,7 +229,7 @@ async def _sequence(client, keel, charging: Charging, cases: list[Case], *, path
     learn, held = split(cases)
     sequence = {"kind": "sequence", "arm": arm, "dataset": dataset, "repeat": repeat, "expected": len(cases),
                 "feedback": 0, "observations": 0, "learned_skills": 0, "reviews": 0, "dreams": 0,
-                "overhead_tokens": 0}
+                "reviews_not_done": 0, "dreams_not_done": 0, "overhead_tokens": 0}
     try:
         staged = isolation(cases[0], repo, mount_root, profile_id, image=image)
     except Exception as exc:  # noqa: BLE001 - isolation failures are blocked cases, not a crashed curve
@@ -313,19 +320,28 @@ def summarize_curve(records: list[dict]) -> dict:
     for arm in ARMS:
         held = [r for r in tasks if r["arm"] == arm and r["phase"] == "heldout"]
         ran = [r for r in held if r["status"] not in ERROR_STATUSES]
+        measured = [r for r in ran if r["status"] not in UNMEASURED]
         per_repeat = []
         for repeat in sorted({r["repeat"] for r in ran}):
             mine = [r for r in ran if r["repeat"] == repeat]
-            per_dataset = [statistics.fmean(r["passed"] for r in mine if r["dataset"] == name)
+            per_dataset = [statistics.fmean(r["passed"] and r["status"] not in UNMEASURED
+                                            for r in mine if r["dataset"] == name)
                            for name in sorted({r["dataset"] for r in mine})]
             per_repeat.append(statistics.fmean(per_dataset))
         mine_seq = [s for s in sequences if s["arm"] == arm]
         summary[arm] = {"heldout_pass": _mean(per_repeat) or 0.0,
                         "heldout_pass_sd": statistics.stdev(per_repeat) if len(per_repeat) > 1 else 0.0,
                         "repeats": len(per_repeat), "heldout_runs": len(held), "heldout_errors": len(held) - len(ran),
-                        "iterations": _mean(r.get("iterations") for r in ran),
-                        "tool_errors": _mean(r.get("tool_errors") for r in ran),
-                        "tokens": _mean(r.get("tokens") for r in ran),
+                        "heldout_failed": sum(r["status"] == "failed" for r in ran),
+                        "heldout_timeout": sum(r["status"] == "timeout" for r in ran),
+                        "iterations": _mean(r.get("iterations") for r in measured),
+                        "tool_errors": _mean(r.get("tool_errors") for r in measured),
+                        "tokens": _mean(r.get("tokens") for r in measured),
                         "learned_skills": _mean(s.get("learned_skills") for s in mine_seq),
+                        "learned_by_sequence": [{"dataset": s["dataset"], "repeat": s["repeat"],
+                                                 "learned_skills": s.get("learned_skills")}
+                                                for s in sorted(mine_seq, key=lambda s: (s["dataset"], s["repeat"]))],
+                        "reviews_not_done": sum(s.get("reviews_not_done") or 0 for s in mine_seq),
+                        "dreams_not_done": sum(s.get("dreams_not_done") or 0 for s in mine_seq),
                         "overhead_tokens": _mean(s.get("overhead_tokens") for s in mine_seq)}
     return summary
