@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import uuid
 
+from keel.observations import MAX_PER_JOB
 from keel.review_input import SourceRow
 from keel.store.base import (MemorySource, ProfileDeletionBusy, ReviewClaim, ReviewJob, ReviewNotRetryable,
                              ReviewSourceGone)
@@ -316,7 +317,7 @@ class ReviewStoreMixin:
         return [SourceRow(row["message_id"], row["role"], row["text"], row["created_at"]) for row in rows]
 
     async def commit_review(self, claim: ReviewClaim, proposals: dict, *, end: tuple[int, int], done: bool,
-                            evidence: int | None, usage: dict | None) -> str:
+                            evidence: int | None, usage: dict | None, observations: tuple = ()) -> str:
         """Apply a complete staged proposal, the job's progress and the session cursor atomically. Nothing is written
         unless this claim still holds its lease, its owner is current and every touched target is unchanged."""
         job = claim.job
@@ -345,6 +346,13 @@ class ReviewStoreMixin:
             for target, (_, before, after, changes) in proposals.items():
                 await self._commit_memory(job.profile_id, target, before, after, changes, source, key)
             now = await self.coordination_now()
+            if observations:  # staged lessons commit with the memory proposal, only while learning is on
+                learning = await self.db.fetchrow("SELECT learning FROM profiles WHERE id = ?", job.profile_id)
+                if learning is not None and learning["learning"]:
+                    left = MAX_PER_JOB - await self.review_observation_count(job.profile_id, job.id)
+                    for item in observations[:max(0, left)]:
+                        await self._insert_observation(job.profile_id, job.session_id, claim.generation, item,
+                                                       now=self.clock(), review_job_id=job.id)
             if done:
                 await self._settle_review(row, "done", usage=usage, cursor=(job.source_through, 0))
                 reviewed = job.source_through

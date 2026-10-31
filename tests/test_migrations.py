@@ -16,8 +16,9 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, learned_skills, "
-              "memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, sandbox_execs, "
+ALL_TABLES = ("run_feedback, skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, "
+              "learned_skills, memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, "
+              "sandbox_execs, "
               "sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, memory_changes, "
               "memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, tenants, blobs")
 
@@ -96,6 +97,15 @@ async def restore_legacy_memories(db) -> None:
         await db.execute(f"DROP TABLE {table}")
     await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
+
+
+async def restore_pre_observations(db) -> None:
+    """Undo migration 12 on a database that is being rewound to an older schema version."""
+    await db.execute("DROP TABLE run_feedback")
+    await db.execute("DROP INDEX lesson_observations_job")
+    await db.execute("ALTER TABLE lesson_observations DROP COLUMN review_job_id")
+    await db.execute("ALTER TABLE lesson_observations DROP COLUMN run_id")
+    await db.execute("ALTER TABLE runs DROP COLUMN capped")
 
 
 async def restore_pre_learning(db) -> None:
@@ -431,6 +441,7 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await restore_pre_observations(store.db)
     await restore_pre_learning(store.db)
     await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
@@ -489,6 +500,7 @@ async def test_a_v4_database_gains_the_coordination_tables(db_url):
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await restore_pre_observations(store.db)
     await restore_pre_learning(store.db)
     await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
@@ -710,6 +722,7 @@ async def test_migration_10_adds_review_tables_and_session_generations(db_url):
         await store.ensure_session("p1", "s1")
         await store.ensure_session("p1", "s2")
         await store.db.execute("UPDATE schema_version SET version = 9")
+        await restore_pre_observations(store.db)
         await restore_pre_learning(store.db)
         await restore_pre_review_queue(store.db)
     finally:
@@ -744,6 +757,7 @@ async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_
     try:
         await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
         await store.db.execute("UPDATE schema_version SET version = 10")
+        await restore_pre_observations(store.db)
         await restore_pre_learning(store.db)
     finally:
         await store.close()
@@ -755,3 +769,18 @@ async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_
                 "skill_loads"} <= await database_table_names(upgraded.db)
     finally:
         await upgraded.close()
+
+
+async def test_migration_12_adds_capped_runs_feedback_and_observation_sources(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.ensure_session("p1", "s1")
+        run = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                     reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                     instructions=None)
+        assert (await store.get_run("p1", run.id)).capped is False
+        assert (await store.db.fetchrow("SELECT COUNT(*) AS n FROM run_feedback"))["n"] == 0
+        await store.db.fetchrow("SELECT review_job_id, run_id FROM lesson_observations LIMIT 1")
+    finally:
+        await store.close()

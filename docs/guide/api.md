@@ -43,6 +43,7 @@ Errors have one shape, with a machine-readable code:
 | `PATCH /v1/profiles/{profile_id}/skills/learned/{skill_id}` | Edit a learned skill. |
 | `POST /v1/profiles/{profile_id}/skills/learned/{skill_id}/{rollback,suspend,resume}` | Change a learned skill's version or state. |
 | `DELETE /v1/profiles/{profile_id}/skills/learned/{skill_id}?expected_version=n` | Retire a learned skill: `{"retired": true}`. |
+| `PUT`, `GET`, `DELETE /v1/profiles/{profile_id}/runs/{run_id}/feedback` | Rate a finished run, read the rating, or remove it. |
 | `POST /v1/models/verify` | Check a model id: `{"provider", "model"}` → `{"supports_vision": bool}`. |
 
 ## Profile
@@ -84,7 +85,8 @@ Errors have one shape, with a machine-readable code:
 
 - `learning`: a boolean, default false (including on update), and it requires `memory`: `true` without `memory` is
   400 `invalid_input` ("learning requires memory."). When true, the model is offered a `skill_manage` tool, and
-  `skills_list` and `skill_view` show the profile's active learned skills (see [Learned skills](#learned-skills)).
+  `skills_list` and `skill_view` show the profile's active learned skills, and the background memory review may also record
+  observations about methods (see [Learned skills](#learned-skills) and [Run feedback](#run-feedback)).
   Like `memory`, the tool is fixed per session until it compacts. `null`, or anything other than a boolean, is
   400 `invalid_input`.
 
@@ -282,8 +284,11 @@ authoritative and enter the history with source `consumer`.
 | `DELETE …/{skill_id}?expected_version=n` | Retire the skill: `{"retired": true}`. The history is kept until the profile is deleted. |
 
 Each skill is `{"id", "name", "description", "category", "state", "version", "origin", "created_at", "updated_at",
-"consumer_changed_at", "stats": {"loads_30d": n}}`; `origin` is who created it, and `loads_30d` counts
-`skill_view` loads of the current version in the last 30 days. Every change route except DELETE returns the
+"consumer_changed_at", "stats": {"loads_30d", "up_30d", "down_30d", "completed_30d", "failed_30d",
+"cancelled_30d"}}`; `origin` is who created it. The `stats` cover the last 30 days and add up the versions since the
+current text began (a rollback to older text starts again from that text; a suspend or resume does not reset them):
+`loads_30d` counts `skill_view` loads, the `up` and `down` counts are the ratings of the loading runs, and the other
+three are the loading runs' terminal statuses. Every change route except DELETE returns the
 skill with its `body`. A change names the version it expects: 409 `version_conflict` when the skill has moved on.
 Other errors: 404
 `learned_skill_not_found`, 409 `name_taken` (an active or suspended skill has the name), 409 `skill_limit` (50
@@ -291,7 +296,41 @@ reached), 409 `skill_retired` (a retired skill cannot change), and 400 `invalid_
 `expected_version`, an invalid field, an invalid `state`, a rollback to a version that does not exist, or a suspend
 or resume from the wrong state (resume needs a suspended skill, suspend an active one). All routes answer 404
 `profile_not_found` for a missing or foreign profile, and 409 `profile_deletion_busy` while the profile is being
-deleted. Observations from review, feedback and automatic suspension are planned and not available yet.
+deleted.
+
+With `learning` on, the background memory review can also record observations: short notes of a method and how it
+turned out (`corrected`, `worked`, `failed` or `requested`), each citing messages of the reviewed text, at most 5 per
+review. They are stored privately, pending for 30 days, and are inputs to a later consolidation step that is planned
+and not available yet; nothing consumes them today.
+
+A learned skill is suspended automatically when its current version has at least 3 `down` ratings in 30 days and more
+`down` than `up`, but only while `learning` is on. The change is recorded as a version with change `suspend` and
+source kind `automatic`; resume it like any suspended skill.
+Resuming writes a new version, and suspension counts only ratings on runs that loaded the current version, so a
+resumed skill is suspended again only after 3 new `down` ratings (and more `down` than `up`) on the resumed version.
+The `stats` still include the earlier ratings, because they cover the whole current text.
+
+## Run feedback
+
+A consumer can rate a finished run. One rating per run; a new `PUT` replaces the old one. The routes work whether or
+not `learning` is enabled, like the memory routes.
+
+| Route | Body and result |
+|---|---|
+| `PUT …/runs/{run_id}/feedback` | `{"rating": "up" or "down", "comment"?}`. Returns `{"run_id", "rating", "comment", "created_at", "updated_at", "suspended": […]}`; `suspended` lists the ids of learned skills this rating suspended (usually empty). |
+| `GET …/runs/{run_id}/feedback` | The same object without `suspended`. |
+| `DELETE …/runs/{run_id}/feedback` | `{"deleted": true}`. |
+
+`comment` is optional text of at most 2000 characters, checked like memory text (secrets and instruction-like text
+are refused); it is stored as data and never treated as instructions. Feedback is accepted once the run has finished
+(any terminal status). With `learning` on, a rating also records a `feedback_up` or `feedback_down` observation for
+the run's session, without a model call; replacing or deleting the rating drops its observation if still pending. A
+`down` rating on a run that loaded a learned skill counts toward that skill's automatic suspension. Deleting a
+session or a profile deletes its feedback.
+
+Errors: 400 `invalid_input` (a rating other than `up` or `down`, or an invalid comment), 404 `run_not_found`, 404
+`feedback_not_found` (`GET` or `DELETE` on a run with no rating), 404 `profile_not_found`, 409 `run_not_terminal`
+(the run has not finished), and 409 `profile_deletion_busy` while the profile is being deleted.
 
 ## Verifying a model
 
@@ -345,6 +384,8 @@ remove a container by name alone.
 | 404 | `profile_not_found`, `session_not_found`, `run_not_found` | No such object. |
 | 404 | `memory_not_found` | No such memory entry in this profile. |
 | 404 | `learned_skill_not_found` | No such learned skill in this profile. |
+| 404 | `feedback_not_found` | The run has no feedback. |
+| 409 | `run_not_terminal` | Feedback is accepted only once the run has finished. |
 | 409 | `version_conflict` | The memory entry or learned skill changed since `expected_version`. |
 | 409 | `name_taken`, `skill_limit`, `skill_retired` | A learned skill's name is in use, the profile has 50 active or suspended skills, or the skill is retired. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |

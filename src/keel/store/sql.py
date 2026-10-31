@@ -19,9 +19,11 @@ from keel.store.base import (
 )
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
+from keel.store.feedback import FeedbackStoreMixin
 from keel.store.history import HistoryStoreMixin
 from keel.store.learned import LearnedSkillStoreMixin
 from keel.store.memory import MemoryStoreMixin
+from keel.store.observations import ObservationStoreMixin
 from keel.store.migrations import migrate
 from keel.store.reviews import ReviewStoreMixin
 from keel.store.sandboxes import SandboxStoreMixin
@@ -72,7 +74,7 @@ def _run(row: dict) -> Run:
         row["reasoning_effort"], json.loads(row["input"]), row["instructions"], row["output"],
         Usage.from_dict(json.loads(row["usage"])), row["error_code"], row["error"], row["lease_owner"],
         row["lease_expires_at"], row["created_at"], row["started_at"], row["finished_at"],
-        row["current_exec_id"], row["profile_incarnation"],
+        row["current_exec_id"], row["profile_incarnation"], bool(row["capped"]),
     )
 
 
@@ -80,7 +82,8 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
+class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin,
+               ObservationStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
                ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
@@ -367,7 +370,7 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, Revi
                 "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute(
                 "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
-            for table in ("lesson_observations", "skill_loads", "learned_skill_evidence"):
+            for table in ("lesson_observations", "skill_loads", "learned_skill_evidence", "run_feedback"):
                 await self.db.execute(f"DELETE FROM {table} WHERE profile_id = ? AND session_id = ?",
                                       profile_id, session_id)
             await self.db.execute(
@@ -569,7 +572,7 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, Revi
 
     async def finish_run(self, run_id: str, status: str, *, output: str = "", usage: Usage = Usage(),
                          error_code: str | None = None, error: str | None = None,
-                         incomplete: bool = False,
+                         incomplete: bool = False, capped: bool = False,
                          deletion_authority: ProfileDeletionAuthority | None = None) -> RunTransition | None:
         """Finish an active run and insert its terminal event in one transaction.
 
@@ -582,6 +585,8 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, Revi
             raise ValueError("a failed run needs an error code and a message")
         if incomplete and status != "completed":
             raise ValueError("only a completed run can be incomplete")
+        if capped and status != "completed":
+            raise ValueError("only a completed run can be capped")
         async with self.db.transaction():
             if deletion_authority is not None:
                 profile_id = await self.db.fetchrow("SELECT profile_id FROM runs WHERE id = ?", run_id)
@@ -597,8 +602,9 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, Revi
             now = self.clock()
             updated = await self.db.fetchrow(
                 "UPDATE runs SET status = ?, output = ?, usage = ?, error_code = ?, error = ?, finished_at = ?, "
-                f"lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND status IN {_IN_FLIGHT} RETURNING *",
-                status, output, _j(usage.to_dict()), error_code, error, now, run_id)
+                f"capped = ?, lease_owner = NULL, lease_expires_at = NULL "
+                f"WHERE id = ? AND status IN {_IN_FLIGHT} RETURNING *",
+                status, output, _j(usage.to_dict()), error_code, error, now, int(capped), run_id)
             if updated is None:  # unreachable under the lock; never invent an event
                 return RunTransition(_run(row), None)
             if status == "completed":

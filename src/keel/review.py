@@ -1,6 +1,7 @@
 """Durable memory review (cross-session memory design §4). A worker claims one job, reads a bounded chunk of the
 session's indexed text, lets the model edit a staged copy of memory with the memory tool, and commits the edits, the
-job and the cursor together. It never appends a message or an event, and it runs beside the run workers."""
+job and the cursor together (and, when learning is on, stages lesson observations committed with it). It never
+appends a message or an event, and it runs beside the run workers."""
 
 from __future__ import annotations
 
@@ -13,9 +14,11 @@ from keel import prompts
 from keel.compress import message_tokens, text_tokens
 from keel.models import (Completed, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCallReady,
                          Usage)
+from keel.observations import MAX_PER_JOB
 from keel.providers.base import ModelError
 from keel.providers.retry import RETRYABLE, stream_with_retries
 from keel.review_input import CHUNK_TOKENS, build_chunk, overlap, render
+from keel.review_observe import StagedObservations
 from keel.review_stage import StagedMemory
 
 log = logging.getLogger(__name__)
@@ -162,11 +165,23 @@ class MemoryReviewer:
         slots, revisions = await self.store.review_memory(job.profile_id)
         corrected = await self.store.corrected_texts(job.profile_id, after_message=chunk.last_message,
                                                      after_time=chunk.last_created_at)
+        learning = bool(profile.memory and profile.learning)
         stage = StagedMemory(slots, revisions, self.limits, corrected)
         context = overlap(await self.store.review_context(claim))
         messages = [Message("user", (TextPart(render(context, chunk, stage.items(), self.limits)),))]
+        observed = None
+        if learning:
+            reviewed = {segment.message_id for segment in chunk.segments}
+            shown = {segment.message_id for segment in context}
+            observed = StagedObservations(
+                reviewed=reviewed, context=shown - reviewed,
+                finished=await self.store.review_message_runs(job.profile_id, job.session_id, reviewed | shown),
+                requested=await self.store.requested_message_ids(job.profile_id, job.session_id),
+                remaining=MAX_PER_JOB - await self.store.review_observation_count(job.profile_id, job.id))
         system = prompts.text("memory_review")
-        tools = prompts.tool_definitions(("memory",))
+        if observed is not None:
+            system += "\n\n" + prompts.text("memory_review_learning")
+        tools = prompts.tool_definitions(("memory", "observe") if observed is not None else ("memory",))
         base = text_tokens(system) + text_tokens(json.dumps(tools))
         for _ in range(ITERATIONS):
             estimate = base + sum(message_tokens(message) for message in messages)
@@ -197,13 +212,16 @@ class MemoryReviewer:
             if not calls:
                 outcome = await self.store.commit_review(claim, stage.proposals(), end=end, done=chunk.done,
                                                          evidence=chunk.last_message,
-                                                         usage=state.entry("committed"))
+                                                         usage=state.entry("committed"),
+                                                         observations=tuple(observed.items) if observed else ())
                 if outcome != "committed":
                     log.info("memory review %s ended %s", job.id, outcome)
                 return
             for call in calls:
                 if call.name == "memory":
                     content, _ = stage.call(call.arguments)
+                elif call.name == "observe" and observed is not None:
+                    content, _ = observed.call(call.arguments)
                 else:
                     content = json.dumps({"error": f"Unknown tool: {call.name}"})
                 messages.append(Message("tool", (TextPart(content),), tool_call_id=call.id, tool_name=call.name))

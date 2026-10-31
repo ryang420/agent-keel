@@ -8,6 +8,7 @@ import json
 import uuid
 
 from keel.learned import MAX_DETAIL, MAX_SKILLS, MAX_TOPIC, check
+from keel.review_observe import StagedObservation
 from keel.store.base import LearnedSkill, LearnedSkillVersion, SkillSource
 
 _ACTIONS = ("create", "revise", "retire", "rollback", "suspend", "resume")
@@ -77,6 +78,8 @@ class LearnedSkillStoreMixin:
         return "A learned skill already has that name; revise it instead." if row else None
 
     async def _create_skill(self, profile_id: str, op: dict, shipped: set[str], source: SkillSource) -> dict:
+        if source.kind not in ("foreground", "dream", "consumer"):
+            return _fail("invalid", "Only the foreground, a dream or the consumer can create a skill.")
         name, description, body, category = (op.get(key) for key in _FIELDS)
         if reason := check(name, description, body, category):
             return _fail("invalid", reason)
@@ -182,20 +185,11 @@ class LearnedSkillStoreMixin:
         history, not pending work (learning §3)."""
         session = await self.db.fetchrow("SELECT generation FROM sessions WHERE id = ? AND profile_id = ?",
                                          source.session_id, profile_id)
-        loads = await self.db.fetch(
-            "SELECT skill_id, version FROM skill_loads WHERE run_id = ? AND profile_id = ? ORDER BY skill_id",
-            source.run_id or "", profile_id)
-        observation = uuid.uuid4().hex
-        await self.db.execute(
-            "INSERT INTO lesson_observations (id, profile_id, session_id, generation, topic, situation, approach, "
-            "outcome, evidence, loaded, state, consumed_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, 'consumed', ?, ?)",
-            observation, profile_id, source.session_id, session["generation"] if session else "",
-            skill.name[:MAX_TOPIC], skill.description[:MAX_DETAIL], skill.body[:MAX_DETAIL],
-            json.dumps([source.message_id]),
-            json.dumps([{"skill_id": row["skill_id"], "version": row["version"]} for row in loads]),
-            f"skill:{skill.id}:{skill.version}", now)
-        return observation
+        item = StagedObservation(skill.name[:MAX_TOPIC], skill.description[:MAX_DETAIL], skill.body[:MAX_DETAIL],
+                                 "requested", (source.message_id,))
+        return await self._insert_observation(profile_id, source.session_id, session["generation"] if session else "",
+                                              item, now=now, state="consumed",
+                                              consumed_by=f"skill:{skill.id}:{skill.version}")
 
     async def learned_skills(self, profile_id: str, *, states: tuple[str, ...] | None = None) -> list[LearnedSkill]:
         where, args = "", [profile_id]

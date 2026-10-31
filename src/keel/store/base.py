@@ -196,6 +196,46 @@ class ReviewClaim:
 
 
 @dataclass(frozen=True)
+class RunFeedback:
+    run_id: str
+    session_id: str
+    rating: str  # "up" or "down"
+    comment: str | None
+    observation_id: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """One learned skill version over the statistics window: runs that loaded it, their ratings and end states."""
+    loads: int
+    up: int
+    down: int
+    completed: int
+    failed: int
+    cancelled: int
+
+
+@dataclass(frozen=True)
+class Observation:
+    """A lesson observation: what a review, feedback or a skill request saw, awaiting or past the dream."""
+    id: str
+    session_id: str
+    topic: str
+    situation: str
+    approach: str
+    outcome: str
+    evidence: tuple[int, ...]
+    loaded: tuple[tuple[str, int], ...]  # (learned skill id, version) loaded by the cited runs
+    state: str
+    review_job_id: str | None
+    run_id: str | None
+    consumed_by: str | None
+    created_at: float
+
+
+@dataclass(frozen=True)
 class SkillSource:
     """Who changed a learned skill. Set from trusted context, never from model arguments."""
     kind: str  # "foreground", "dream", "consumer" or "automatic"
@@ -275,6 +315,7 @@ class Run:
     finished_at: float | None
     current_exec_id: str | None = None
     profile_incarnation: str | None = None
+    capped: bool = False
 
 
 @dataclass(frozen=True)

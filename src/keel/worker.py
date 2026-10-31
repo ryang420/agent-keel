@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import logging
 import time
 
+from keel.observations import EXPIRY_SECONDS
 from keel.sandbox.records import LeaseStamp, RunClaim
 
 log = logging.getLogger(__name__)
@@ -81,8 +82,7 @@ class WorkerPool:
         if self.reviewer is not None:
             self._tasks += [asyncio.create_task(self._review(), name=f"keel-memory-review-{i}")
                             for i in range(self.review_workers)]
-        if self.event_retention_s is not None:
-            self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
+        self._tasks.append(asyncio.create_task(self._maintain(), name="keel-maintenance"))
 
     async def close(self, drain_seconds: float = 4.0) -> None:
         """Stop claiming, give runs in flight `drain_seconds` to finish, then fail what is left as worker_lost.
@@ -152,9 +152,13 @@ class WorkerPool:
         self._pruned_before = cutoff
         return deleted
 
+    async def expire_once(self) -> int:
+        """Expire pending observations older than the window, on the store clock they were stamped with."""
+        return await self.store.expire_observations(self.store.clock() - EXPIRY_SECONDS)
+
     async def _maintain(self) -> None:
-        """Hourly: delete old run events. Passes on several instances may overlap; deleting rows already gone is
-        harmless."""
+        """Hourly: delete old run events (when a retention is set) and expire old observations. Passes on several
+        instances may overlap; repeating them is harmless."""
         while not self._closing:
             try:
                 deleted = await self.prune_once()
@@ -162,6 +166,12 @@ class WorkerPool:
                     log.info("pruned %d run events older than the retention", deleted)
             except Exception:
                 log.exception("pruning old run events failed")
+            try:
+                expired = await self.expire_once()
+                if expired:
+                    log.info("expired %d pending observations", expired)
+            except Exception:
+                log.exception("expiring old observations failed")
             await self._idle(self.maintenance_s)
 
     async def _review(self) -> None:
