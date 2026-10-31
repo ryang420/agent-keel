@@ -11,7 +11,7 @@ from keel.learned import MAX_DETAIL, MAX_SKILLS, MAX_TOPIC, check
 from keel.review_observe import StagedObservation
 from keel.store.base import LearnedSkill, LearnedSkillVersion, SkillSource
 
-_ACTIONS = ("create", "revise", "retire", "rollback", "suspend", "resume")
+_ACTIONS = ("create", "revise", "merge", "retire", "rollback", "suspend", "resume")
 _FIELDS = ("name", "description", "body", "category")
 _SKILL = ("SELECT id, name, description, category, body, version, state, origin, consumer_changed_at, created_at, "
           "updated_at FROM learned_skills WHERE profile_id = ?")
@@ -20,6 +20,11 @@ _SKILL = ("SELECT id, name, description, category, body, version, state, origin,
 def _skill(row: dict) -> LearnedSkill:
     return LearnedSkill(row["id"], row["name"], row["description"], row["category"], row["body"], row["version"],
                         row["state"], row["origin"], row["consumer_changed_at"], row["created_at"], row["updated_at"])
+
+
+def _cited(op: dict, source: SkillSource) -> tuple[tuple[str, str], ...]:
+    """The observations a dream's change cites, as (observation id, session id); set by the store, never by a model."""
+    return tuple(tuple(item) for item in op.get("cited", ())) if source.kind == "dream" else ()
 
 
 def _fail(code: str, error: str, skill: LearnedSkill | None = None) -> dict:
@@ -42,6 +47,8 @@ class LearnedSkillStoreMixin:
         action = op.get("action")
         if action not in _ACTIONS:
             return _fail("invalid", f"action must be one of {', '.join(_ACTIONS)}.")
+        if action == "merge" and source.kind != "dream":
+            return _fail("invalid", "Only a dream merges skills.")
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
@@ -97,7 +104,7 @@ class LearnedSkillStoreMixin:
             "consumer_changed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             skill.id, profile_id, name, description, category, body, 1, "active", source.kind,
             skill.consumer_changed_at, now, now)
-        await self._write_version(profile_id, skill, "create", source, op.get("rationale"))
+        await self._write_version(profile_id, skill, "create", source, op.get("rationale"), _cited(op, source))
         return {"success": True, "skill": skill.summary()}
 
     async def _change_skill(self, profile_id: str, action: str, op: dict, shipped: set[str],
@@ -116,7 +123,7 @@ class LearnedSkillStoreMixin:
         fields = {"name": skill.name, "description": skill.description, "body": skill.body,
                   "category": skill.category}
         state = skill.state
-        if action == "revise":
+        if action in ("revise", "merge"):
             given = {key: op[key] for key in _FIELDS if key in op}
             if not given:
                 return _fail("invalid", "Give at least one of name, description, body or category.", skill)
@@ -140,7 +147,9 @@ class LearnedSkillStoreMixin:
             state = "active"
         else:
             state = "retired"
-        if action in ("revise", "rollback"):
+        if source.kind == "dream" and action in ("revise", "merge"):
+            state = "active"  # a dream's new text replaces a suspended one and starts fresh statistics (§6)
+        if action in ("revise", "merge", "rollback"):
             if reason := check(fields["name"], fields["description"], fields["body"], fields["category"]):
                 return _fail("invalid", reason, skill)
             if fields["name"] != skill.name and (
@@ -155,11 +164,11 @@ class LearnedSkillStoreMixin:
             "consumer_changed_at = ?, updated_at = ? WHERE profile_id = ? AND id = ?",
             changed.name, changed.description, changed.category, changed.body, changed.version, changed.state,
             changed.consumer_changed_at, now, profile_id, skill.id)
-        await self._write_version(profile_id, changed, action, source, op.get("rationale"))
+        await self._write_version(profile_id, changed, action, source, op.get("rationale"), _cited(op, source))
         return {"success": True, "skill": changed.summary()}
 
     async def _write_version(self, profile_id: str, skill: LearnedSkill, change: str, source: SkillSource,
-                             rationale) -> None:
+                             rationale, cited: tuple[tuple[str, str], ...] = ()) -> None:
         now = self.clock()
         await self.db.execute(
             "INSERT INTO learned_skill_versions (profile_id, skill_id, version, name, description, category, body, "
@@ -168,6 +177,10 @@ class LearnedSkillStoreMixin:
             profile_id, skill.id, skill.version, skill.name, skill.description, skill.category, skill.body, change,
             source.kind, source.run_id, source.session_id, source.tool_call_id, source.job_id,
             rationale if isinstance(rationale, str) else None, now)
+        for observation_id, session_id in cited:
+            await self.db.execute(
+                "INSERT INTO learned_skill_evidence (profile_id, skill_id, version, session_id, observation_id) "
+                "VALUES (?, ?, ?, ?, ?)", profile_id, skill.id, skill.version, session_id, observation_id)
         if source.session_id is None or source.message_id is None:
             return
         await self.db.execute(

@@ -208,3 +208,16 @@ async def test_a_down_rating_after_a_skill_load_records_the_loaded_version_on_th
     await store.put_feedback("p1", run.id, "down", "wrong")
     [item] = await store.observations("p1")
     assert item.outcome == "feedback_down" and item.loaded == ((skill_id, 1),)
+
+
+async def test_text_outcomes_add_up_every_version_of_the_current_text(store):
+    await profile(store)
+    skill_id = await skill(store)
+    await rated_load(store, skill_id, 1, "down", 1)
+    await store.change_learned_skill("p1", {"action": "suspend", "skill_id": skill_id, "expected_version": 1},
+                                     source=SkillSource("consumer"))
+    await rated_load(store, skill_id, 2, "up", 2)
+    assert (await store.skill_text_outcomes("p1"))[skill_id] == SkillOutcome(2, 1, 1, 2, 0, 0)
+    await store.change_learned_skill("p1", {"action": "revise", "skill_id": skill_id, "expected_version": 2,
+                                            "body": "2."}, source=SkillSource("consumer"))
+    assert skill_id not in await store.skill_text_outcomes("p1")  # a new text starts fresh

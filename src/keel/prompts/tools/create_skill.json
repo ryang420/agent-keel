@@ -1,0 +1,16 @@
+{
+  "name": "create_skill",
+  "description": "Stage a new learned skill for a recurring kind of problem that no existing skill covers. Cite the supporting observations.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {"type": "string", "description": "A lowercase slug (letters, digits, single hyphens), at most 64 characters."},
+      "description": {"type": "string", "description": "One line, at most 200 characters: when to use it."},
+      "body": {"type": "string", "description": "Markdown without front matter, at most 8000 characters: conditions, steps, pitfalls."},
+      "category": {"type": "string", "description": "Optional lowercase slug, at most 32 characters."},
+      "observations": {"type": "array", "items": {"type": "string"}, "description": "Ids of the supporting observations."},
+      "rationale": {"type": "string", "description": "Why, in a sentence."}
+    },
+    "required": ["name", "description", "body", "observations", "rationale"]
+  }
+}

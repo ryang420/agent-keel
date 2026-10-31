@@ -16,7 +16,7 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("run_feedback, skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, "
+ALL_TABLES = ("dream_attempts, dream_jobs, run_feedback, skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, "
               "learned_skills, memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, "
               "sandbox_execs, "
               "sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, memory_changes, "
@@ -99,8 +99,17 @@ async def restore_legacy_memories(db) -> None:
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
 
 
+async def restore_pre_dreams(db) -> None:
+    """Undo migration 13 on a database that is being rewound to an older schema version."""
+    for table in ("dream_attempts", "dream_jobs"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("DROP INDEX lesson_observations_pending")
+    await db.execute("ALTER TABLE lesson_observations DROP COLUMN note")
+
+
 async def restore_pre_observations(db) -> None:
-    """Undo migration 12 on a database that is being rewound to an older schema version."""
+    """Undo migrations 13 and 12 on a database that is being rewound to an older schema version."""
+    await restore_pre_dreams(db)
     await db.execute("DROP TABLE run_feedback")
     await db.execute("DROP INDEX lesson_observations_job")
     await db.execute("ALTER TABLE lesson_observations DROP COLUMN review_job_id")
@@ -782,5 +791,27 @@ async def test_migration_12_adds_capped_runs_feedback_and_observation_sources(db
         assert (await store.get_run("p1", run.id)).capped is False
         assert (await store.db.fetchrow("SELECT COUNT(*) AS n FROM run_feedback"))["n"] == 0
         await store.db.fetchrow("SELECT review_job_id, run_id FROM lesson_observations LIMIT 1")
+    finally:
+        await store.close()
+
+
+async def test_migration_13_adds_dream_jobs_to_a_version_12_database(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[], memory=True, learning=True)
+        await store.db.execute("UPDATE schema_version SET version = 12")
+        await restore_pre_dreams(store.db)
+    finally:
+        await store.close()
+    store = await open_store(db_url)
+    try:
+        assert await schema_version(store.db) == LATEST_VERSION == 13
+        assert await store.db.fetch("SELECT * FROM dream_jobs") == []
+        assert await store.db.fetch("SELECT * FROM dream_attempts") == []
+        column = await store.db.fetchrow(
+            "SELECT 1 AS found FROM information_schema.columns WHERE table_name = 'lesson_observations' "
+            "AND column_name = 'note'")
+        assert column is not None
+        assert (await store.get_profile("p1")).learning
     finally:
         await store.close()

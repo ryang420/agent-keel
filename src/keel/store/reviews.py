@@ -1,5 +1,6 @@
-"""The durable memory-review queue (cross-session memory design §4): per-session review state written with a run's
-completion, jobs that claim an immutable source range, leases on database time and an atomic commit."""
+"""The durable memory-review queue (cross-session memory design §4), where a review never runs beside a dream of the
+same profile: per-session review state written with a run's completion, jobs that claim an immutable source range,
+leases on database time and an atomic commit."""
 
 from __future__ import annotations
 
@@ -91,6 +92,7 @@ class ReviewStoreMixin:
             "AND p.incarnation = j.profile_incarnation "
             "AND NOT EXISTS (SELECT 1 FROM memory_review_jobs r WHERE r.profile_id = j.profile_id "
             "AND r.status = 'running') "
+            "AND NOT EXISTS (SELECT 1 FROM dream_jobs d2 WHERE d2.profile_id = j.profile_id AND d2.status = 'running') "
             "AND NOT EXISTS (SELECT 1 FROM profile_deletions d WHERE d.profile_id = j.profile_id) "
             "ORDER BY j.next_attempt_at, j.created_at, j.id LIMIT 5", now)
         for candidate in candidates:
@@ -168,8 +170,10 @@ class ReviewStoreMixin:
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             now = await self.coordination_now()
-            if await self.db.fetchrow("SELECT 1 AS busy FROM memory_review_jobs WHERE profile_id = ? "
-                                      "AND status = 'running'", profile_id):
+            if await self.db.fetchrow(
+                    "SELECT 1 AS busy FROM memory_review_jobs WHERE profile_id = ? AND status = 'running' UNION ALL "
+                    "SELECT 1 FROM dream_jobs WHERE profile_id = ? AND status = 'running' LIMIT 1",
+                    profile_id, profile_id):
                 return None
             row = await self.db.fetchrow(
                 "UPDATE memory_review_jobs SET status = 'running', attempts = attempts + 1, lease_owner = ?, "

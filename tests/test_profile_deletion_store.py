@@ -296,9 +296,15 @@ async def test_purge_removes_learned_skill_rows(store):
     await store.record_skill_load("p1", "s1", "r1", created["skill"]["id"], 1)
     await store.db.execute("INSERT INTO run_feedback (profile_id, run_id, session_id, rating, created_at, updated_at) "
                            "VALUES ('p1', 'r1', 's1', 'up', 1, 1)")
+    await store.db.execute("INSERT INTO dream_jobs (id, profile_id, profile_incarnation, status, trigger, "
+                           "next_attempt_at, created_at, updated_at) "
+                           "VALUES ('d1', 'p1', 'i', 'done', 'interval', 0, 0, 0)")
+    await store.db.execute("INSERT INTO dream_attempts (profile_id, job_id, started_at) VALUES ('p1', 'd1', 0)")
     record = await store.begin_profile_deletion("p1", 1, OP_A)
     record = await store.advance_profile_deletion(record, "draining")
     await store.purge_profile_data(record)
+    for table in ("dream_jobs", "dream_attempts"):
+        assert await store.db.fetch(f"SELECT 1 FROM {table} WHERE profile_id = 'p1'") == []
     for table in ("learned_skills", "learned_skill_versions", "learned_skill_evidence", "lesson_observations",
                   "skill_loads", "run_feedback"):
         row = await store.db.fetchrow(f"SELECT COUNT(*) AS n FROM {table} WHERE profile_id = ?", "p1")

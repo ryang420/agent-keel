@@ -1,6 +1,9 @@
 """Lesson observation rows (procedural learning design §4, §6): written by a memory review's commit, by feedback and
 by skill_manage; read by the dream (plan ⑦) and the tests. Every query is scoped by profile. Observation times use
-the store's content clock, the same as the skill and version times they are compared with."""
+the store's content clock, the same as the skill and version times they are compared with.
+
+`consumed_by` says who consumed an observation: `skill:<id>:<version>` for a foreground `skill_manage` write,
+`dream:<job id>` for a dream, which also stores a dismissal's reason in `note`."""
 
 from __future__ import annotations
 
@@ -10,14 +13,15 @@ import uuid
 from keel.store.base import Observation
 
 _COLUMNS = ("id, session_id, topic, situation, approach, outcome, evidence, loaded, state, review_job_id, run_id, "
-            "consumed_by, created_at")
+            "consumed_by, created_at, note")
 
 
 def _observation(row: dict) -> Observation:
     return Observation(row["id"], row["session_id"], row["topic"], row["situation"], row["approach"], row["outcome"],
                        tuple(json.loads(row["evidence"])),
                        tuple((item["skill_id"], item["version"]) for item in json.loads(row["loaded"])),
-                       row["state"], row["review_job_id"], row["run_id"], row["consumed_by"], row["created_at"])
+                       row["state"], row["review_job_id"], row["run_id"], row["consumed_by"], row["created_at"],
+                       row["note"])
 
 
 class ObservationStoreMixin:
