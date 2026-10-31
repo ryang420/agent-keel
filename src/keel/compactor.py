@@ -26,6 +26,7 @@ class SessionContext:
     anchor_tokens: int | None = None
     anchor_id: int | None = None
     failed_at: float | None = None
+    tools: tuple[str, ...] = ()  # the tool names this session's prompt was built with
 
 
 class Compactor:
@@ -38,8 +39,9 @@ class Compactor:
         self._emit = emit
 
     async def prepare(self, run: Run, provider, stored: Sequence[StoredMessage], context: SessionContext, *,
-                      tools: tuple[dict, ...], window: int, rebuild: Callable[[], Awaitable[str]],
-                      overflow: bool = False) -> tuple[list[compress.Item], Usage]:
+                      tools: tuple[dict, ...], window: int,
+                      rebuild: Callable[[], Awaitable[tuple[str, tuple[str, ...]]]], overflow: bool = False
+                      ) -> tuple[list[compress.Item], Usage]:
         """The messages to send next, and the summary call's usage (empty when none was made).
 
         Below the threshold nothing changes. At the threshold the placeholder pass is applied up to a new tail; if
@@ -90,11 +92,12 @@ class Compactor:
             await self._prune(run.session_id, context, pruned, failed_at=now.timestamp())
             return pruned_items, usage
         summary = compress.join_files(text, compress.collect_files(middle, files))
-        system_prompt = await rebuild()
+        system_prompt, tool_names = await rebuild()
         bounds = compress.Boundaries(summary, head[-1].id, tail_id, tail_id)
         await self.store.compact_session(run.session_id, summary=summary, head_id=bounds.head_id, tail_id=tail_id,
-                                         system_prompt=system_prompt)
+                                         system_prompt=system_prompt, tools=list(tool_names))
         context.bounds, context.system = bounds, system_prompt
+        context.tools = tool_names
         context.anchor_tokens = context.anchor_id = context.failed_at = None
         compacted = compress.assemble(stored, bounds, budget)
         await self._emit(run.id, "context.compacted", {

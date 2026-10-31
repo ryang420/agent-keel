@@ -88,8 +88,8 @@ async def live_generation(store, backend, coordinator, profile_id: str, session:
     return container_id
 
 
-async def test_delete_retires_the_profiles_live_sandbox(tmp_path, backend):
-    store = await open_store(f"sqlite:///{tmp_path / 'keel.sqlite3'}")
+async def test_delete_retires_the_profiles_live_sandbox(tmp_path, backend, pg_dsn):
+    store = await open_store(pg_dsn)
     coordinator = SandboxCoordinator(store, backend, deployment=backend.deployment, owner="instance-del",
                                      lease_seconds=LEASE, idle_seconds=1800.0, reap_seconds=2.0)
     try:

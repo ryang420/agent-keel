@@ -10,7 +10,7 @@ service key are required; an invalid value stops the service at start with a mes
 | `KEEL_API_KEYS` | unset | Comma-separated `tenant-id:secret` bindings, for example `1:key-a,2:key-b`. Each tenant ID is a signed 32-bit integer (`0` and negatives such as `-5` are valid; no leading zeros or `+`) and has its own key; multiple keys may name one tenant. A key cannot name two tenants. |
 | `KEEL_API_KEY`, `KEEL_API_KEY_TENANT` | unset | Single-key form of the binding. Both must be set together; `KEEL_API_KEY_TENANT` is a signed 32-bit integer. A bare key does not start the service. |
 | `KEEL_TENANT_BACKFILL` | unset | Path to a JSON object mapping existing profile IDs to integer tenant IDs, for example `{"p1":1}`. Required while any existing profile lacks an owner. The named tenants must have configured keys; an incomplete, unknown or conflicting assignment stops startup without changing ownership. |
-| `KEEL_DATABASE_URL` | required | `postgresql://…` (or `postgres://…`) or `sqlite:///path`. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). A lost LISTEN connection is reconnected with backoff; several instances can share one database. |
+| `KEEL_DATABASE_URL` | required | A PostgreSQL URL: `postgresql://…` (or `postgres://…`), required in every environment. Postgres wakes workers through LISTEN/NOTIFY, which needs direct connections (not a transaction-mode pooler). A lost LISTEN connection is reconnected with backoff; several instances can share one database. |
 | `KEEL_HOST` | `0.0.0.0` | Listen address. |
 | `KEEL_PORT` | `8700` | Listen port. If you change it, change the image's `HEALTHCHECK` too. |
 | `KEEL_WORKERS` | `4` | Runs executed at the same time by this instance. |
@@ -21,7 +21,7 @@ service key are required; an invalid value stops the service at start with a mes
 | `KEEL_EVENT_RETENTION_DAYS` | `7` | Days finished run events are kept, a positive integer. An hourly task deletes older ones (runs, their output and messages are kept). The same retention governs resolved sandbox coordination records: the minute-by-minute maintenance pass prunes resolved, unreferenced attempts, usages and execs older than this in batches of 100. Unresolved creates, unreleased usages, unresolved execs and current references are never pruned. |
 | `KEEL_BACKGROUND_LIMIT` | `4` | How many best-effort tasks (a title, a memory review) this instance may run at once outside a run, a positive integer; past the limit the new task is dropped and logged, and they are cancelled only when the service stops. |
 | `KEEL_MEMORY_REVIEW_TURNS` | `10` | Completed runs of a memory-enabled profile between background memory reviews, a positive integer. |
-| `KEEL_MEMORY_CHARS` | `2200` | Character limit for the `memory` target, a positive integer. |
+| `KEEL_MEMORY_CHARS` | `2200` | Character limit for the `memory` target, a positive integer. A profile with `memory` on is also offered `session_search`, with no setting of its own. |
 | `KEEL_USER_CHARS` | `1375` | Character limit for the `user` target, a positive integer. |
 
 ## Sandbox
@@ -85,10 +85,21 @@ For each profile with a legacy bind mount, use this stopped-service procedure be
    session history and a file in its sandbox. Delete old copies only after the cutover and rollback window.
 
 The frozen 0.2.0 migration test exercises this copy, policy update, backfill and history-preservation sequence on
-SQLite and PostgreSQL. A failed ownership mapping leaves the old schema and data unchanged.
+PostgreSQL. A failed ownership mapping leaves the old schema and data unchanged.
 
 ## Tests
 
-These are read by the test suite, not the service: `KEEL_TEST_DOCKER=1` (with `KEEL_TEST_DOCKER_IMAGE`),
-`KEEL_TEST_POSTGRES_DSN`, `KEEL_TEST_SUBPROCESS=1` (starts and kills real server processes), `KEEL_LIVE_BEDROCK=1`,
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
+```
+
+The test compose file runs PostgreSQL 17 on `127.0.0.1:55437`. Integration tests require
+`KEEL_TEST_POSTGRES_DSN`; a missing DSN fails those tests. Each test creates and drops its own unique database,
+so the configured user needs `CREATEDB`; the supplied base database is never cleared. To run only unit tests
+without a database, use `.venv/bin/python -m pytest -q -m 'not integration'`.
+
+These opt-in settings are read by the test suite, not the service: `KEEL_TEST_DOCKER=1` (with `KEEL_TEST_DOCKER_IMAGE`),
+`KEEL_TEST_SUBPROCESS=1` (starts and kills real server processes), `KEEL_LIVE_BEDROCK=1`,
 `KEEL_LIVE_OPENAI=1`.

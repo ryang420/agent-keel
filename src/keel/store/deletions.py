@@ -41,13 +41,11 @@ class ProfileDeletionStoreMixin:
         """Serialize profile admission and mutation across processes.
 
         PostgreSQL advisory transaction locks are shared by fence creation, the
-        purge, completion and every profile-owned writer. SQLite's
-        ``BEGIN IMMEDIATE`` already serializes writers; this is a no-op there.
+        purge, completion and every profile-owned writer.
         """
-        if self.db.dialect == "postgres":
-            await self.db.execute(
-                "SELECT pg_advisory_xact_lock(hashtext('keel.profile'), hashtext(?))",
-                profile_id)
+        await self.db.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('keel.profile'), hashtext(?))",
+            profile_id)
 
     async def _assert_deletion_authority(self, profile_id: str, authority: ProfileDeletionAuthority,
                                          *, phases: tuple[str, ...] = ("draining",)) -> None:
@@ -195,7 +193,9 @@ class ProfileDeletionStoreMixin:
             await self.db.execute("DELETE FROM runs WHERE profile_id = ?", profile_id)
             await self.db.execute("DELETE FROM sessions WHERE profile_id = ?", profile_id)
             await self.db.execute("DELETE FROM blobs WHERE profile_id = ?", profile_id)
-            await self.db.execute("DELETE FROM memories WHERE profile_id = ?", profile_id)
+            for table in ("memory_entries", "memory_changes", "memory_revisions", "memory_mutations",
+                          "message_tokens", "message_search", "history_backfill"):
+                await self.db.execute(f"DELETE FROM {table} WHERE profile_id = ?", profile_id)
             await self._purge_profile_sandbox_evidence(profile_id)
             await self.db.execute("DELETE FROM profiles WHERE id = ?", profile_id)
             updated = await self.db.fetchrow(

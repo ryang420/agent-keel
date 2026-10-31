@@ -1,0 +1,686 @@
+{
+  "datasets": {
+    "DEPS_DEV_V1": {
+      "data_files": {
+        "query_dataset/package_query.db": {
+          "bytes": 538877952,
+          "sha256": "6676259f784aa89aec838a3e4a74bc68793085e49520c819b2356205a6eaf68a",
+          "source": "mirror"
+        },
+        "query_dataset/project_query.db": {
+          "bytes": 11022336,
+          "sha256": "e6b171594cbb8dbb5298b54206b235a396b0eee9dd8c2c68deefab8d76c72e6a",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "package_database": {
+          "db_path": "query_dataset/package_query.db",
+          "db_type": "sqlite"
+        },
+        "project_database": {
+          "db_path": "query_dataset/project_query.db",
+          "db_type": "duckdb"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "336cef76f717fb738b2a3128a1bec0bb863bc6a5cc981b9ab863475a4c542ad2",
+          "query.json": "0cedd62ce3f61e3fa7d45f1db9809b912273bded66b13310823fed671607c0a5",
+          "validate.py": "691a1910f0eb76e20b7d0652141584320b5bcfcaa399f07d8601f0dbc00c2d35"
+        },
+        "2": {
+          "ground_truth.csv": "e4b12f8c8d92b6c2feff844047e10aa6355358dae4cd24b9cb4192947ce353a8",
+          "query.json": "5fe660eaae9c882a79e1afcb8e91baccdfaf88a0aa59197e3ac1a790fb2f4aed",
+          "validate.py": "e7c49325c40ebc7a028f27dd5d677e22485e7acfed456ba6e029f6bdb03d480d"
+        }
+      }
+    },
+    "GITHUB_REPOS": {
+      "data_files": {
+        "query_dataset/repo_artifacts.db": {
+          "bytes": 361246720,
+          "sha256": "d514c66eb07403f79b8da2ff6a79a6c82f2d862cadaf71d536ea58644cd07bbc",
+          "source": "mirror"
+        },
+        "query_dataset/repo_metadata.db": {
+          "bytes": 567222272,
+          "sha256": "e9b71beb5d7e2b344f996baf19fb34231c24ab354019d65bd14a1cbfc62c67a1",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "artifacts_database": {
+          "db_path": "query_dataset/repo_artifacts.db",
+          "db_type": "duckdb"
+        },
+        "metadata_database": {
+          "db_path": "query_dataset/repo_metadata.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "44899c6b8dd5da879dd0c12ea41f1f5218b6327404f3064953d2826e7818c262",
+          "query.json": "c1ec5a8a222f1df528c246e18cc7791cfc5ffd5bdba3cd3da1f6362a526bd40f",
+          "validate.py": "c8e979be70776b67ee32372ac1e77b75f7474946809dc81d4941821bf5683bd5"
+        },
+        "2": {
+          "ground_truth.csv": "689b9dfba8e2eb25ac4b38c639986b31668cc9248a03231cf89786093f5f60f4",
+          "query.json": "d643fbf44aef32f8b5f4c24cc5ab9ffc642ac2b5a6a52b6f7bae65b8087b632b",
+          "validate.py": "782a94fd3f78285d3035fcaa2b9de187c4a8a599b8203c9433f6aaa9ba1c83ef"
+        },
+        "3": {
+          "ground_truth.csv": "6a70cf66bae386ff7cd4896ce681c5488bab0c20d69a4615b28b49fb1e805295",
+          "query.json": "be348f0f9207fd049040a6cb3785a2e7d18a24aeb5d75a877e34e28d7916e0f0",
+          "validate.py": "e415c60c301c0376ee0c9b922390efa20500d5e23dd24fc574d2c000603c4f7c"
+        },
+        "4": {
+          "ground_truth.csv": "4931116a06cb21d15c4482bece3a8beda131539ef5bdb31a1b9433db2dc15607",
+          "query.json": "e19192b4f504d1c0dd8f61c13b36022f95a0f125fa82a5383d893a6bc0f63f88",
+          "validate.py": "b6d8110867225717a23f9e217f5586f8b32639b80a57d7d4bbd3f05cbc8d8287"
+        }
+      }
+    },
+    "agnews": {
+      "data_files": {
+        "query_dataset/agnews_articles/articles_db/articles.bson": {
+          "bytes": 36545577,
+          "sha256": "ad74220284cb2737273f5b6a9e6c2c1e34374a232db1072a5842f82f8a539488",
+          "source": "repo"
+        },
+        "query_dataset/metadata.db": {
+          "bytes": 4046848,
+          "sha256": "30cfb96d29b4e49c5f6ae6e5cb2c754d98e118a183ddd57ae44ee3564aeb1955",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "articles_database": {
+          "db_name": "articles_db",
+          "db_type": "mongo",
+          "dump_folder": "query_dataset/agnews_articles"
+        },
+        "metadata_database": {
+          "db_path": "query_dataset/metadata.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "mongo",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "3e183c3ae5c85ec93a91c92eee92e7f0830d05cc1eb9d32bc2ac52b27f4e32b6",
+          "query.json": "bbc94a9e190cc3efe66b92537cb856622c111e52964c9c8bb7c530f3d9e182ce",
+          "validate.py": "f2fd963afb74ae60921613f4662aacc7be39e6fae6d1acc2c121aeec7f61d322"
+        },
+        "2": {
+          "ground_truth.csv": "7d6087e1a86ee20b95560423784a8236c63b752e1366854d19e8cc133151b452",
+          "query.json": "79f736db6659b00b8ce85f03ce0eb9af962ec283404a72ee9e10fb8a477c2ae8",
+          "validate.py": "4f38f4768db4b5bc392efdc495fe5d98a20d937bed9a773ae876445dd6287145"
+        },
+        "3": {
+          "ground_truth.csv": "b55c2391cd3c87e8f8626773073ff9fcd76681e9bacd2ffce7c57a9a5b7f3dfd",
+          "query.json": "2444519816264b71fb76ba72cb641e04daebb340d8232651f2ab04e4d1b5a855",
+          "validate.py": "809d8d3f011655336e2579577b93681b2f7170eadccf08551de74190e9a61b7f"
+        },
+        "4": {
+          "ground_truth.csv": "c4a371acd7c3df8bd70e49805e76cb39b1309ccac3d0f4289120079a9ad68bcd",
+          "query.json": "b9e4940960a6376ea3ebec7bbb46e82fb470862ea7cd083c122dddaa1bedf6f1",
+          "validate.py": "a90e70fefb2f2b97c408d9f236d1b1f07037e5bf553162157c6df36b627a8776"
+        }
+      }
+    },
+    "bookreview": {
+      "data_files": {
+        "query_dataset/books_info.sql": {
+          "bytes": 649048,
+          "sha256": "80acb3ece574f26b634107c9c553dc5ab0c95ca11f6b226c9602dff9465393d9",
+          "source": "mirror"
+        },
+        "query_dataset/review_query.db": {
+          "bytes": 1093632,
+          "sha256": "01f07a5894f058613374694a8f46d19341bf1fa316367494d019191e772b3e2c",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "books_database": {
+          "db_name": "bookreview_db",
+          "db_type": "postgres",
+          "sql_file": "query_dataset/books_info.sql"
+        },
+        "review_database": {
+          "db_path": "query_dataset/review_query.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "postgres",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "73a2af8864fc500fa49048bf3003776c19938f360e56bd03663866fb3087884a",
+          "query.json": "908099cc5c9202b498f2f21233bbe0dc1f1d346eb7c79ad4f836d0bb53567289",
+          "validate.py": "acb4462bb0fe6e1e7b54faf1ec6b7e75e3e88b38b074a9ebbb3d7c4e8f23759e"
+        },
+        "2": {
+          "ground_truth.csv": "79c7cb16dfa98f54cc6789d5590fc061e8cda1117bdd3f47fd35c557b9622339",
+          "query.json": "97b6ecbd39ac559caab7f0cf6bec74a32011583db87f153afe6cbffeeb18c8b6",
+          "validate.py": "b85d464dea068a5f49587d6bc0067a50759ad7aca1c3dbf99679f8b45feb4a56"
+        },
+        "3": {
+          "ground_truth.csv": "436d3156750ff7d145658cc6b8a0fd459de36939b50bb3535480de93d626ebc2",
+          "query.json": "118b330352dd14214a20a7bea1c2691ff18aa65e7546fb8e270af2e2ff62b976",
+          "validate.py": "7d234b73b4c2c256ea5f19b1d840e38589b0449e804a126eb9c18881a09d40aa"
+        }
+      }
+    },
+    "crmarenapro": {
+      "data_files": {
+        "query_dataset/activities.duckdb": {
+          "bytes": 21245952,
+          "sha256": "f3299b9214885f00c71c9af77d89b62ad73f3e545e3cf5baa4861d1265151c60",
+          "source": "mirror"
+        },
+        "query_dataset/core_crm.db": {
+          "bytes": 188416,
+          "sha256": "aa595797e41db401136a0a68bf14bac44707f9f86ed235f61d9f051728e50506",
+          "source": "mirror"
+        },
+        "query_dataset/products_orders.db": {
+          "bytes": 143360,
+          "sha256": "92ad52f2a624ee5e0cdf7cd4cc64ac60b1e3f7af2c672be27f651f80af4a6bdb",
+          "source": "mirror"
+        },
+        "query_dataset/sales_pipeline.duckdb": {
+          "bytes": 2371584,
+          "sha256": "5b44cc3754820bff20c3f25e50cf09c6be401f86e69df6b9d3ee7a4cf64ac5af",
+          "source": "mirror"
+        },
+        "query_dataset/support.sql": {
+          "bytes": 8860941,
+          "sha256": "5248cd64cddf4936027859c5d6f74b2d32fbeb4e1939d784b2ff26d45d83950c",
+          "source": "mirror"
+        },
+        "query_dataset/territory.db": {
+          "bytes": 24576,
+          "sha256": "1a9650d4ba3c0a3690b936d294feb31a3227bf6f2ebe886f74cf12e14936366a",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "activities": {
+          "db_path": "query_dataset/activities.duckdb",
+          "db_type": "duckdb"
+        },
+        "core_crm": {
+          "db_path": "query_dataset/core_crm.db",
+          "db_type": "sqlite"
+        },
+        "products_orders": {
+          "db_path": "query_dataset/products_orders.db",
+          "db_type": "sqlite"
+        },
+        "sales_pipeline": {
+          "db_path": "query_dataset/sales_pipeline.duckdb",
+          "db_type": "duckdb"
+        },
+        "support": {
+          "db_name": "crm_support",
+          "db_type": "postgres",
+          "sql_file": "query_dataset/support.sql"
+        },
+        "territory": {
+          "db_path": "query_dataset/territory.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "postgres",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "36b5edda18b50b864d526ee9d5926061302708cf96574b54de0adc0bd667fafb",
+          "query.json": "894e6fb92a2c798b3dd29e486a7ec78c5c9f8aa7ff398bef227b8784529d5f66",
+          "validate.py": "579be6cfae68087cc8efd8e2e9c1ae0a5283e722d2a1d033705d52f28b9f9835"
+        },
+        "10": {
+          "ground_truth.csv": "6d935e6f705c93174be6576cdd4467bca849d126a6be8e0b9023f944284ace1c",
+          "query.json": "cad473f5f29c0965ea73e0c136a96034e3436df59c016c2a3549d03beeca2010",
+          "validate.py": "33e391562f728b4a5d80b7a1a8b046746a8d40a48817db1f379271ed99329193"
+        },
+        "11": {
+          "ground_truth.csv": "8eae503568db8e087f4553b80f1acadcba3972fbc09cf4b697a76cbedb5e3f7e",
+          "query.json": "f26f335645c4383dde4f4532c4c84f21f4b01a26f9dd2738be6d151e8116b0f1",
+          "validate.py": "0a0b8e676ad86e4e90c8c06e0034a04d2b1fb28ef5bf63d097ecbd440d4bb8a7"
+        },
+        "12": {
+          "ground_truth.csv": "00fd1d685ab1dba492d8c237367560944efce4283e913cec527ba3ddd1c99384",
+          "query.json": "c4a10a08df2a82e5bbba81c38820f441acc4e69f0e8784b4cd9df76045244a20",
+          "validate.py": "99476c2b08ba7f07bfbe1fb4fd32938a5a78c7942e88fb57c35da748e6c7d2cc"
+        },
+        "13": {
+          "ground_truth.csv": "392ca1513b6b80d358b95124c4f212920d4424d75b5ccfaa70349d4574047ab0",
+          "query.json": "e45a2ab8feb029efd1fdc6dd175053d253ec6a833bec576015ca0fff5bde1044",
+          "validate.py": "cf707902d5ccb87233fbba008ebc70d6e7001d2f77e10ddebeb082575ded4486"
+        },
+        "2": {
+          "ground_truth.csv": "6b6a6337891ae7619f92991923a68920a4c4b1eca81e1733463af2bf7ed2d458",
+          "query.json": "9e4834b6399ed135885379b58092992df72a6abfda6d63289c3c6d632ff7a67b",
+          "validate.py": "a9e852fda1bbda63d3d1940e129e32d5af4a428c75a78424b4495db02a984d1d"
+        },
+        "3": {
+          "ground_truth.csv": "3e18e2dab6f2bdb77a8888916f368ab87ad7a23534560f8159744aff0e245aff",
+          "query.json": "3413c9ccae6924385e20ca4e5683a2b2bb53e988df87cbd40b2154885824d294",
+          "validate.py": "0b8dda4ccc5958a7ae292ff782329785ac450ac1ccec890484a6ff5a9f774767"
+        },
+        "4": {
+          "ground_truth.csv": "9de6fe1d72659daec67e919b0c473a24da5f03d3d096dc44ead1687240975f7c",
+          "query.json": "e7b8341035f0e32bb2dfe08a1112b2e973bf45ebffde77ec42de102d427f0da3",
+          "validate.py": "44a9efc64699eb0f99703ef0cb1e37d7c11af5bcfb62974a9f3c5d890af27c14"
+        },
+        "5": {
+          "ground_truth.csv": "1527ff4fc7764fd9d086de285177637357747e3d583dcc594151607ea0b3409d",
+          "query.json": "12f4ad0de8c065b851dd9edb53f9003c58ddd02516c73d7b941c7b08ff432962",
+          "validate.py": "2c9fd2b1cef51e8e00b5cbefb15dfe4cb8261d726519f394ab4b2dc1f2c05797"
+        },
+        "6": {
+          "ground_truth.csv": "6dcb146b0c2b9eafa8588e83f10e655a9db823987fb8638a9fc23d5106cd3d84",
+          "query.json": "366e380fb2873420a22a287a85a3eeea802bc10985709a0b1ded7eb90aa8736f",
+          "validate.py": "62d23cae1947acf29b02fdc186e25b10b2d11e223965c6f384fbbab6ccf6a7df"
+        },
+        "7": {
+          "ground_truth.csv": "b673d6904b108ea9c43d1ce5f49bf549de8b09d5773b27cccfd8af6aaafceea7",
+          "query.json": "82d93f1e5317b087cb59b785270191915f0d1d542779dc1d7035efe99277689a",
+          "validate.py": "6a3a4ce64de4fe3abbb7c38f50f0bd5c54ef09506445b384fa9f2f537bb0704e"
+        },
+        "8": {
+          "ground_truth.csv": "d6272a72f0c9f9e38fd138b0eeda6bd4e26c68c72d409f52a373e96bd8f557a7",
+          "query.json": "c0d1d62e8696fc91c2469b719753ba8c6e4273c3cdeade0f4c58b5d9df5a8408",
+          "validate.py": "f5286f8dadbe0c2d0895b6f0fe4085691fdd2e6ae916e79f2f9293a960c30334"
+        },
+        "9": {
+          "ground_truth.csv": "4a95385af451dc995120af71db4be91aeb125c541eb70adc65287dbc3f27a09c",
+          "query.json": "ad49f3909ed2da0fd72a99db50de26652f1a4c7b7b35aead6656092918357a71",
+          "validate.py": "fd1b20664e106209005d1d3f8321d935616927f4529d9a9388098481e6799b78"
+        }
+      }
+    },
+    "googlelocal": {
+      "data_files": {
+        "query_dataset/business_description.sql": {
+          "bytes": 38204,
+          "sha256": "cac36db1c60ab1fcbc661cc7df46c9980db1c2fcdaedb65b57f7a2618339ddd4",
+          "source": "mirror"
+        },
+        "query_dataset/review_query.db": {
+          "bytes": 585728,
+          "sha256": "1e9ef561d4edf62ff49bf874253935caf8d404a79c60d21b9b0fc40ee041692c",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "business_database": {
+          "db_name": "googlelocal_db",
+          "db_type": "postgres",
+          "sql_file": "query_dataset/business_description.sql"
+        },
+        "review_database": {
+          "db_path": "query_dataset/review_query.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "postgres",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "346dee2e3d1ac957c9f2f8ca18b463e9ef32779f47979b33f1c7cf31fa0e3950",
+          "query.json": "3f9cae56516b7ae78edb2d96a28634746762b983219b85d995db679c554226be",
+          "validate.py": "380e9dd0d57319d8c887ebfb5161c38add6bb8d19283265bf9f84e0e4c6323d3"
+        },
+        "2": {
+          "ground_truth.csv": "df1f004117f74a3a4e0c1fd7ae59a5d22e6375abb24a2a9683d1d691850700ff",
+          "query.json": "d4b527325a39563c28e17bb29a694082677ba6190ecd7d8b232f923de947e2a6",
+          "validate.py": "0a2db3d2e36578165b3135c309b9e6d7b4f67665b2e3cf025524efcb711e2ad4"
+        },
+        "3": {
+          "ground_truth.csv": "e0fa0f352948f37245f42661e208511b7c4f1cf85e6a50e7b062f13e8b7929c9",
+          "query.json": "edc69dda56e12bd4b5c1b4ec50d98fef8a1f24a1af951aa3933511dae7cc651d",
+          "validate.py": "37b5175ce2fe38edf5cf813d1b293ae4b42d22b8b8afe1348e4d56db898096fa"
+        },
+        "4": {
+          "ground_truth.csv": "229ae1e1ff0c007363e5e99e6972d7cb7714d49077522bc9ff28f7937fd862ce",
+          "query.json": "1ffd55d9fca7f959216dc13dda75bfc37c3dddadd939b3fad072b1a1f3e48cae",
+          "validate.py": "4b9c7096546d5f581c5212e8617caa41b19820f56025ee309abcf7a97ba5f6d9"
+        }
+      }
+    },
+    "music_brainz_20k": {
+      "data_files": {
+        "query_dataset/sales.duckdb": {
+          "bytes": 1060864,
+          "sha256": "52ce48c0027eab1b3f85932139425107dd5cf7422217bd8adedfc3edf21ad0e2",
+          "source": "repo"
+        },
+        "query_dataset/tracks.db": {
+          "bytes": 2035712,
+          "sha256": "0c349f70e5bafcba1deb605b49e224abfa95c5a83a44688faa511f9e123a02cc",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "sales_database": {
+          "db_path": "query_dataset/sales.duckdb",
+          "db_type": "duckdb"
+        },
+        "tracks_database": {
+          "db_path": "query_dataset/tracks.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "3a21b64bdb7b781b51d41c587a8834c38a4dca706588fa5eddc421a737a68232",
+          "query.json": "b49b9e624260d2ea09ec1191ef32bf7a85fe00a428288140a2ea4fb9233e267f",
+          "validate.py": "95e75de5b663e836372faeab70420527c7b42bcf3767e8431beca1ebde17637b"
+        },
+        "2": {
+          "ground_truth.csv": "2faf9cfdecef4a699b155b1f3d5fad94e760f7767c57f9c50f4ce60392c5f09c",
+          "query.json": "8918f918a333b6c28250bfa169a4acd2e7c36876c98b946c30b64e0aeb0c677c",
+          "validate.py": "2ef8b4f76ade27acfeed410e59fd52c608a04b86a6bed8626b71c8b589bfcff3"
+        },
+        "3": {
+          "ground_truth.csv": "f9ed9f10dd91abe4f91cd3a0b1a98dae80087cbed65bac2db7795da510fc8e43",
+          "query.json": "c73ce87fbc8a1a57563705070de6867e9d275656ef48d5be0b1b28dfa3375146",
+          "validate.py": "cdc581cea003b72d490ab83e3e005bac94531a990a737aa96a39b8cceee33d2e"
+        }
+      }
+    },
+    "pancancer_atlas": {
+      "data_files": {
+        "query_dataset/pancancer_clinical.sql": {
+          "bytes": 7555304,
+          "sha256": "ce57356f7a0f72e1c43a1fc2083d46293991645cbce2f6f237c731bf4035fdd6",
+          "source": "mirror"
+        },
+        "query_dataset/pancancer_molecular.db": {
+          "bytes": 293875712,
+          "sha256": "7e1131c386014ea8bdd528d2fd040a85f6891dd9e46e8dc18947f7a712cf8610",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "clinical_database": {
+          "db_name": "pancancer_clinical",
+          "db_type": "postgres",
+          "sql_file": "query_dataset/pancancer_clinical.sql"
+        },
+        "molecular_database": {
+          "db_path": "query_dataset/pancancer_molecular.db",
+          "db_type": "duckdb"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "postgres"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "7ee7cbafeaf478ae54c9beddfc70470234ee2eca9a0a7cb77728e45a4ecd4a0b",
+          "query.json": "7a127ebaa5aadfdd3eabf6a01891eda9211b15fa462f3e03f15e67f3a98ec328",
+          "validate.py": "3f1b15e3c24c1ce258ba064fcc3f2523ee4b7c8079ab58c5ac215cd90d1d6d7a"
+        },
+        "2": {
+          "ground_truth.csv": "2bfe813dbde0db8da2b4fbec782091239d97c3e0a7c1af9fe2d3f04f1ae0610c",
+          "query.json": "352c6f13e64220ec8cb518ac3411382a66577f98f3c536d9610ea7f5a3e8b628",
+          "validate.py": "e48251d37463258951299880b5784724274aa87fee40583cd3c513fc3ff02312"
+        },
+        "3": {
+          "ground_truth.csv": "e5e0c096ced1f63b34760d004167b551bcdfd6a642ba219de8c2e35786f6e158",
+          "query.json": "c21bb23a1d4c9e40717b73a55edf04b237a953a5c79a894e44672a5eab36d1b5",
+          "validate.py": "14b8be8849e25f4ba71b0347589ade0e51dec3e8a51f1273b485244981427520"
+        }
+      }
+    },
+    "patents": {
+      "data_files": {
+        "query_dataset/patent_CPCDefinition.sql": {
+          "bytes": 135238448,
+          "sha256": "f888382228bf87538744194ca2ea1be126c316423d6d10e35e7d4ec226da0144",
+          "source": "mirror"
+        },
+        "query_dataset/patent_publication.db": {
+          "bytes": 5421027328,
+          "sha256": "1e22b92b9849b3f7a07dcf89075f37787c84feacb0cdbc7b4bd96ae4fa88071c",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "CPCDefinition_database": {
+          "db_name": "patent_CPCDefinition",
+          "db_type": "postgres",
+          "sql_file": "query_dataset/patent_CPCDefinition.sql"
+        },
+        "publication_database": {
+          "db_path": "query_dataset/patent_publication.db",
+          "db_type": "sqlite"
+        }
+      },
+      "dbms": [
+        "postgres",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "c82084bcdce5382bdd5e599192b963d3d06909776c39b758342cef7c1f4109dd",
+          "query.json": "b181e9bd7ee711fe45783c7bcdd04cc9c44da38ad96592d5895d90b5a33a5912",
+          "validate.py": "764c9af0492c15fc12d2ce796fd312717c066af04937aa25c95a6351fe2efee8"
+        },
+        "2": {
+          "ground_truth.csv": "2531e2b75186c3393d781eecfe46ecea6212f58d50a35cb04f58eacab9d45631",
+          "query.json": "85222e70a218b55a186a5be14e3ec047739558afbaf98b21b7f824dc9f6ce7ba",
+          "validate.py": "28741289c1bb9065924f97981af0b64f19b0415fb110ee8e9d8c536a9f550c28"
+        },
+        "3": {
+          "ground_truth.csv": "a1b512f919c90e9d372c828f4b3cebcdc6c59c7fc614e8825914dc2ff7a27501",
+          "query.json": "65a4054537b7662556db4ab5e0d04b290b5103080b8759da3d65573fe6034968",
+          "validate.py": "c34efa6c273789795d3bf52a02e11503924644a665fa81ca752914a0c5577d50"
+        }
+      }
+    },
+    "stockindex": {
+      "data_files": {
+        "query_dataset/indexInfo_query.db": {
+          "bytes": 8192,
+          "sha256": "976511f3eb213269c81b286dd4517e4948b3d3bb776e221559943f0439916b55",
+          "source": "mirror"
+        },
+        "query_dataset/indextrade_query.db": {
+          "bytes": 4468736,
+          "sha256": "12e9cf350be2a6396f6be9f0c2bb057013859956bc8269952dc7a85008973bb1",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "indexinfo_database": {
+          "db_path": "query_dataset/indexInfo_query.db",
+          "db_type": "sqlite"
+        },
+        "indextrade_database": {
+          "db_path": "query_dataset/indextrade_query.db",
+          "db_type": "duckdb"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "fabb4a589ff762e92e56b924558cfa2ff4e03e354c466d2c792bd5de86cd831f",
+          "query.json": "cdf0ad83ee620ca66a1c46cdf8eb3ee24ecffc65c362802ab722c7a19ea4a8d7",
+          "validate.py": "827c71dc7ab3b6624437a4af3c21bedbe64a7b3614d86241e547e70c7e1a7c15"
+        },
+        "2": {
+          "ground_truth.csv": "d701279d5c493307a8780ea6f6e29909dc1c5a120b4ebc51b5aced4f69b27762",
+          "query.json": "1f06ad9ec6f8dbd571ef75b77c411bb72349ca2a64d5ae4e4ae1efa3b56fc296",
+          "validate.py": "834e41dd6de60ef5c824b229560738c7fca33672e8978bb9eb8ca0f71d052355"
+        },
+        "3": {
+          "ground_truth.csv": "7e3b2d0405ac07b5c270378b99a1229a14c4e70508e43704a965040ea1346331",
+          "query.json": "d872cc5cce95bfa4f498fecbb8947b143f0cc75bc195c6647b5cdb92a47c903e",
+          "validate.py": "eff4734185a8d3c7ebd1ec94b13feb50d7e6bd2ee431c01018cf88d3556444cd"
+        }
+      }
+    },
+    "stockmarket": {
+      "data_files": {
+        "query_dataset/stockinfo_query.db": {
+          "bytes": 737280,
+          "sha256": "b8cf6b5627c92e17c10e27779afa8aa77c659e44bd4ccc14b10f1116053bc6a2",
+          "source": "mirror"
+        },
+        "query_dataset/stocktrade_query.db": {
+          "bytes": 964964352,
+          "sha256": "e9cbf3c4d05d2eeb919c5b207374aefd19aa02e40dca49f2688618beb180350d",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "stockinfo_database": {
+          "db_path": "query_dataset/stockinfo_query.db",
+          "db_type": "sqlite"
+        },
+        "stocktrade_database": {
+          "db_path": "query_dataset/stocktrade_query.db",
+          "db_type": "duckdb"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "sqlite"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "50af6be4c15cde023a1ac26b4980de1a058ceece741f0878bb6251b34a6d8fa3",
+          "query.json": "ec4541f3706936b4950c984be32b011dee7c47cf0333b75c2f45a59d93a29c4d",
+          "validate.py": "58282597518b0432ab5d15c0f7845ae97d93a9d8dd66549c840f0c98fa9c815e"
+        },
+        "2": {
+          "ground_truth.csv": "6e6a09f82a445daab52a178dca62db5ef4e17d6601dc642a1f5496cd5382c008",
+          "query.json": "1dfdfba655707afbb3e02084a572b173b79e20e47be036f413975ecd57664473",
+          "validate.py": "be6ef9996c48d357291d87b8e572d20311d8cb6b05a3a6e9702f8d93dad8d63d"
+        },
+        "3": {
+          "ground_truth.csv": "ec679a6a984e44cb0277ab3055dee81ec38ce377ff9218b07791bef9fb6aaf7c",
+          "query.json": "0770ab30b8e79b9af5a3e91d0dd180a1d5f4708981a6c48f8ebf2716baf55010",
+          "validate.py": "948ed2b64b2ea8de48c11034c8c4e2772b5ca7dbdf898f8ff816bea407b227cb"
+        },
+        "4": {
+          "ground_truth.csv": "615d35632dae90d0b38723f1bc50cc59f6838dd34432f58b2063d5effaecd27d",
+          "query.json": "01590225dde474c7496ca27c8c79a15a908da8b1388eef730d8b660146c59bc7",
+          "validate.py": "09538392d54f1c68d9aac70e5d7d1c692cebe3a743078067b211bbf0909d7f8d"
+        },
+        "5": {
+          "ground_truth.csv": "55dc0939bfb90a11fb976ed7741c6802c8e5b23b150ca6637a5accd48b94b622",
+          "query.json": "a40bc9e12f4723c5b54e3661c8d58518854e0cef2abf330612215d5de2fedd53",
+          "validate.py": "8f0e5b28bad6e209a6509662e7fab27d2a0a8114228dd04b49a2851dbefc95c4"
+        }
+      }
+    },
+    "yelp": {
+      "data_files": {
+        "query_dataset/yelp_business/yelp_db/business.bson": {
+          "bytes": 80597,
+          "sha256": "3aed3f77a2b0360b0f431decc63aaa0fd69e539a3fe4cb7e08f5ea081eb65c01",
+          "source": "repo"
+        },
+        "query_dataset/yelp_business/yelp_db/checkin.bson": {
+          "bytes": 248418,
+          "sha256": "879afe04080efd1bfc405109eb87efe4b127bf52d1c749224ca5e9c2f914fc6c",
+          "source": "repo"
+        },
+        "query_dataset/yelp_user.db": {
+          "bytes": 3420160,
+          "sha256": "155ecf989e62e0d087ed9d4586893e6825ab56504bc5e62ad46d454067f9b730",
+          "source": "mirror"
+        }
+      },
+      "db_clients": {
+        "businessinfo_database": {
+          "db_name": "yelp_db",
+          "db_type": "mongo",
+          "dump_folder": "query_dataset/yelp_business"
+        },
+        "user_database": {
+          "db_path": "query_dataset/yelp_user.db",
+          "db_type": "duckdb"
+        }
+      },
+      "dbms": [
+        "duckdb",
+        "mongo"
+      ],
+      "queries": {
+        "1": {
+          "ground_truth.csv": "f9aa63a7dcac4c43d4acae18d8ccb68c2e5b23525f73ff81aabddc085c7374ad",
+          "query.json": "6d7feb548d68d731ea7c3b4cfeed0cc86bd796d4aaf4f142cd00ba02307d0be8",
+          "validate.py": "30d1f2535c4fea561260aa3e5e59fa3af25a98b0528557b11ba5af09f9a27475"
+        },
+        "2": {
+          "ground_truth.csv": "f2fd172bdd95984ea02defc781aae756565790ae2615ee6d7401586f3ed87545",
+          "query.json": "271ac8527fd063db0d58911d55429175cdb815d83fc39ba6b3794bafcda0e027",
+          "validate.py": "aa1e9fe46484d1319fe7da725441e34d6c2008672a990ccc8424b75fa19a582b"
+        },
+        "3": {
+          "ground_truth.csv": "90d7ec0f0acef104d8b6252794295f661a0149634868d02a1ae0c358099638f5",
+          "query.json": "1dcf772c1298a4df34e9f486ff9ae56dfd6e379fcef4986dbff6f00967af99a1",
+          "validate.py": "c79185af0b0bc5d163d2c617fc853f724ecf30142e903978363e7ad82a4fb4ee"
+        },
+        "4": {
+          "ground_truth.csv": "519c2fcda71548e2d22a68931d0aa885ed7459dde1416bbb20d14d3644f76820",
+          "query.json": "23ec6db6b39fb023c42c753c3b8a834190220b4bfe994bb69c7580fdedcd0080",
+          "validate.py": "fb27e15bd68c5671fd1e152790d220bdd78c88270e398c0ccc4a91ee28b31ed2"
+        },
+        "5": {
+          "ground_truth.csv": "c8834cf007b7200fcb1f8914094868f330100fbeef81c84725479192b1e4c197",
+          "query.json": "26cb0e7d3cadead760b4201dfadfacf333aa6b143637b72c31d6609cd8db8848",
+          "validate.py": "b9e2d3c797b7e51b13cdfdc62896a4dd074bb3135168e57e7faad5b8de52859b"
+        },
+        "6": {
+          "ground_truth.csv": "163131e85c1522811b148b586ff479dcdb3d737ad134890daf9c886455d9b64b",
+          "query.json": "5b9b951319a32b32a070b29ea598f25332afb5529f92926f8268eedb07a49114",
+          "validate.py": "14b3488f8a0b35c69167d93fee30db11f02d2552c2003fd24e2061eb6f7d38b0"
+        },
+        "7": {
+          "ground_truth.csv": "9e9d5fee0d199805a6470697df357f3888aae3606ca8c0304b969fcb4ce721dc",
+          "query.json": "5f226f1a026b89cc7d22903987c215df6837d561ebc193f607c12ccb48e40d3f",
+          "validate.py": "b35b9f67c8c915c9e06d02b1abacfe853655b45cb34aef30e5ee972d84a21caf"
+        }
+      }
+    }
+  },
+  "mirror": "ruiyingm/DataAgentBench-data",
+  "protocol": "dab-score-v2",
+  "revision": "61fb21e0766d775acae443f6074f5d498e95f938"
+}

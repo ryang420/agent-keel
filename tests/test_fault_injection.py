@@ -307,7 +307,7 @@ LAUNCHER = textwrap.dedent("""
     db, port, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
     providers = ProviderRegistry()
     providers.register(FakeProvider(script=[[TextDelta("par"), "hang"]] if mode == "hang" else []))
-    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=f"sqlite:///{db}",
+    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=db,
                         sandbox="none", workers=1, lease_seconds=2.0)
     uvicorn.run(create_service(settings, providers=providers), host="127.0.0.1", port=port, log_level="warning")
 """)
@@ -342,13 +342,13 @@ async def wait_status(client, run_id, statuses, seconds=20.0):
 
 
 @needs_subprocess
-async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_continues(tmp_path):
-    db, launcher = tmp_path / "keel.sqlite3", tmp_path / "launch.py"
+async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_continues(tmp_path, pg_dsn):
+    launcher = tmp_path / "launch.py"
     launcher.write_text(LAUNCHER)
     port = free_port()
 
     def spawn(mode):
-        return subprocess.Popen([sys.executable, str(launcher), str(db), str(port), mode])
+        return subprocess.Popen([sys.executable, str(launcher), pg_dsn, str(port), mode])
 
     server = spawn("hang")
     try:
@@ -359,7 +359,7 @@ async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_contin
             payload = {"input": "hi", "session_id": "s1", "provider": "fake", "model": "m"}
             run_id = (await client.post("/v1/profiles/p1/runs", json=payload)).json()["run_id"]
             await wait_status(client, run_id, {"running"})
-            watcher = await open_store(f"sqlite:///{db}")
+            watcher = await open_store(pg_dsn)
             try:
                 for _ in range(250):  # the delta follows the stored user message
                     if any(e.type == "message.delta" for e in await watcher.events_after(run_id, 0)):
@@ -379,7 +379,7 @@ async def test_a_server_killed_with_sigkill_loses_its_run_and_the_session_contin
     finally:
         server.kill()
         server.wait(10)
-    store = await open_store(f"sqlite:///{db}")
+    store = await open_store(pg_dsn)
     try:
         assert (await one_terminal_event(store, run_id)).data["error_code"] == "worker_lost"
         assert (await one_terminal_event(store, nxt)).type == "run.completed"

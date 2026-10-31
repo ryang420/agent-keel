@@ -8,10 +8,7 @@ from dataclasses import dataclass
 # Taken first in every migration's transaction, so instances starting together migrate once.
 # The key must equal 0.2.0's, so that a 0.2.0 instance and this one starting together also serialise.
 _PG_LOCK = "SELECT pg_advisory_xact_lock(7312100001)"
-_TYPES = {
-    "sqlite": {"real": "REAL", "serial": "INTEGER", "bigint": "INTEGER"},
-    "postgres": {"real": "DOUBLE PRECISION", "serial": "BIGSERIAL", "bigint": "BIGINT"},
-}
+_TYPES = {"real": "DOUBLE PRECISION", "serial": "BIGSERIAL", "bigint": "BIGINT"}
 
 
 class SchemaTooNew(Exception):
@@ -21,15 +18,11 @@ class SchemaTooNew(Exception):
 @dataclass(frozen=True)
 class Migration:
     version: int
-    template: str  # statements separated by ";", with {real}, {serial} and {bigint} filled per dialect
+    template: str  # statements separated by ";", with {real}, {serial} and {bigint} filled with PostgreSQL types
 
-    def statements(self, dialect: str) -> list[str]:
+    def statements(self) -> list[str]:
         sql = self.template
-        if dialect == "sqlite":
-            # SQLite only auto-increments an INTEGER PRIMARY KEY when it is declared exactly that way.
-            # Tenant ids are assigned by the operator, so only {serial} columns get AUTOINCREMENT.
-            sql = sql.replace("id {serial} PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
-        sql = sql.format(**_TYPES[dialect])
+        sql = sql.format(**_TYPES)
         return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 
@@ -191,18 +184,73 @@ ALTER TABLE profiles ADD COLUMN incarnation TEXT;
 ALTER TABLE runs ADD COLUMN profile_incarnation TEXT;
 """
 
+# Memory entries (cross-session memory design §2): each JSON list item becomes a stable row in its old order,
+# duplicates included, with legacy provenance and no invented source. The old table goes in the same transaction.
+_V8 = """
+CREATE TABLE memory_entries (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL,
+    target TEXT NOT NULL CHECK (target IN ('memory', 'user')),
+    position INTEGER NOT NULL, text TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'removed')),
+    created_at {real} NOT NULL, updated_at {real} NOT NULL);
+CREATE INDEX memory_entries_live ON memory_entries (profile_id, target, state, position);
+CREATE TABLE memory_revisions (
+    profile_id TEXT NOT NULL, target TEXT NOT NULL, revision {bigint} NOT NULL,
+    PRIMARY KEY (profile_id, target));
+CREATE TABLE memory_changes (
+    id {serial} PRIMARY KEY, profile_id TEXT NOT NULL, target TEXT NOT NULL, entry_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('add', 'replace', 'remove')), old_text TEXT, new_text TEXT,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('foreground', 'review', 'consumer', 'legacy')),
+    run_id TEXT, session_id TEXT, message_id {bigint}, tool_call_id TEXT, mutation_key TEXT,
+    revision {bigint} NOT NULL, created_at {real} NOT NULL);
+CREATE INDEX memory_changes_entry ON memory_changes (profile_id, entry_id, id);
+CREATE INDEX memory_changes_session ON memory_changes (profile_id, session_id);
+CREATE TABLE memory_mutations (
+    profile_id TEXT NOT NULL, mutation_key TEXT NOT NULL, session_id TEXT, result TEXT NOT NULL,
+    created_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, mutation_key));
+INSERT INTO memory_entries (id, profile_id, target, position, text, version, state, created_at, updated_at)
+    SELECT md5(m.profile_id || '/' || m.target || '/' || e.ord::text), m.profile_id, m.target, e.ord::integer - 1,
+           e.value, 1, 'active', m.updated_at, m.updated_at
+    FROM memories m CROSS JOIN LATERAL jsonb_array_elements_text(m.entries::jsonb) WITH ORDINALITY AS e(value, ord);
+INSERT INTO memory_revisions (profile_id, target, revision)
+    SELECT DISTINCT profile_id, target, 1 FROM memory_entries;
+INSERT INTO memory_changes (profile_id, target, entry_id, action, new_text, source_kind, revision, created_at)
+    SELECT profile_id, target, id, 'add', text, 'legacy', 1, created_at FROM memory_entries ORDER BY position;
+DROP TABLE memories
+"""
+
+# History search (cross-session memory design §3): a redacted text row per user/assistant message and unique
+# postings per profile. Existing history is indexed later by a resumable backfill up to each profile's ceiling;
+# newer messages are indexed as they are written. Sessions record the tools their prompt was built with.
+_V9 = """
+ALTER TABLE sessions ADD COLUMN tools TEXT;
+CREATE TABLE message_search (
+    message_id {bigint} PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, role TEXT NOT NULL,
+    text TEXT NOT NULL, created_at {real} NOT NULL);
+CREATE INDEX message_search_session ON message_search (profile_id, session_id, message_id);
+CREATE INDEX message_search_time ON message_search (profile_id, created_at);
+CREATE TABLE message_tokens (
+    profile_id TEXT NOT NULL, token TEXT NOT NULL, message_id {bigint} NOT NULL,
+    PRIMARY KEY (profile_id, token, message_id));
+CREATE INDEX message_tokens_message ON message_tokens (message_id);
+CREATE TABLE history_backfill (
+    profile_id TEXT PRIMARY KEY, done_through {bigint} NOT NULL, ceiling {bigint} NOT NULL,
+    updated_at {real} NOT NULL);
+INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at)
+    SELECT s.profile_id, 0, MAX(m.id), EXTRACT(EPOCH FROM now())
+    FROM messages m JOIN sessions s ON s.id = m.session_id GROUP BY s.profile_id
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 
 async def _table_exists(db, name: str) -> bool:
-    if db.dialect == "sqlite":
-        row = await db.fetchrow("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?", name)
-    else:
-        row = await db.fetchrow("SELECT 1 AS ok FROM information_schema.tables "
-                                "WHERE table_schema = current_schema() AND table_name = ?", name)
+    row = await db.fetchrow("SELECT 1 AS ok FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() AND table_name = ?", name)
     return row is not None
 
 
@@ -229,11 +277,10 @@ async def _set_version(db, version: int) -> None:
 
 async def migrate(db) -> int:
     """Bring the schema to LATEST_VERSION, one transaction per migration, each re-reading the version under the lock;
-    statements run one at a time because SQLite's executescript would commit the transaction."""
+    each version and its stamp commit atomically."""
     for migration in MIGRATIONS:
         async with db.transaction():
-            if db.dialect == "postgres":
-                await db.execute(_PG_LOCK)
+            await db.execute(_PG_LOCK)
             current = await schema_version(db)
             if current > LATEST_VERSION:
                 raise SchemaTooNew(f"The database schema is version {current}; this keel knows versions up to "
@@ -241,11 +288,11 @@ async def migrate(db) -> int:
             if current >= migration.version:
                 if await _stamped_version(db) is None:
                     # A 0.2.0 database, maybe partly created: 0.2.0 made its tables outside a transaction.
-                    for statement in migration.statements(db.dialect):
+                    for statement in migration.statements():
                         await db.execute(statement)
                     await _set_version(db, current)
                 continue
-            for statement in migration.statements(db.dialect):
+            for statement in migration.statements():
                 await db.execute(statement)
             await _set_version(db, migration.version)
     return LATEST_VERSION

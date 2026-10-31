@@ -11,7 +11,7 @@ product, where many users (profiles) each get their own sandbox, sessions and sk
 ## Why
 
 - **One HTTP + SSE API.** Create a profile, start a run, follow its events, stop it, read the session history.
-- **Durable runs.** Runs are rows in a Postgres (or SQLite) queue. Events are stored, so a client that drops can
+- **Durable runs.** Runs are rows in a Postgres queue. Events are stored, so a client that drops can
   reconnect and replay from the last sequence number it saw.
 - **Isolation per profile.** Tools run in a hardened Docker container per profile, described by a policy you set
   on the profile.
@@ -59,7 +59,7 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 - Sessions with stored messages, titles, and a persistent working directory.
 - Image input (PNG, JPEG, GIF, WebP) for vision-capable models.
 - Replayable SSE events and a stop endpoint that kills the running command.
-- Postgres (workers with LISTEN/NOTIFY wake-ups; several instances can share one database) or SQLite (one instance).
+- Postgres storage and LISTEN/NOTIFY wake-ups; several instances can share one database.
 - Per-run limits: iteration cap, run lease, and an in-flight cap that answers 429.
 
 ## Documentation
@@ -78,19 +78,28 @@ For the OpenAI provider use `"provider": "openai"` and your model name. The full
 
 Pre-1.0 (0.3.1). The API and the database schema may change between releases. A database is upgraded in place at
 start (numbered migrations; the coordinated sandbox lifecycle is migration 5); a database written by a newer keel is
-refused. Back up the database before upgrading. Sandbox coordination across more than one instance needs PostgreSQL
-and the stopped-service cutover in [the operations guide](docs/guide/operations.md#upgrading-to-the-coordinated-sandbox-lifecycle).
+refused. PostgreSQL is required, including for local development. Back up the database before upgrading.
+Sandbox lifecycle upgrades require the stopped-service cutover in [the operations guide](docs/guide/operations.md#upgrading-to-the-coordinated-sandbox-lifecycle).
 
 ## Development
 
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest -q
 ```
 
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
+```
+
+The test compose file runs PostgreSQL 17 on `127.0.0.1:55437`. Integration tests require
+`KEEL_TEST_POSTGRES_DSN`; a missing DSN fails those tests. Each test creates and drops its own unique database,
+so the configured user needs `CREATEDB`; the supplied base database is never cleared. To run only unit tests
+without a database, use `.venv/bin/python -m pytest -q -m 'not integration'`.
+
 Opt-in suites: `KEEL_TEST_DOCKER=1` (Docker sandbox, image from `KEEL_TEST_DOCKER_IMAGE`, default
-`python:3.12-slim`), `KEEL_TEST_POSTGRES_DSN=postgresql://…` (drops and recreates keel's tables),
-`KEEL_LIVE_BEDROCK=1` and `KEEL_LIVE_OPENAI=1` (call a real model). The Docker suites need the sandbox supervisor
+`python:3.12-slim`), `KEEL_LIVE_BEDROCK=1` and `KEEL_LIVE_OPENAI=1` (call a real model). The Docker suites need the sandbox supervisor
 for the daemon's architecture; build it once with `python scripts/build_supervisor.py --arch all` (the artifacts
 are gitignored and also packaged into wheels and images). Native supervisor tests run with
 `python3 scripts/run_native_tests.py --arch amd64` (or `arm64`) in a throwaway container.

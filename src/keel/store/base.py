@@ -54,7 +54,7 @@ class ProfileIncarnationMismatch(StoreError):
 
 
 class UniqueViolation(Exception):
-    """Raised by a Db adapter when a unique constraint rejects a write."""
+    """Raised by the database adapter when a unique constraint rejects a write."""
 
 
 class OwnershipError(Exception):
@@ -95,6 +95,7 @@ class Session:
     compaction_failed_at: float | None = None
     turns_since_memory: int = 0
     pruned_id: int | None = None
+    tools: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,54 @@ class StoredMessage:
     run_id: str | None
     message: Message
     created_at: float
+
+
+@dataclass(frozen=True)
+class HistoryRow:
+    """A search candidate: an indexed message, with its session's title and the status of the run that wrote it."""
+    message_id: int
+    session_id: str
+    title: str | None
+    role: str
+    text: str            # the redacted searchable text
+    created_at: float
+    run_status: str | None  # None when the message has no run (imported)
+    hits: int            # distinct query tokens it contains
+
+
+@dataclass(frozen=True)
+class HistoryMessage:
+    """A stored message read for context, with the status of the run that wrote it."""
+    id: int
+    session_id: str
+    message: Message
+    created_at: float
+    run_status: str | None
+
+
+@dataclass(frozen=True)
+class MemorySource:
+    """Who committed a memory change. Set from trusted context, never from model arguments."""
+    kind: str  # "foreground", "review", "consumer" or "legacy"
+    run_id: str | None = None
+    session_id: str | None = None
+    message_id: int | None = None
+    tool_call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryItem:
+    """An active memory entry with the source of its latest change."""
+    id: str
+    target: str
+    text: str
+    version: int
+    created_at: float
+    updated_at: float
+    source_kind: str | None
+    run_id: str | None
+    session_id: str | None
+    message_id: int | None
 
 
 @dataclass(frozen=True)

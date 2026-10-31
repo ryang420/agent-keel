@@ -301,8 +301,8 @@ async def test_other_instance_cannot_resume_an_old_background_review_into_a_reus
         await background_b.close()
 
 
-async def test_an_inflight_delete_cannot_cancel_a_recreated_incarnations_queued_run(tmp_path):
-    dsn = f"sqlite:///{tmp_path / 'inflight-delete.sqlite3'}"
+async def test_an_inflight_delete_cannot_cancel_a_recreated_incarnations_queued_run(tmp_path, pg_dsn):
+    dsn = pg_dsn
     store_a, store_b = await open_store(dsn), await open_store(dsn)
     background_a, background_b = Background(), Background()
     try:
@@ -341,8 +341,8 @@ async def test_an_inflight_delete_cannot_cancel_a_recreated_incarnations_queued_
         await store_b.close()
 
 
-async def test_late_old_delete_cannot_replace_a_newer_local_background_block(tmp_path):
-    dsn = f"sqlite:///{tmp_path / 'late-background-block.sqlite3'}"
+async def test_late_old_delete_cannot_replace_a_newer_local_background_block(tmp_path, pg_dsn):
+    dsn = pg_dsn
     store_a, store_b = await open_store(dsn), await open_store(dsn)
     background_a, background_b = Background(), Background()
     service_a = ProfileDeletionService(store_a, background=background_a)
@@ -387,8 +387,8 @@ async def test_late_old_delete_cannot_replace_a_newer_local_background_block(tmp
         await store_b.close()
 
 
-async def test_late_old_background_drain_leaves_new_incarnation_tasks_running(tmp_path):
-    dsn = f"sqlite:///{tmp_path / 'late-background-drain.sqlite3'}"
+async def test_late_old_background_drain_leaves_new_incarnation_tasks_running(tmp_path, pg_dsn):
+    dsn = pg_dsn
     store_a, store_b = await open_store(dsn), await open_store(dsn)
     background_a, background_b = Background(), Background()
     service_a = ProfileDeletionService(store_a, background=background_a)
@@ -439,20 +439,14 @@ async def test_late_old_background_drain_leaves_new_incarnation_tasks_running(tm
 
 @pytest.mark.parametrize("pause_point", ["service", "planner"])
 async def test_an_inflight_delete_cannot_retire_a_recreated_incarnations_sandbox(
-        store, clock, helper_assets, pause_point):
+        store, clock, helper_assets, pause_point, pg_dsn):
     clock.now = await store.db.database_now()
     store.coordination_clock = clock
     backend = FakeDocker()
     coordinator = SandboxCoordinator(store, backend, deployment="dep", owner="w1", lease_seconds=30,
                                      idle_seconds=10, reap_seconds=1)
     assert await coordinator.open_admission()
-    if store.db.dialect == "postgres":
-        import os
-
-        dsn = os.environ["KEEL_TEST_POSTGRES_DSN"]
-    else:
-        [dbrow] = await store.db.fetch("PRAGMA database_list")
-        dsn = "sqlite:///" + dbrow["file"]
+    dsn = pg_dsn
     other = await open_store(dsn)
     other.coordination_clock = clock
     newer_coordinator = SandboxCoordinator(

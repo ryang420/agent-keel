@@ -68,7 +68,7 @@ removal) with coordinated exact-ID generations. Migration 5 adds the `sandboxes`
 Requirements:
 
 - Every instance of one deployment uses the same PostgreSQL database, the same Docker daemon and the same
-  `KEEL_DEPLOYMENT` label. SQLite supports one instance.
+  `KEEL_DEPLOYMENT` label.
 - The installed package carries the sandbox supervisor for amd64 and arm64 (the wheel, the source distribution and
   the container image do). Building from a source tree needs `scripts/build_supervisor.py --arch all` once; it is
   never downloaded at run time.
@@ -109,6 +109,18 @@ Verification after cutover:
 - The daemon ID reported by `docker info` matches the one recorded in the sandbox and operation rows;
   changing it closes admission until the recorded daemon is restored and the service restarted.
 
+## History search index
+
+Migration 9 creates the index behind `session_search`. Every instance indexes new messages as they are written and
+backfills older ones in the background, 200 messages per batch, so no operator step is needed. Until the backfill
+finishes for a profile, `session_search` reports `index_complete: false` for it. Watch progress with:
+
+```sql
+SELECT profile_id, done_through, ceiling FROM history_backfill WHERE done_through < ceiling;
+```
+
+Every instance must run this release: an older instance writes messages the index never sees.
+
 ## Complete profile deletion
 
 A consumer may ask the service to remove one profile completely through the delete/complete contract in
@@ -133,5 +145,5 @@ A consumer may ask the service to remove one profile completely through the dele
 6. Do not delete rows from `profile_deletions`, `profile_deletion_receipts` or the sandbox ledger by hand: they
    are the evidence a retry relies on. A receipt may be retained after completion; it contains no conversation,
    file, memory or user email.
-7. On both SQLite and PostgreSQL the same migration and store code apply. A newer schema is refused by an older
+7. PostgreSQL databases are upgraded in place by numbered migrations. A newer schema is refused by an older
    keel, so roll back by restoring the database backup, as with any migration.

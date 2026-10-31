@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
-from keel.store.base import ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch, ProfileTenantMismatch
+from keel.store.base import (
+    MemorySource, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch, ProfileTenantMismatch,
+)
 
 MODELS = [{"provider": "fake", "model": "m"}]
 OP_A = "11111111-1111-4111-8111-111111111111"
@@ -16,10 +18,10 @@ async def put_profile(store, profile_id="p1", tenant_id=1):
                                       tenant_id=tenant_id)
 
 
-async def test_delete_fence_survives_reopen(tmp_path, clock):
+async def test_delete_fence_survives_reopen(tmp_path, clock, pg_dsn):
     from keel.store import open_store
 
-    url = f"sqlite:///{tmp_path / 'keel.sqlite3'}"
+    url = pg_dsn
     first = await open_store(url, clock=clock)
     await put_profile(first)
     record = await first.begin_profile_deletion("p1", 1, OP_A)
@@ -227,7 +229,13 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
                                      input_parts=[{"type": "text", "text": "hi"}], instructions=None)
         await store.append_message(f"{profile}-s", run.id, _message())
         await store.put_blob(profile, f"{profile}-s", "text/plain", "aGk=")
-        await store.apply_memory(profile, "user", 10, [{"action": "add", "content": "likes tea"}])
+        await store.apply_memory(profile, "user", 10, [{"action": "add", "content": "likes tea"}],
+                                 source=MemorySource("foreground", run_id=run.id, session_id=f"{profile}-s"),
+                                 mutation_key=f"foreground:{run.id}:c1")
+
+    for profile in ("p1", "p2"):
+        await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
+                               "VALUES (?, 0, 1, 0)", profile)
 
     record = await store.begin_profile_deletion("p1", 1, OP_A)
     record = await store.advance_profile_deletion(record, "draining")
@@ -236,6 +244,10 @@ async def test_purge_removes_only_the_target_profiles_rows(store):
     assert await store.get_profile("p1") is None
     assert await store.list_sessions("p1") == []
     assert await store.memory_entries("p1") == {"memory": [], "user": []}
+    for table in ("memory_entries", "memory_changes", "memory_revisions", "memory_mutations",
+                  "message_search", "message_tokens", "history_backfill"):
+        assert await store.db.fetchrow(f"SELECT 1 AS n FROM {table} WHERE profile_id = ?", "p1") is None
+        assert await store.db.fetchrow(f"SELECT 1 AS n FROM {table} WHERE profile_id = ?", "p2") is not None
 
     assert await store.get_profile("p2") is not None
     assert len(await store.list_sessions("p2")) == 1

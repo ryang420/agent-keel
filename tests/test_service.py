@@ -10,10 +10,10 @@ from keel.service import create_service
 from tests.sandbox_support import LOCAL_DAEMON, LocalDocker, container_id, install_helper_assets
 
 
-async def test_the_service_starts_runs_and_stops(tmp_path):
+async def test_the_service_starts_runs_and_stops(tmp_path, pg_dsn):
     # Docker mode with no reachable Docker: chat-only runs still start and complete.
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{tmp_path / 'keel.sqlite3'}", workers=1,
+                        database_url=pg_dsn, workers=1,
                         docker=str(tmp_path / "no-docker"))
     providers = ProviderRegistry()
     providers.register(FakeProvider())
@@ -34,11 +34,11 @@ async def test_the_service_starts_runs_and_stops(tmp_path):
             assert status == "completed"
 
 
-async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
+async def test_the_service_starts_without_a_sandbox_backend(tmp_path, pg_dsn):
     from keel.service import build
 
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
+                        database_url=pg_dsn, sandbox="none",
                         compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3)
     keel, pool, closables, backend = await build(settings)
     try:
@@ -54,7 +54,7 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
             await close()
 
 
-async def test_a_failing_pool_start_still_closes_everything(tmp_path, monkeypatch):
+async def test_a_failing_pool_start_still_closes_everything(tmp_path, monkeypatch, pg_dsn):
     import pytest
 
     from keel import service
@@ -78,7 +78,7 @@ async def test_a_failing_pool_start_still_closes_everything(tmp_path, monkeypatc
     monkeypatch.setattr(WorkerPool, "start", boom)
     monkeypatch.setattr(service, "build", build)
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none")
+                        database_url=pg_dsn, sandbox="none")
     app = service.create_service(settings)
     with pytest.raises(RuntimeError, match="no start"):
         async with app.router.lifespan_context(app):
@@ -89,7 +89,7 @@ async def test_a_failing_pool_start_still_closes_everything(tmp_path, monkeypatc
 async def test_openai_is_registered_only_when_a_key_is_set(tmp_path):
     from keel.service import default_providers
 
-    base = {"credentials": (ServiceCredential(1, "k"),), "database_url": f"sqlite:///{tmp_path / 'k.db'}"}
+    base = {"credentials": (ServiceCredential(1, "k"),), "database_url": "postgresql://unused/keel"}
     without = default_providers(Settings(**base))
     with_key = default_providers(Settings(**base, openai_api_key="sk-x"))
     try:
@@ -103,7 +103,7 @@ async def test_openai_is_registered_only_when_a_key_is_set(tmp_path):
 async def test_both_providers_use_the_configured_stall_limits(tmp_path):
     from keel.service import default_providers
 
-    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url=f"sqlite:///{tmp_path / 'k.db'}",
+    settings = Settings(credentials=(ServiceCredential(1, "k"),), database_url="postgresql://unused/keel",
                         openai_api_key="sk-x", model_first_event_seconds=7.0, model_stall_seconds=42.0,
                         model_high_effort_stall_seconds=300.0)
     registry = default_providers(settings)
@@ -117,7 +117,7 @@ async def test_both_providers_use_the_configured_stall_limits(tmp_path):
         await registry.aclose()
 
 
-async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monkeypatch):
+async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monkeypatch, pg_dsn):
     from keel import service
 
     seen = {}
@@ -129,7 +129,7 @@ async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monke
 
     monkeypatch.setattr(service, "open_store", spy)
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
-                        database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
+                        database_url=pg_dsn, sandbox="none",
                         lease_seconds=60)
     keel, pool, closables, backend = await service.build(settings)
     try:
@@ -140,8 +140,8 @@ async def test_build_derives_the_database_timeout_from_the_lease(tmp_path, monke
             await close()
 
 
-def _docker_settings(tmp_path, **extra) -> Settings:
-    return Settings(credentials=(ServiceCredential(1, "k"),), database_url=f"sqlite:///{tmp_path / 'k.db'}",
+def _docker_settings(tmp_path, pg_dsn, **extra) -> Settings:
+    return Settings(credentials=(ServiceCredential(1, "k"),), database_url=pg_dsn,
                     workers=1, docker=str(tmp_path / "no-docker"), deployment="dep", **extra)
 
 
@@ -179,11 +179,11 @@ class _ServiceDocker(LocalDocker):
         return [*await super().inventory(), *self.extra_inventory]
 
 
-async def test_build_wires_one_coordinator_into_the_executor_and_the_pool(tmp_path):
+async def test_build_wires_one_coordinator_into_the_executor_and_the_pool(tmp_path, pg_dsn):
     from keel.sandbox.coordinator import SandboxCoordinator
     from keel.service import build
 
-    settings = _docker_settings(tmp_path, lease_seconds=45.0, sandbox_reap_seconds=7.0, sandbox_idle_seconds=99.0)
+    settings = _docker_settings(tmp_path, pg_dsn, lease_seconds=45.0, sandbox_reap_seconds=7.0, sandbox_idle_seconds=99.0)
     keel, pool, closables, coordinator = await build(settings)
     try:
         assert isinstance(coordinator, SandboxCoordinator)
@@ -198,8 +198,8 @@ async def test_build_wires_one_coordinator_into_the_executor_and_the_pool(tmp_pa
         await _close(closables)
 
 
-async def test_sandboxed_runs_wait_while_chat_only_runs_proceed_when_docker_cannot_initialize(tmp_path):
-    settings = _docker_settings(tmp_path)
+async def test_sandboxed_runs_wait_while_chat_only_runs_proceed_when_docker_cannot_initialize(tmp_path, pg_dsn):
+    settings = _docker_settings(tmp_path, pg_dsn)
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     app = create_service(settings, providers=providers)
@@ -221,7 +221,7 @@ async def test_sandboxed_runs_wait_while_chat_only_runs_proceed_when_docker_cann
             assert (await client.post(f"/v1/profiles/boxed/runs/{boxed}/stop")).json()["status"] == "cancelled"
 
 
-async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_its_profile(tmp_path, monkeypatch):
+async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_its_profile(tmp_path, monkeypatch, pg_dsn):
     from keel import service
 
     install_helper_assets(tmp_path / "helper", monkeypatch)
@@ -240,7 +240,7 @@ async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_it
         return backend
 
     monkeypatch.setattr(service, "DockerSandbox", factory)
-    settings = _docker_settings(tmp_path, sandbox_reap_seconds=3.0)
+    settings = _docker_settings(tmp_path, pg_dsn, sandbox_reap_seconds=3.0)
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     sandbox = {"image": "img", "workdir": str(tmp_path / "work")}
@@ -268,7 +268,7 @@ async def test_startup_reconciles_inventory_and_unknown_inventory_blocks_only_it
             assert backend.removed_ids == [] and backend.calls.count("create") == 1
 
 
-async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown(tmp_path, monkeypatch):
+async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown(tmp_path, monkeypatch, pg_dsn):
     from keel import service
     from keel.sandbox.coordinator import SandboxCoordinator
     from keel.sandbox.records import RecoveryReport
@@ -292,7 +292,7 @@ async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown
 
     monkeypatch.setattr(SandboxCoordinator, "reconcile_once", reconcile_once)
     monkeypatch.setattr(SandboxCoordinator, "reap_idle_once", reap_idle_once)
-    app = create_service(_docker_settings(tmp_path))
+    app = create_service(_docker_settings(tmp_path, pg_dsn))
     async with app.router.lifespan_context(app):
         for _ in range(100):
             if calls.count(("idle", 100)) >= 2:
@@ -307,7 +307,7 @@ async def test_maintenance_runs_bounded_reconcile_and_idle_passes_until_shutdown
 
 
 async def test_maintenance_prunes_records_with_the_configured_retention_and_logs_failures(tmp_path, monkeypatch,
-                                                                                          caplog):
+                                                                                          caplog, pg_dsn):
     import logging
 
     from keel import service
@@ -339,7 +339,7 @@ async def test_maintenance_prunes_records_with_the_configured_retention_and_logs
 
     monkeypatch.setattr(SqlStore, "prune_sandbox_records", prune)
     caplog.set_level(logging.INFO, logger=service.log.name)
-    app = create_service(_docker_settings(tmp_path, event_retention_days=3))
+    app = create_service(_docker_settings(tmp_path, pg_dsn, event_retention_days=3))
     async with app.router.lifespan_context(app):
         for _ in range(100):
             if len(calls) >= 2:
@@ -390,7 +390,7 @@ async def test_claims_never_wait_on_docker_and_admission_opens_after_a_full_inve
 
 
 async def test_docker_down_at_startup_keeps_sandbox_admission_closed_until_inventory_is_classified(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, pg_dsn):
     from keel import service
     from keel.sandbox.base import SandboxError
 
@@ -421,7 +421,7 @@ async def test_docker_down_at_startup_keeps_sandbox_admission_closed_until_inven
     providers = ProviderRegistry()
     providers.register(FakeProvider())
     sandbox = {"image": "img", "workdir": str(tmp_path / "work")}
-    app = service.create_service(_docker_settings(tmp_path), providers=providers)
+    app = service.create_service(_docker_settings(tmp_path, pg_dsn), providers=providers)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
                                      headers={"Authorization": "Bearer k"}) as client:
@@ -441,7 +441,7 @@ async def test_docker_down_at_startup_keeps_sandbox_admission_closed_until_inven
             assert row == {"state": "blocked"} and backends[0].removed_ids == []
 
 
-async def test_a_hung_daemon_neither_stalls_startup_nor_chat_only_runs(tmp_path, monkeypatch):
+async def test_a_hung_daemon_neither_stalls_startup_nor_chat_only_runs(tmp_path, monkeypatch, pg_dsn):
     import time
 
     from keel import service
@@ -457,7 +457,7 @@ async def test_a_hung_daemon_neither_stalls_startup_nor_chat_only_runs(tmp_path,
     monkeypatch.setattr(service, "DockerSandbox", Hung)
     providers = ProviderRegistry()
     providers.register(FakeProvider())
-    app = service.create_service(_docker_settings(tmp_path), providers=providers)
+    app = service.create_service(_docker_settings(tmp_path, pg_dsn), providers=providers)
     started = time.monotonic()
     async with app.router.lifespan_context(app):
         assert time.monotonic() - started < 1.0

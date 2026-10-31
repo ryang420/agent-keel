@@ -14,7 +14,7 @@ from typing import Mapping
 
 from keel.providers.base import StallLimits
 
-_DB_SCHEMES = ("postgresql://", "postgres://", "sqlite:///")
+_DB_SCHEMES = ("postgresql://", "postgres://")
 _DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TENANT_INT_MIN = -2_147_483_648
@@ -174,10 +174,6 @@ class Settings:
     tenant_backfill: dict[str, int] = field(default_factory=dict)
 
     @property
-    def is_postgres(self) -> bool:
-        return self.database_url.startswith(("postgresql://", "postgres://"))
-
-    @property
     def stall_limits(self) -> StallLimits:
         return StallLimits(first_event=self.model_first_event_seconds, between_events=self.model_stall_seconds,
                            high_effort=self.model_high_effort_stall_seconds)
@@ -195,7 +191,7 @@ class Settings:
         backfill = _backfill(env)
         url = (env.get("KEEL_DATABASE_URL") or "").strip()
         if not url.startswith(_DB_SCHEMES):
-            raise ValueError("KEEL_DATABASE_URL must be postgresql://… or sqlite:///path")
+            raise ValueError("KEEL_DATABASE_URL must be postgresql://… or postgres://…")
         sandbox = (env.get("KEEL_SANDBOX") or "docker").strip()
         if sandbox not in ("docker", "none"):
             raise ValueError("KEEL_SANDBOX must be docker or none")

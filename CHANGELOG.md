@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `session_search`: memory-enabled profiles can search and read their earlier conversations (lexical, English and
+  Chinese), with a background index backfill (schema migration 9). Migration 9 adds the search index, so every
+  instance must run this version before messages are written again (no mixed-version rollout): an older binary
+  would leave the messages it writes unindexed; a downgrade is not supported.
+- `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
+- `evals/dab`: an evaluation-only harness for the pinned DataAgentBench slice (protocol `dab-score-v2`), with
+  `prepare`/`validate`/`execute`/`score`/`report` commands, a pinned evaluation image, budget enforcement, fresh
+  per-case PostgreSQL and MongoDB restores on an internal network with read-only roles, and unit tests. It runs
+  outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
+
+### Changed
+- A session's tool list is fixed with its prompt and changes only at a compaction; sessions started before this
+  release have no stored list: their tools follow the profile, without `session_search`, until they compact. Tools now declare whether they need a sandbox, and a call to a tool
+  the session was not offered is refused.
+- Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
+  user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
+  memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,
+  and a repeated tool call is applied once. Migration 8 drops the old `memories` table, so every instance must run
+  this version before memory is written again (no mixed-version rollout for memory); a downgrade is not supported.
+- **Breaking:** PostgreSQL is now the only supported database, including local development. `KEEL_DATABASE_URL`
+  must use `postgresql://` or `postgres://`; SQLite URLs are rejected. Existing PostgreSQL databases continue to
+  upgrade in place through numbered migrations.
+- Database integration tests require `KEEL_TEST_POSTGRES_DSN` and create and drop unique per-test databases with a
+  `CREATEDB` user, leaving the supplied base database untouched. `docker-compose.test.yml` provides PostgreSQL 17;
+  `.venv/bin/python -m pytest -q -m 'not integration'` runs the unit subset without a database. Docker sandbox and
+  live-model suites remain opt-in.
+
 ## [0.3.1] - 2026-10-31
 
 ### Fixed

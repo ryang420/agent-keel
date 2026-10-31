@@ -33,12 +33,14 @@ def test_memory_is_not_among_the_default_tools():
     assert "memory" not in {tool["name"] for tool in prompts.tool_definitions()}
     memory = prompts.tool_definitions(("memory",))
     assert [tool["name"] for tool in memory] == ["memory"]
-    assert set(memory[0]["parameters"]["properties"]) >= {"action", "target", "content", "old_text", "operations"}
+    assert set(memory[0]["parameters"]["properties"]) >= {
+        "action", "target", "content", "old_text", "operations", "entry_id", "expected_version"}
+    assert "list" in memory[0]["parameters"]["properties"]["action"]["enum"]
 
 
 def test_texts_mention_nothing_keel_lacks():
     files = list(PROMPTS.glob("*.md")) + list((PROMPTS / "tools").glob("*.json"))
-    assert len(files) == 22
+    assert len(files) == 24
     for path in files:
         content = path.read_text(encoding="utf-8")
         for pattern in FORBIDDEN:

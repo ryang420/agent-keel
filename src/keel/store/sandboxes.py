@@ -190,63 +190,58 @@ class SandboxStoreMixin:
     async def profile_guard(self, profile_id: str, *, skip_locked: bool = False) -> AsyncIterator[bool]:
         """Serialize admission/policy work on one profile; yields whether the profile row exists.
 
-        PostgreSQL locks the profile row (`SKIP LOCKED` when asked, so a busy profile is not waited on). SQLite's
-        BEGIN IMMEDIATE write transaction serializes writers. An already open transaction is joined, not nested.
+        PostgreSQL locks the profile row (`SKIP LOCKED` when asked, so a busy profile is not waited on).
+        An already open transaction is joined, not nested.
         """
         async with self.db.transaction():
-            if self.db.dialect == "postgres":
-                if skip_locked:
-                    locked = await self.db.fetchrow(
-                        "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
-                        profile_id)
-                    if not locked["locked"]:
-                        yield False
-                        return
-                else:
-                    await self.lock_profile(profile_id)
-            if self.db.dialect == "postgres":
-                lock = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
-                row = await self.db.fetchrow(f"SELECT id FROM profiles WHERE id = ?{lock}", profile_id)
+            if skip_locked:
+                locked = await self.db.fetchrow(
+                    "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
+                    profile_id)
+                if not locked["locked"]:
+                    yield False
+                    return
             else:
-                row = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?", profile_id)
+                await self.lock_profile(profile_id)
+            lock = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
+            row = await self.db.fetchrow(f"SELECT id FROM profiles WHERE id = ?{lock}", profile_id)
             yield row is not None
 
     def _lock_suffix(self) -> str:
-        """Postgres row locks explicitly; SQLite's BEGIN IMMEDIATE write transaction already serializes."""
-        return " FOR UPDATE" if self.db.dialect == "postgres" else ""
+        """Lock selected PostgreSQL rows for the current transaction."""
+        return " FOR UPDATE"
 
     @asynccontextmanager
     async def coordination_guard(self, profile_id: str, *, skip_locked: bool = False) -> AsyncIterator[bool]:
         """Serialize coordination work for a profile that may already have been deleted.
 
         Cleanup, release and recovery must finish after a terminal session/run/profile deletion, so unlike
-        `profile_guard` this never refuses work. PostgreSQL locks the profile row when it exists; the sandbox row
-        and SQLite's write transaction carry the serialization otherwise.
+        `profile_guard` this never refuses work. Advisory locks serialize work even without a profile row;
+        PostgreSQL row locks also protect existing profile and sandbox rows.
         """
         async with self.db.transaction():
-            if self.db.dialect == "postgres":
-                if skip_locked:
-                    locked = await self.db.fetchrow(
-                        "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
-                        profile_id)
-                    if not locked["locked"]:
-                        yield False
-                        return
-                else:
-                    await self.lock_profile(profile_id)
-                suffix = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
-                row = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?" + suffix, profile_id)
-                if row is None and skip_locked:
-                    exists = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?", profile_id)
-                    if exists is not None:
-                        yield False
-                        return
-                    guard = await self.db.fetchrow(
-                        "SELECT profile_id FROM sandboxes WHERE profile_id = ? FOR UPDATE SKIP LOCKED", profile_id)
-                    if guard is None and await self.db.fetchrow(
-                            "SELECT profile_id FROM sandboxes WHERE profile_id = ?", profile_id) is not None:
-                        yield False
-                        return
+            if skip_locked:
+                locked = await self.db.fetchrow(
+                    "SELECT pg_try_advisory_xact_lock(hashtext('keel.profile'), hashtext(?)) AS locked",
+                    profile_id)
+                if not locked["locked"]:
+                    yield False
+                    return
+            else:
+                await self.lock_profile(profile_id)
+            suffix = " FOR UPDATE SKIP LOCKED" if skip_locked else " FOR UPDATE"
+            row = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?" + suffix, profile_id)
+            if row is None and skip_locked:
+                exists = await self.db.fetchrow("SELECT id FROM profiles WHERE id = ?", profile_id)
+                if exists is not None:
+                    yield False
+                    return
+                guard = await self.db.fetchrow(
+                    "SELECT profile_id FROM sandboxes WHERE profile_id = ? FOR UPDATE SKIP LOCKED", profile_id)
+                if guard is None and await self.db.fetchrow(
+                        "SELECT profile_id FROM sandboxes WHERE profile_id = ?", profile_id) is not None:
+                    yield False
+                    return
             yield True
 
     async def _lock_sandbox(self, key: SandboxKey, lock: str) -> dict | None:
@@ -354,7 +349,7 @@ class SandboxStoreMixin:
             return None
 
     async def _queued_run_row(self, run_id: str, profile_id: str) -> dict | None:
-        lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
+        lock = " FOR UPDATE"
         return await self.db.fetchrow(
             f"SELECT * FROM runs WHERE id = ? AND profile_id = ? AND status = 'queued'{lock}",
             run_id, profile_id)

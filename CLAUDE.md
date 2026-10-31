@@ -1,7 +1,6 @@
 # agent-keel
 
-A server-side, multi-tenant agent runtime: an HTTP + SSE API, runs queued in Postgres (SQLite for local use and
-tests), an agent loop with eight tools in a per-profile Docker sandbox, skills, and pluggable model providers
+A server-side, multi-tenant agent runtime: an HTTP + SSE API, runs queued in PostgreSQL in every environment, an agent loop with eight tools in a per-profile Docker sandbox, skills, and pluggable model providers
 (Bedrock Mantle over the OpenAI Responses API, and for `anthropic.` ids the Anthropic Messages API;
 OpenAI-compatible over the Responses API). Public, MIT-licensed open-source project
 at https://github.com/ryang420/agent-keel.
@@ -18,26 +17,30 @@ milestones) and `docs/design/2026-10-12-m2-agent-loop.md` (the agent loop, tools
   `git config user.email` before the first commit of a session.
 - Test fixtures that look like credentials are built from pieces at runtime (`"hunter" + "2"`, `"AKIA" + "…"`), so
   secret scanners stay quiet. Never commit a real credential, and never print credentials or environment dumps.
-- Pushing, tagging and anything that publishes (GitHub releases, the GHCR image) needs the owner's go-ahead. The
-  owner pushes; this machine has no GitHub credentials (`! git push` from the prompt).
+- Pushing, opening or merging a PR, tagging and anything that publishes (GitHub releases, the GHCR image) needs
+  the owner's explicit go-ahead for that change. With it, use `git push` and `gh`; merge a PR only after its CI
+  passes, with a merge commit (`gh pr merge --merge`).
 
 ## Develop
 
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
 ```
 
-The default run needs no Docker, database or network. Opt-in suites:
+Integration tests require PostgreSQL and `KEEL_TEST_POSTGRES_DSN`; missing infrastructure fails them. Each test
+creates/drops a private database (role needs CREATEDB), leaving the base database untouched. For pure unit tests
+without PostgreSQL, run `.venv/bin/python -m pytest -q -m 'not integration'`. Opt-in suites:
 
 - `KEEL_TEST_DOCKER=1` — Docker sandbox tests (image `KEEL_TEST_DOCKER_IMAGE`, default `python:3.12-slim`). Leave no
   containers labelled `keel.managed=1` behind.
-- `KEEL_TEST_POSTGRES_DSN=postgresql://…` — store and event-bus tests on Postgres; drops and recreates keel's tables,
-  so use a scratch database (e.g. a throwaway `postgres:16` container).
+- `KEEL_TEST_SUBPROCESS=1` — server crash/restart fault injection against PostgreSQL.
 - `KEEL_LIVE_BEDROCK=1`, `KEEL_LIVE_OPENAI=1` — call a real model. Use only the model ids the tests name
   (`KEEL_LIVE_MODEL`, `KEEL_LIVE_CLAUDE_MODEL`, `KEEL_LIVE_OPENAI_MODEL`); never probe other Bedrock model ids or regions.
 
-CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an image build. A `v*` tag runs
+CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docker and an image build. A `v*` tag runs
 `release.yml`: tests, a multi-arch image to GHCR and a GitHub release from `CHANGELOG.md`.
 
 ## How work is done here
@@ -78,7 +81,13 @@ CI (`.github/workflows/ci.yml`) runs the default suite, Postgres, Docker and an 
   profile deletion, the coordinated sandbox lifecycle, and Claude models on the `bedrock` provider
   (`docs/design/2026-10-23-bedrock-anthropic-messages.md`). 0.3.1 is a patch on 0.3.0: a sandbox command no
   longer waits out the whole kill grace once its process group is empty.
-- No milestone is open in keel itself; M4 (history import and cutover) is consumer-specific.
+- Open work: cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`) and, on top of it,
+  procedural learning (`docs/design/2026-10-29-procedural-learning.md`), both approved 2026-10-29. Memory
+  entries, the change ledger, memory tool v2 and the memory API (migration 8), the history index,
+  `session_search` and per-session tool lists (migration 9) are merged (`[Unreleased]`); next are the durable
+  review queue, then memory acceptance, then the learning plans (learned skills, observations and feedback, dream,
+  learning acceptance).
+- M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown
   hands a running command's cleanup to the executor's cancel path.

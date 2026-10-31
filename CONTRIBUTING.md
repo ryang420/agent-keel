@@ -6,14 +6,19 @@ Thanks for helping. keel is small on purpose; focused changes with tests are the
 
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml up -d --wait
+KEEL_TEST_POSTGRES_DSN=postgresql://keel:keel_test@127.0.0.1:55437/keel_test .venv/bin/python -m pytest -q
+docker compose -f docker-compose.test.yml down -v
 ```
 
-The default run needs no Docker, database or network. Four suites are opt-in:
+Integration tests use PostgreSQL 17. The configured role needs `CREATEDB`: each test creates and drops a unique
+database, leaving the supplied base database untouched. Missing `KEEL_TEST_POSTGRES_DSN` fails selected integration
+tests. Run `.venv/bin/python -m pytest -q -m 'not integration'` for unit tests without PostgreSQL.
+
+Additional suites are opt-in:
 
 - `KEEL_TEST_DOCKER=1` runs the Docker sandbox tests (image from `KEEL_TEST_DOCKER_IMAGE`, default `python:3.12-slim`).
-- `KEEL_TEST_POSTGRES_DSN=postgresql://…` runs the store and event-bus tests on Postgres. It drops and recreates
-  keel's tables, so point it at a scratch database.
+- `KEEL_TEST_SUBPROCESS=1` runs server crash/restart fault injection against PostgreSQL.
 - `KEEL_LIVE_BEDROCK=1` and `KEEL_LIVE_OPENAI=1` call a real model with your credentials.
 
 See [Configuration](docs/guide/configuration.md) for the variables.

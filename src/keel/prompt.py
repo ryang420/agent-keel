@@ -14,13 +14,15 @@ DEFAULT_IDENTITY = "You are a helpful assistant."
 
 def build_system_prompt(*, soul: str, model: str, provider: str, now: datetime, tools: bool,
                         skills: Sequence[SkillInfo] = (), workdir: str | None = None, memory: bool = False,
-                        memory_snapshot: str = "") -> str:
+                        memory_snapshot: str = "", history: bool = False) -> str:
     identity = soul.strip() or DEFAULT_IDENTITY
     if not tools:
         return identity
     parts = [identity, prompts.text("guidance")]
     if memory:
         parts.append(prompts.text("memory"))
+    if history:
+        parts.append(prompts.text("history"))
     parts.append(prompts.text("platform"))
     if skills:
         parts += [prompts.text("skills_header"), render_index(skills), prompts.text("skills_footer")]

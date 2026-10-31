@@ -1,4 +1,4 @@
-"""Every query the service runs, written once for SQLite and Postgres (`?` placeholders)."""
+"""PostgreSQL store queries (`?` placeholders are numbered by the adapter)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import time
 import uuid
 from typing import Callable, Sequence
 
-from keel.memory import apply_entries
 from keel.models import (
     Message, Usage, part_from_dict, part_to_dict, reasoning_from_dict, reasoning_to_dict,
     tool_call_from_dict, tool_call_to_dict,
@@ -20,6 +19,8 @@ from keel.store.base import (
 )
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
+from keel.store.history import HistoryStoreMixin
+from keel.store.memory import MemoryStoreMixin
 from keel.store.migrations import migrate
 from keel.store.sandboxes import SandboxStoreMixin
 from keel.store.deletions import ProfileDeletionAuthority, ProfileDeletionStoreMixin
@@ -46,6 +47,7 @@ def _session(row: dict) -> Session:
         context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
         compaction_failed_at=row["compaction_failed_at"], turns_since_memory=row["turns_since_memory"],
         pruned_id=row["pruned_id"],
+        tools=tuple(json.loads(row["tools"])) if row.get("tools") is not None else None,
     )
 
 
@@ -75,7 +77,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
+class SqlStore(HistoryStoreMixin, MemoryStoreMixin, SandboxStoreMixin, ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
         self.db = db
@@ -197,35 +199,6 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
     # memory
 
-    async def apply_memory(self, profile_id: str, target: str, limit: int, ops: list[dict], *,
-                           profile_incarnation: str | None = None) -> dict:
-        """Read, modify and write one target in a single transaction (a row lock on Postgres)."""
-        if target not in ("memory", "user"):
-            return {"success": False, "error": "target must be memory or user.", "entries": []}
-        async with self.db.transaction():
-            await self.lock_profile(profile_id)
-            await self.assert_profile_admitted(profile_id)
-            await self._check_profile_incarnation(profile_id, profile_incarnation)
-            await self.db.execute(
-                "INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, '[]', ?) "
-                "ON CONFLICT (profile_id, target) DO NOTHING",
-                profile_id, target, self.clock())
-            lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
-            row = await self.db.fetchrow(
-                f"SELECT entries FROM memories WHERE profile_id = ? AND target = ?{lock}", profile_id, target)
-            current = json.loads(row["entries"])
-            updated, result = apply_entries(current, ops, limit)
-            if result["success"] and updated != current:
-                await self.db.execute(
-                    "UPDATE memories SET entries = ?, updated_at = ? WHERE profile_id = ? AND target = ?",
-                    _j(updated), self.clock(), profile_id, target)
-            return result
-
-    async def memory_entries(self, profile_id: str) -> dict[str, list[str]]:
-        rows = await self.db.fetch("SELECT target, entries FROM memories WHERE profile_id = ?", profile_id)
-        found = {row["target"]: json.loads(row["entries"]) for row in rows}
-        return {"memory": found.get("memory", []), "user": found.get("user", [])}
-
     async def reset_memory_turns(self, session_id: str, *, profile_incarnation: str | None = None) -> None:
         async with self.db.transaction():
             session = await self.db.fetchrow("SELECT profile_id FROM sessions WHERE id = ?", session_id)
@@ -307,6 +280,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
                     _j([tool_call_to_dict(c) for c in message.tool_calls]), message.tool_call_id,
                     message.tool_name, at)
                 ids.append(row["id"])
+                await self._index_message(profile_id, session_id, row["id"], message, at)
         return ImportResult("imported", profile is None, tuple(ids), title)
 
     async def _free_title(self, profile_id: str, title: str | None) -> str | None:
@@ -330,11 +304,13 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             profile_id, limit)
         return [_session(row) for row in rows]
 
-    async def set_session_prompt(self, session_id: str, system_prompt: str, provider: str, model: str) -> Session:
-        """Store a session's system prompt once; the first writer wins and later calls read it back."""
+    async def set_session_prompt(self, session_id: str, system_prompt: str, provider: str, model: str,
+                                 tools: Sequence[str] | None = None) -> Session:
+        """Store a session's system prompt, and the tools it was built with, once; the first writer wins."""
         await self.db.execute(
-            "UPDATE sessions SET system_prompt = ?, provider = ?, model = ? WHERE id = ? AND system_prompt IS NULL",
-            system_prompt, provider, model, session_id)
+            "UPDATE sessions SET system_prompt = ?, provider = ?, model = ?, tools = ? "
+            "WHERE id = ? AND system_prompt IS NULL",
+            system_prompt, provider, model, None if tools is None else _j(list(tools)), session_id)
         row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
         if row is None:
             raise SessionNotFound(session_id)
@@ -357,13 +333,14 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             pruned_id, failed_at, session_id)
 
     async def compact_session(self, session_id: str, *, summary: str, head_id: int, tail_id: int,
-                              system_prompt: str) -> None:
-        """Record a compaction. Unlike set_session_prompt, this overwrites the system prompt."""
+                              system_prompt: str, tools: Sequence[str] | None = None) -> None:
+        """Record a compaction. Unlike set_session_prompt, this overwrites the system prompt and, when given, the
+        session's tool list."""
         await self.db.execute(
             "UPDATE sessions SET summary = ?, summary_head_id = ?, summary_tail_id = ?, pruned_id = ?, "
-            "system_prompt = ?, context_tokens = NULL, context_message_id = NULL, compaction_failed_at = NULL "
-            "WHERE id = ?",
-            summary, head_id, tail_id, tail_id, system_prompt, session_id)
+            "system_prompt = ?, tools = COALESCE(?, tools), context_tokens = NULL, context_message_id = NULL, "
+            "compaction_failed_at = NULL WHERE id = ?",
+            summary, head_id, tail_id, tail_id, system_prompt, None if tools is None else _j(list(tools)), session_id)
 
     async def set_title(self, profile_id: str, session_id: str, title: str, source: str, *,
                         profile_incarnation: str | None = None) -> Session:
@@ -389,6 +366,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
     async def delete_session(self, profile_id: str, session_id: str) -> bool:
         async with self.db.transaction():
+            await self.lock_profile(profile_id)
             row = await self.db.fetchrow("SELECT id FROM sessions WHERE id = ? AND profile_id = ?",
                                          session_id, profile_id)
             if row is None:
@@ -400,8 +378,19 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             await self.db.execute(
                 "DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?)", session_id)
             await self.db.execute("DELETE FROM runs WHERE session_id = ?", session_id)
+            await self.db.execute(
+                "DELETE FROM message_tokens WHERE message_id IN "
+                "(SELECT message_id FROM message_search WHERE profile_id = ? AND session_id = ?)",
+                profile_id, session_id)
+            await self.db.execute("DELETE FROM message_search WHERE profile_id = ? AND session_id = ?",
+                                  profile_id, session_id)
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", session_id)
             await self.db.execute("DELETE FROM blobs WHERE session_id = ?", session_id)
+            await self.db.execute(
+                "UPDATE memory_changes SET run_id = NULL, session_id = NULL, message_id = NULL, tool_call_id = NULL "
+                "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            await self.db.execute(
+                "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute("DELETE FROM sessions WHERE id = ?", session_id)
         return True
 
@@ -419,6 +408,10 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             await self.db.execute(
                 "UPDATE sessions SET message_count = message_count + 1, last_active_at = ? WHERE id = ?",
                 now, session_id)
+            if message.role in ("user", "assistant"):
+                owner = await self.db.fetchrow("SELECT profile_id FROM sessions WHERE id = ?", session_id)
+                if owner is not None:
+                    await self._index_message(owner["profile_id"], session_id, row["id"], message, now)
         return StoredMessage(row["id"], session_id, run_id, message, now)
 
     async def messages(self, session_id: str) -> list[StoredMessage]:
@@ -533,7 +526,7 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
         It reserves no sandbox usage, so a sandbox-enabled executor refuses to run what it returns.
         """
-        lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
+        lock = " FOR UPDATE SKIP LOCKED"
         row = await self.db.fetchrow(
             "UPDATE runs SET status = 'running', lease_owner = ?, lease_expires_at = ?, started_at = ? "
             "WHERE id = (SELECT id FROM runs WHERE status = 'queued' AND NOT EXISTS ("
@@ -551,8 +544,8 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         return row["status"] if row else None
 
     async def _locked_run(self, run_id: str, profile_id: str | None = None) -> dict | None:
-        """Read a run under the transaction's row lock (Postgres) or its BEGIN IMMEDIATE write lock (SQLite)."""
-        lock = " FOR UPDATE" if self.db.dialect == "postgres" else ""
+        """Read a run under the transaction's row lock."""
+        lock = " FOR UPDATE"
         if profile_id is None:
             return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ?{lock}", run_id)
         return await self.db.fetchrow(f"SELECT * FROM runs WHERE id = ? AND profile_id = ?{lock}",
@@ -640,14 +633,14 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
         """Fail one bounded batch of runs whose lease expired, their terminal events committing with them.
 
         Postgres locks the selected rows with SKIP LOCKED, so a sweep, a renewal and a finish serialise on the run
-        row. SQLite serialises writers with BEGIN IMMEDIATE. A failure rolls the whole batch back; the next pass
+        row. A failure rolls the whole batch back; the next pass
         selects the same runs again. Deadlines are compared with database coordination time, the basis claims and
         renewals use; the finish time stays transcript time.
         """
         now = self.clock()
         async with self.db.transaction():
             deadline = await self.coordination_now()
-            lock = " FOR UPDATE SKIP LOCKED" if self.db.dialect == "postgres" else ""
+            lock = " FOR UPDATE SKIP LOCKED"
             rows = await self.db.fetch(
                 "SELECT * FROM runs WHERE status IN ('running', 'stopping') AND lease_expires_at < ? "
                 f"ORDER BY id LIMIT ?{lock}", deadline, batch)

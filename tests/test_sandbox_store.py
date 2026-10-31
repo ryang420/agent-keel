@@ -1,7 +1,6 @@
 """Guarded sandbox admission, usage leases and lifecycle intent (store task 2)."""
 
 import asyncio
-import os
 from dataclasses import replace
 
 import pytest
@@ -571,16 +570,14 @@ async def test_claim_skips_a_sandbox_recorded_on_another_daemon(store, clock):
     assert drifted_uses["n"] == 0
 
 
-async def test_postgres_skip_locked_claim_moves_to_a_later_profile(store, clock):
-    if store.db.dialect != "postgres":
-        pytest.skip("a row-lock barrier needs PostgreSQL")
+async def test_postgres_skip_locked_claim_moves_to_a_later_profile(store, clock, pg_dsn):
     await seed_profile(store, "p1")
     blocked_run = await queue_run(store, "s1", profile_id="p1")
     clock.now += 1
     await seed_profile(store, "p2")
     healthy_run = await queue_run(store, "s2", profile_id="p2")
 
-    barrier = await open_store(os.environ["KEEL_TEST_POSTGRES_DSN"], clock=clock)
+    barrier = await open_store(pg_dsn, clock=clock)
     try:
         async with barrier.db.transaction():
             locked = await barrier.db.fetchrow(
