@@ -6,7 +6,8 @@ compaction summary prefix and checkpoint prompt (agent/context_compressor.py), t
 (agent/title_generator.py) and the eight tool schemas as model_tools sends them. Edits remove what keel does not have:
 background processes, a persistent kernel, skill authoring, document extraction, other tools, and the compressor's
 skill, session-log and memory-provider sections. The memory, memory-review, history and learning guidance and the
-memory, session_search and skill_manage tool schemas are keel's, and none of those tools is one of the eight in
+memory, session_search and skill_manage tool schemas, the dream instructions and the dream's proposal tool schemas
+are keel's, and none of those tools is one of the eight in
 TOOL_ORDER. See THIRD_PARTY_NOTICES.md.
 """
 

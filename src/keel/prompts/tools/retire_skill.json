@@ -1,0 +1,13 @@
+{
+  "name": "retire_skill",
+  "description": "Stage the retirement of a learned skill that observations contradict or show to be obsolete.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "skill_id": {"type": "string", "description": "The skill to retire."},
+      "observations": {"type": "array", "items": {"type": "string"}, "description": "Observations that contradict it or show it obsolete."},
+      "rationale": {"type": "string", "description": "Why, in a sentence."}
+    },
+    "required": ["skill_id", "observations", "rationale"]
+  }
+}
