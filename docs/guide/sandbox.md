@@ -193,6 +193,9 @@ Docker Desktop's socket is root-only.
   period, then kills; cleanup is reported as complete only when its terminal receipt proves the leader is gone and
   no descendants remain. No numeric PID, PID file or process-group lookup from the host is used. An unconfirmed
   cleanup keeps the generation blocked for recovery instead of retrying the cancellation.
+- When a command ends on its own, the supervisor also sends `TERM` to its process group, so background work does not
+  outlive it. It then waits the grace period only while a member of that group is still alive; a command that leaves
+  nothing behind returns at once instead of after the grace period.
 
 ## Skills
 

@@ -756,11 +756,9 @@ def test_subreaper_is_enabled_and_verified_before_the_payload_fork(launch_factor
 
 @LINUX_ONLY
 def test_success_follows_leader_reap_and_an_actual_echild(launch_factory):
-    started = time.monotonic()
     launch = launch_factory(["/bin/sh", "-c", "exit 0"], grace=0.2, reap=1.0)
     launch.wait_for("fork")
     code, _, stderr = launch.wait()
-    elapsed = time.monotonic() - started
     assert code == 0, stderr
 
     events = launch.events()
@@ -773,7 +771,78 @@ def test_success_follows_leader_reap_and_an_actual_echild(launch_factory):
     assert_success_receipt(launch.receipt(), 0)
     assert_no_signal_after_reap(events)
     assert all(event["leader_pinned"] for event in signal_events(events))
-    assert elapsed >= 0.15, "the configured TERM grace must be part of normal cleanup latency"
+
+
+@LINUX_ONLY
+def test_natural_exit_with_an_empty_group_skips_the_grace(launch_factory):
+    grace = 3.0
+    started = time.monotonic()
+    launch = launch_factory(["/bin/true"], grace=grace, reap=1.0)
+    launch.wait_for("fork")
+    code, _, stderr = launch.wait()
+    elapsed = time.monotonic() - started
+    assert code == 0, stderr
+    assert elapsed < 1.0, elapsed
+
+    events = launch.events()
+    kinds = [event["kind"] for event in events]
+    # The final KILL still goes to the pinned group, and completion is still proven by ECHILD.
+    assert kinds.index("term") < kinds.index("group_drained") < kinds.index("kill")
+    assert kinds.index("kill") < kinds.index("control_closed") < kinds.index("leader_reaped")
+    assert kinds.index("leader_reaped") < kinds.index("echild") < kinds.index("receipt_written")
+    assert_success_receipt(launch.receipt(), 0)
+    assert all(event["leader_pinned"] for event in signal_events(events))
+    assert_no_signal_after_reap(events)
+
+
+@LINUX_ONLY
+def test_a_group_member_that_exits_on_term_ends_the_grace_once_it_is_gone(launch_factory):
+    # The leader leaves a background member in its group that takes a moment to exit on TERM.
+    payload = python_payload(
+        "import os, signal, time\n"
+        "if os.fork() == 0:\n"
+        "    signal.signal(signal.SIGTERM, lambda *_: (time.sleep(0.3), os._exit(0)))\n"
+        "    os.write(1, b'ready\\n')\n"
+        "    time.sleep(30)\n"
+        "    os._exit(1)\n")
+    started = time.monotonic()
+    launch = launch_factory(payload, grace=3.0, reap=2.0)
+    launch.wait_for("fork")
+    assert launch.wait_line() == "ready"
+    code, _, stderr = launch.wait()
+    elapsed = time.monotonic() - started
+    assert code == 0, stderr
+    assert 0.25 <= elapsed < 1.5, elapsed
+
+    kinds = launch.kinds()
+    assert kinds.index("term") < kinds.index("group_drained") < kinds.index("kill")
+    assert "deadline" not in kinds
+    assert_success_receipt(launch.receipt(), 0)
+
+
+@LINUX_ONLY
+def test_a_group_member_ignoring_term_still_gets_the_whole_grace(launch_factory):
+    payload = python_payload(
+        "import os, signal, time\n"
+        "if os.fork() == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    os.write(1, b'ready\\n')\n"
+        "    time.sleep(30)\n"
+        "    os._exit(1)\n")
+    grace = 0.8
+    started = time.monotonic()
+    launch = launch_factory(payload, grace=grace, reap=2.0)
+    launch.wait_for("fork")
+    assert launch.wait_line() == "ready"
+    code, _, stderr = launch.wait()
+    elapsed = time.monotonic() - started
+    assert code == 0, stderr
+    assert grace - 0.05 <= elapsed < grace + 1.0, elapsed
+
+    kinds = launch.kinds()
+    assert "group_drained" not in kinds
+    assert kinds.index("term") < kinds.index("kill") < kinds.index("echild")
+    assert_success_receipt(launch.receipt(), 0)
 
 
 @LINUX_ONLY
