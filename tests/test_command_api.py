@@ -82,6 +82,7 @@ async def test_a_command_run_on_a_profile_without_models_completes(boxed):
     (lambda work: {"kind": "shell"}, "kind must be"),
     (lambda work: {"command": None}, "command must be an object"),
     (lambda work: {"command": {"argv": [], "cwd": str(work), "timeout_s": 5}}, "command.argv"),
+    (lambda work: {"command": {"argv": ["-l", "true"], "cwd": str(work), "timeout_s": 5}}, "must not start with '-'"),
     (lambda work: {"command": {"argv": ["true"], "cwd": "/etc", "timeout_s": 5}}, "under the sandbox workdir"),
     (lambda work: {"command": {"argv": ["true"], "cwd": str(work), "timeout_s": 601}}, "from 1 to 600"),
     (lambda work: {"command": {"argv": ["true"], "cwd": str(work), "timeout_s": 5, "env": {"A": "x\ny"}}},
@@ -132,3 +133,25 @@ async def test_one_run_per_session_and_stop_apply_to_command_runs(boxed):
     assert backend.exec_calls
     assert (await client.post(f"/v1/profiles/p1/runs/{first['run_id']}/stop")).status_code == 200
     assert (await settle(client, first["run_id"], seconds=15))["status"] == "cancelled"
+
+
+async def test_another_tenants_key_cannot_start_a_command_run(store, tmp_path, monkeypatch):
+    coordinator, _ = await local_coordinator(store, tmp_path / "bin", monkeypatch)
+    registry = ProviderRegistry()
+    bus = InMemoryEventBus()
+    executor = RunExecutor(store, bus, registry, coordinator=coordinator)
+    keel = Keel(store=store, bus=bus, providers=registry, executor=executor,
+                credentials=(ServiceCredential(1, "key-a"), ServiceCredential(2, "key-b")), max_running=4,
+                coordinator=coordinator, command_timeout_max_s=600)
+    transport = httpx.ASGITransport(app=create_app(keel))
+    work = tmp_path / "work"
+    work.mkdir()
+    async with httpx.AsyncClient(transport=transport, base_url="http://keel",
+                                 headers={"Authorization": "Bearer key-a"}) as owner, \
+            httpx.AsyncClient(transport=transport, base_url="http://keel",
+                              headers={"Authorization": "Bearer key-b"}) as other:
+        profile = {"models": [], "sandbox": {"image": "local", "workdir": str(work)}}
+        assert (await owner.put("/v1/profiles/p1", json=profile)).status_code == 200
+        response = await other.post("/v1/profiles/p1/runs", json=command_run(work, "true"))
+        assert response.status_code == 404 and response.json()["error"]["code"] == "profile_not_found"
+        assert await store.list_runs("p1", ALL) == []

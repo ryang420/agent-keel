@@ -529,7 +529,8 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
 
     async def completed_run_count(self, session_id: str, *, except_id: str) -> int:
         row = await self.db.fetchrow(
-            "SELECT COUNT(*) AS n FROM runs WHERE session_id = ? AND status = 'completed' AND id <> ?",
+            "SELECT COUNT(*) AS n FROM runs WHERE session_id = ? AND status = 'completed' AND kind = 'model' "
+            "AND id <> ?",
             session_id, except_id)
         return int(row["n"])
 

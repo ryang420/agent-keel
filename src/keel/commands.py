@@ -16,7 +16,7 @@ _KEYS = frozenset({"argv", "cwd", "timeout_s", "env"})
 # The exec starts in "/", which always exists, and this fixed prologue enters the command's directory: a docker exec
 # into a missing directory fails before the sandbox supervisor starts and leaves the exec without a cleanup receipt.
 # The directory and the argv are positional parameters, so no shell ever parses them.
-_ENTER = (f'cd "$1" 2>/dev/null || {{ echo "keel: cannot enter $1" >&2; exit {MISSING_CWD_EXIT_CODE}; }}; '
+_ENTER = (f'cd "$1" 2>/dev/null || {{ printf \'keel: cannot enter %s\\n\' "$1" >&2; exit {MISSING_CWD_EXIT_CODE}; }}; '
           'shift; exec "$@"')
 
 
@@ -52,6 +52,8 @@ def parse_command(raw: object, *, workdir: str | None, max_timeout_s: int) -> di
             or not argv[0]):
         raise CommandError(f"command.argv must be a list of 1 to {MAX_ARGV_ITEMS} strings without NUL, the first "
                            "one not empty.")
+    if argv[0].startswith("-"):
+        raise CommandError("command.argv[0] must not start with '-'.")
     if sum(len(a.encode("utf-8")) for a in argv) > MAX_ARGV_BYTES:
         raise CommandError(f"command.argv must be at most {MAX_ARGV_BYTES} bytes in total.")
     cwd = raw.get("cwd")

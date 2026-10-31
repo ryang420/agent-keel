@@ -14,7 +14,8 @@ All notable changes to this project are documented here. The format follows
   command's output and its usage is zero. Exit 0 completes the run; a non-zero exit, a timeout, an unconfirmed
   cleanup or a missing sandbox fails it as `command_failed`, `command_timed_out`, `sandbox_uncertain` or
   `sandbox_unavailable`. New events `command.started` and `command.completed`; runs report `kind`, and command runs
-  their `command`. `KEEL_COMMAND_TIMEOUT_MAX_S` (default 3600) caps `timeout_s`.
+  their `command`. `KEEL_COMMAND_TIMEOUT_MAX_S` (default 3600) caps `timeout_s`. `argv[0]` may not start with `-`, and a command
+  run in a session does not count as a completed run when a later model run's title is decided.
 
 ### Changed
 

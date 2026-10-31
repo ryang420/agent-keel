@@ -56,6 +56,10 @@ time in proportion to its size. A database at schema version 8 is refused by 0.3
 backup. Upgrade every instance before starting the first command run: a 0.3.1 instance still running against the
 upgraded database would claim a command run as a model run and fail it.
 
+A command run holds a worker (`KEEL_WORKERS`) and a `KEEL_MAX_RUNNING` slot for up to its `timeout_s`, so long commands
+can delay other runs. A deploy or restart fails in-flight command runs as `worker_lost` after the drain. A consumer must
+treat that as "outcome unknown": the command may have partly run, and keel never runs it again.
+
 ## Upgrading to atomic run termination
 
 This release commits a run's terminal state and its terminal event in one transaction. It needs no schema migration,

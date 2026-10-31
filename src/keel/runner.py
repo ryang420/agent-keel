@@ -463,6 +463,11 @@ class RunExecutor:
         except SandboxError as exc:
             await record(None)
             raise _sandbox_failure(exc) from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await record(None)
+            raise
         await record(None)
         tail = output_tail(result.output)
         await self.emit(run.id, "command.completed", {"exit_code": result.exit_code, "timed_out": result.timed_out,

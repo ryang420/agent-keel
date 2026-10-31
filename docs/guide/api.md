@@ -115,12 +115,14 @@ model:
   `instructions`, `reasoning_effort` or `file_context`; sending any of them is 400 `invalid_input`, as is a
   `command` on a model run.
 - The profile needs a sandbox. Its `models` may be empty.
-- `argv`: 1 to 64 strings, at most 16,384 bytes (UTF-8) in total, the first not empty, without NUL. They are passed
-  as given, never through a shell.
+- `argv`: 1 to 64 strings, at most 16,384 bytes (UTF-8) in total, the first not empty and not starting with `-`,
+  without NUL. They are passed as given, never through a shell.
 - `cwd`: an absolute path at or under the sandbox `workdir`. The command starts there; if the directory does not
-  exist, the command exits with code 125.
+  exist or cannot be entered, the command exits with code 125 and its output is
+  `keel: cannot enter <cwd>`.
 - `timeout_s`: a number from 1 to `KEEL_COMMAND_TIMEOUT_MAX_S` (default 3600).
-- `env`: optional, with the rules of `sandbox.env`. It is set over the policy's `env` for this command only.
+- `env`: optional, with the rules of `sandbox.env`. It is set over the policy's `env` for this command only. It is stored with the run and returned by GET and list for as long as the run exists: do
+  not put secrets in it; use the profile's `sandbox.env` for those.
 - One run per session, `KEEL_MAX_RUNNING`, tenant checks and stop work as for a model run. A command run adds no
   messages to its session and does not title it.
 
@@ -163,7 +165,7 @@ below. Events are stored: pass `after=<last seq>` to resume without losing or re
 | `tool.started` | `tool_call_id`, `tool`, `preview` |
 | `tool.completed` | `tool_call_id`, `tool`, `duration_s`, `error` (boolean), `preview` |
 | `command.started` | `argv`, `cwd` (command runs) |
-| `command.completed` | `exit_code`, `timed_out`, `duration_s`, `output` (the last 50,000 characters). Not sent when the run is stopped or its cleanup could not be confirmed. |
+| `command.completed` | `exit_code`, `timed_out`, `duration_s`, `output` (the last 50,000 characters). Sent only when the command's outcome is known: not when the run is stopped or ends by lease loss, `worker_lost`, `internal_error`, `sandbox_uncertain` or `sandbox_unavailable`. |
 | `context.compacted` | `messages_before`, `messages_after`, `tokens_before`, `tokens_after` (estimates), `usage` (the summary call's; it is also counted in the run's `usage`) |
 | `run.completed` | `output`, `usage`, and `incomplete: true` when the model reported an incomplete response |
 | `run.failed` | `error_code`, `message` |

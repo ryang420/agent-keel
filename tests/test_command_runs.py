@@ -20,6 +20,9 @@ SANDBOX = {"image": "img", "workdir": "/w"}
 COMMAND = {"argv": ["python3", "job.py"], "cwd": "/w/job", "timeout_s": 60, "env": {"KEY": "value"}}
 
 
+ZERO = Usage(0, 0, 0, 0)
+
+
 async def test_a_command_run_is_stored_without_a_model(store):
     await store.upsert_profile("p1", models=[], sandbox=SANDBOX, soul="", skills=[])
     await store.ensure_session("p1", "s1")
@@ -172,6 +175,22 @@ async def test_an_unverified_cleanup_fails_the_run_as_sandbox_uncertain(boxed):
     assert (done.status, done.error_code) == ("failed", "sandbox_uncertain")
     assert [kind for kind, _ in await events(store, run.id)] == ["run.started", "command.started", "run.failed"]
     assert (await store.db.fetch("SELECT state FROM sandbox_execs")) == [{"state": "uncertain"}]
+    assert done.current_exec_id is None and done.usage == ZERO
+
+
+async def test_an_unexpected_error_fails_the_run_as_an_internal_error(boxed, monkeypatch):
+    store, executor, backend, work = boxed
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(store, "begin_exec", broken)
+    run = await queue_command(store, ["true"], cwd=work)
+    done = await run_to_end(executor, store, run)
+    assert (done.status, done.error_code) == ("failed", "internal_error")
+    assert done.current_exec_id is None and done.usage == ZERO
+    kinds = [kind for kind, _ in await events(store, run.id)]
+    assert kinds == ["run.started", "command.started", "run.failed"]
 
 
 async def test_a_command_run_without_a_sandbox_backend_fails_cleanly(store):
@@ -209,3 +228,14 @@ async def test_a_stop_during_a_command_cancels_it_through_the_supervisor(store, 
                                                                     "run.cancelled"]
     finally:
         await pool.close(drain_seconds=0.1)
+
+
+async def test_completed_run_count_ignores_command_runs(store):
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox=SANDBOX, soul="", skills=[])
+    await store.ensure_session("p1", "s1")
+    command = await store.create_command_run(profile_id="p1", session_id="s1", command=COMMAND)
+    await store.finish_run(command.id, "completed", output="done")
+    model = await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m",
+                                   reasoning_effort=None, input_parts=[{"type": "text", "text": "hi"}],
+                                   instructions=None)
+    assert await store.completed_run_count("s1", except_id=model.id) == 0

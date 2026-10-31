@@ -45,6 +45,7 @@ def test_the_timeout_cap_is_the_callers():
     ({**GOOD, "argv": "python3 job.py"}, "command.argv"),
     ({**GOOD, "argv": ["python3", 3]}, "command.argv"),
     ({**GOOD, "argv": ["", "x"]}, "command.argv"),
+    ({**GOOD, "argv": ["-l", "x"]}, r"command.argv\[0\] must not start with '-'"),
     ({**GOOD, "argv": ["a\0b"]}, "command.argv"),
     ({**GOOD, "argv": ["\ud800"]}, "command.argv"),
     ({**GOOD, "argv": ["x"] * (MAX_ARGV_ITEMS + 1)}, "command.argv"),
@@ -90,6 +91,21 @@ def test_a_missing_directory_is_an_ordinary_exit_that_says_so(tmp_path):
     done = run_wrapped(["true"], tmp_path / "missing")
     assert done.returncode == MISSING_CWD_EXIT_CODE == 125
     assert "keel: cannot enter" in done.stderr
+
+
+AWKWARD = "a b'c\"d$HOME\\n"
+
+
+def test_an_awkward_directory_name_is_entered_and_named_verbatim(tmp_path):
+    here = tmp_path / AWKWARD
+    here.mkdir()
+    done = run_wrapped(["pwd"], here)
+    assert done.returncode == 0, done.stderr
+    assert Path(done.stdout.strip()).resolve() == here.resolve()
+    missing = tmp_path / ("no " + AWKWARD)
+    gone = run_wrapped(["true"], missing)
+    assert gone.returncode == 125
+    assert f"keel: cannot enter {missing}" in gone.stderr
 
 
 def test_the_exit_code_is_the_commands_own(tmp_path):
