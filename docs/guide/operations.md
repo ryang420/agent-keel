@@ -238,6 +238,9 @@ Gates. When the dream stages a change, it is refused unless:
   of a merge. Every cited observation belongs to this dream's input.
 - A new skill whose name or description overlaps a live learned skill (token overlap of 0.6) is not created, and
   neither is one that duplicates a deployment skill.
+- The text is validated like a consumer's (size limits, no secrets, no instruction-like text), and a name that a
+  deployment skill, a live learned skill or another staged change already has is refused for create, revise and
+  merge. A create is also refused when the profile already holds 50 live skills.
 - Consumer precedence: a change to a skill whose last consumer edit, rollback, suspension or resumption is newer than
   every cited observation is refused.
 - One change per skill per dream. A revise or merge makes a suspended skill active again; a merge retires its sources
