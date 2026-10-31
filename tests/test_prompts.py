@@ -41,7 +41,7 @@ def test_memory_is_not_among_the_default_tools():
 
 def test_texts_mention_nothing_keel_lacks():
     files = list(PROMPTS.glob("*.md")) + list((PROMPTS / "tools").glob("*.json"))
-    assert len(files) == 26
+    assert len(files) == 28
     for path in files:
         content = path.read_text(encoding="utf-8")
         for pattern in FORBIDDEN:
