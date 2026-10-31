@@ -7,21 +7,24 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 
 from keel.api import ApiError, _json_body
-from keel.store.base import ProfileIncarnationMismatch, SkillSource
+from keel.observations import STATS_SECONDS
+from keel.store.base import ProfileIncarnationMismatch, SkillOutcome, SkillSource
 
 STATES = ("active", "suspended", "retired")
-_STATS_DAYS = 30
+_NO_OUTCOME = SkillOutcome(0, 0, 0, 0, 0, 0)
 _ERRORS = {"not_found": (404, "learned_skill_not_found"), "version_conflict": (409, "version_conflict"),
            "name_taken": (409, "name_taken"), "limit": (409, "skill_limit"), "retired": (409, "skill_retired"),
            "invalid": (400, "invalid_input")}
 _FIELDS = ("name", "description", "body", "category")
 
 
-def skill_json(skill, loads: int, *, body: bool = False) -> dict:
+def skill_json(skill, outcome: SkillOutcome, *, body: bool = False) -> dict:
     found = {"id": skill.id, "name": skill.name, "description": skill.description, "category": skill.category,
              "state": skill.state, "version": skill.version, "origin": skill.origin,
              "created_at": skill.created_at, "updated_at": skill.updated_at,
-             "consumer_changed_at": skill.consumer_changed_at, "stats": {"loads_30d": loads}}
+             "consumer_changed_at": skill.consumer_changed_at, "stats": {"loads_30d": outcome.loads, "up_30d": outcome.up, "down_30d": outcome.down,
+                       "completed_30d": outcome.completed, "failed_30d": outcome.failed,
+                       "cancelled_30d": outcome.cancelled}}
     if body:
         found["body"] = skill.body
     return found
@@ -46,9 +49,9 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
     """Mount the learned-skill routes. `k` returns the Keel of a request; `profile_or_404` loads the caller's
     profile (a foreign or missing profile is the same 404)."""
 
-    async def loads(request: Request, profile_id: str) -> dict:
+    async def outcomes(request: Request, profile_id: str) -> dict:
         store = k(request).store
-        return await store.skill_load_counts(profile_id, since=store.clock() - _STATS_DAYS * 86_400)
+        return await store.skill_outcomes(profile_id, since=store.clock() - STATS_SECONDS)
 
     async def apply(request: Request, profile, op: dict):
         store = k(request).store
@@ -61,8 +64,8 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
             status, code = _ERRORS.get(result["code"], (400, "invalid_input"))
             raise ApiError(status, code, result["error"])
         skill = await store.learned_skill(profile.id, result["skill"]["id"])
-        counts = await loads(request, profile.id)
-        return skill_json(skill, counts.get((skill.id, skill.version), 0), body=True)
+        counts = await outcomes(request, profile.id)
+        return skill_json(skill, counts.get((skill.id, skill.version), _NO_OUTCOME), body=True)
 
     async def change(request: Request, profile_id: str, skill_id: str, action: str, extra: tuple[str, ...] = ()):
         profile = await profile_or_404(request, profile_id)
@@ -78,8 +81,8 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
         if state is not None and state not in STATES:
             raise ApiError(400, "invalid_input", f"state must be one of {', '.join(STATES)}.")
         skills = await k(request).store.learned_skills(profile_id, states=None if state is None else (state,))
-        counts = await loads(request, profile_id)
-        return {"skills": [skill_json(skill, counts.get((skill.id, skill.version), 0)) for skill in skills]}
+        counts = await outcomes(request, profile_id)
+        return {"skills": [skill_json(skill, counts.get((skill.id, skill.version), _NO_OUTCOME)) for skill in skills]}
 
     @app.post("/v1/profiles/{profile_id}/skills/learned", status_code=201)
     async def create_learned(request: Request, profile_id: str):
@@ -96,9 +99,9 @@ def add_learned_routes(app: FastAPI, k, profile_or_404) -> None:
         skill = await store.learned_skill(profile_id, skill_id)
         if skill is None:
             raise ApiError(404, "learned_skill_not_found", "No such learned skill.")
-        counts = await loads(request, profile_id)
+        counts = await outcomes(request, profile_id)
         versions = await store.learned_skill_versions(profile_id, skill_id)
-        return {**skill_json(skill, counts.get((skill.id, skill.version), 0), body=True),
+        return {**skill_json(skill, counts.get((skill.id, skill.version), _NO_OUTCOME), body=True),
                 "versions": [version_json(version) for version in versions]}
 
     @app.patch("/v1/profiles/{profile_id}/skills/learned/{skill_id}")

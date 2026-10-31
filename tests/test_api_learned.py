@@ -48,7 +48,8 @@ async def test_create_get_and_list(client):
     assert made.status_code == 201
     body = made.json()
     assert (body["version"], body["origin"], body["state"], body["body"]) == (1, "consumer", "active", "1. Load.")
-    assert body["stats"] == {"loads_30d": 0}
+    assert body["stats"] == {"loads_30d": 0, "up_30d": 0, "down_30d": 0, "completed_30d": 0, "failed_30d": 0,
+                             "cancelled_30d": 0}
     one = (await http.get(f"{BASE}/{body['id']}")).json()
     [version] = one["versions"]
     assert version["change"] == "create" and version["source"]["kind"] == "consumer"
