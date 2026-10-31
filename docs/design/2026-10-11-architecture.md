@@ -43,7 +43,7 @@ previous runtime's recorded baseline.
 ### In the first version
 
 Runs with streaming events and stop; sessions with titles; the agent loop with nine tools; a
-per-profile sandbox; skills (read-only, shipped with the deployment); per-profile long-term
+per-profile sandbox; skills (read-only, shipped with the deployment, plus profile-private learned skills, learning §8); per-profile long-term
 memory with background review; context compression; images in input; a provider-neutral model
 interface with Bedrock Mantle (OpenAI Responses API) as its first implementation; import of
 Hermes history.
@@ -55,7 +55,7 @@ Hermes history.
 | Scheduled jobs (cron) | No consumer need yet. If added later: results go to a session the user sees, per-job token budget and minimum interval, the user's chosen model (a minimal version is small). |
 | Approvals | Deployments run unattended; no approval prompt is ever shown. |
 | Web search / browsing | No consumer need yet; the tools can be added later behind the same tool interface. |
-| MCP servers, agent-authored skills | No consumer need yet; skills are shipped with the deployment and read-only. |
+| MCP servers | No consumer need yet. Deployment skills are shipped with it and read-only; profile-private learned skills (a store, not files) exist alongside them (learning §8). |
 | OpenAI and Anthropic providers | Not needed by the first consumer; the provider interface (§5) is designed for them so they plug in without changes elsewhere. |
 
 The first version keeps the tools most server-side agent work needs: a shell, files and skills.
@@ -146,7 +146,8 @@ behind `EventBus`.
   client can reconstruct a run's tool calls from the stored messages.
 - Titles are unique per profile (`unique (profile_id, title)` on non-null titles).
 - Skills are not in the store: the deployment ships them read-only in the image (or a mounted
-  directory), and a profile's config names which are enabled. No per-profile seeding.
+  directory), and a profile's config names which are enabled. No per-profile seeding. Profile-private learned skills
+  are the exception: text-only rows in the store, versioned, read through `skills_list`/`skill_view` (learning §8).
 
 ## 4. Agent loop and prompt
 
@@ -164,7 +165,7 @@ ends it at the next boundary (see §10).
 1. Stable: SOUL; task-completion and tool-use guidance; the skills rule ("if a skill matches or
    is even partially relevant… load it with skill_view"); memory guidance.
 2. Context: the platform hint (Hermes's `api_server` hint).
-3. Volatile: the skills index; the session's frozen memory snapshot; a date-only timestamp.
+3. Volatile: the skills index (deployment skills, and with learning on the profile's active learned skills under `learned`); the session's frozen memory snapshot; a date-only timestamp.
 
 The prompt is built once per session, stored on the session, and rebuilt only after
 compression. A run's `instructions` are not part of it: they are appended to the system
@@ -260,7 +261,7 @@ base doubling to 120 s with jitter, at most 3 attempts per call.
 
 Nine tools, with Hermes's schemas and descriptions kept as close as possible (consumers'
 prompts are tuned against these texts): `terminal`, `execute_code`, `read_file`, `write_file`,
-`patch`, `search_files`, `skill_view`, `skills_list`, `memory`. `execute_code` runs a Python
+`patch`, `search_files`, `skill_view`, `skills_list`, `memory`; a profile with learning on is also offered `skill_manage` (learning §3), and `skills_list`/`skill_view` read its learned skills from the store without a sandbox. `execute_code` runs a Python
 script in the sandbox (no persistent kernel or RPC bridge). The first version of the loop (M2) ships eight of the nine; `memory` arrives in M3 (§7).
 
 **`SandboxExecutor`** — the tools never touch host paths; every file and process operation goes

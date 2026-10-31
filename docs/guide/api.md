@@ -37,6 +37,12 @@ Errors have one shape, with a machine-readable code:
 | `GET /v1/profiles/{profile_id}/memory` | The profile's active memory entries per target, with usage and each entry's source. |
 | `PATCH /v1/profiles/{profile_id}/memory/{entry_id}` | Replace an entry's text: `{"text": "…", "expected_version": n}`. Returns the entry. |
 | `DELETE /v1/profiles/{profile_id}/memory/{entry_id}?expected_version=n` | Remove an entry: `{"deleted": true}`. |
+| `GET /v1/profiles/{profile_id}/skills/learned?state=` | The profile's learned skills, optionally of one state. |
+| `POST /v1/profiles/{profile_id}/skills/learned` | Create a learned skill (201). |
+| `GET /v1/profiles/{profile_id}/skills/learned/{skill_id}` | One learned skill with its version history. |
+| `PATCH /v1/profiles/{profile_id}/skills/learned/{skill_id}` | Edit a learned skill. |
+| `POST /v1/profiles/{profile_id}/skills/learned/{skill_id}/{rollback,suspend,resume}` | Change a learned skill's version or state. |
+| `DELETE /v1/profiles/{profile_id}/skills/learned/{skill_id}?expected_version=n` | Retire a learned skill: `{"retired": true}`. |
 | `POST /v1/models/verify` | Check a model id: `{"provider", "model"}` → `{"supports_vision": bool}`. |
 
 ## Profile
@@ -49,7 +55,8 @@ Errors have one shape, with a machine-readable code:
   "sandbox": {"image": "python:3.12-slim", "workdir": "/work"},
   "soul": "You are a careful data assistant.",
   "skills": ["my-skill"],
-  "memory": false
+  "memory": false,
+  "learning": false
 }
 ```
 
@@ -75,7 +82,13 @@ Errors have one shape, with a machine-readable code:
   reviews. Omitted, the field is false, including on update. `null`, or anything other than a boolean, is
   400 `invalid_input`.
 
-The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory` and `updated_at`.
+- `learning`: a boolean, default false (including on update), and it requires `memory`: `true` without `memory` is
+  400 `invalid_input` ("learning requires memory."). When true, the model is offered a `skill_manage` tool, and
+  `skills_list` and `skill_view` show the profile's active learned skills (see [Learned skills](#learned-skills)).
+  Like `memory`, the tool is fixed per session until it compacts. `null`, or anything other than a boolean, is
+  400 `invalid_input`.
+
+The response echoes `id`, `models`, `sandbox`, `soul`, `skills`, `memory`, `learning` and `updated_at`.
 
 A replacement that changes the effective sandbox policy is refused with 409 `sandbox_busy` while the profile has a
 run queued, running or stopping, or sandbox work that has not been cleaned up yet; retry once it has finished.
@@ -234,6 +247,49 @@ conversations: user and assistant text only, secrets redacted, never across prof
 started with until it compacts, so open sessions do not gain `session_search` until then. Deleting a session removes
 its messages from search.
 
+## Learned skills
+
+A profile with `learning` on can keep methods as learned skills: text-only, private to the profile, and separate
+from the deployment's read-only `skills`. A skill has a `name` (lowercase slug, at most 64 characters), a one-line
+`description` (at most 200), an optional `category` (slug, at most 32) and a `body` (at most 8000 characters, no
+front matter). A profile holds at most 50 active or suspended skills. A deployment skill of the same name hides a
+learned one. Bodies and descriptions are checked like memory text: empty text, secrets and instruction-like text
+are refused.
+
+The model creates, revises and retires skills with `skill_manage` (`list`, `create`, `revise`, `retire`), only when
+the user explicitly asks it to keep a method; the guidance in its prompt says so. A skill is `active`, `suspended`
+(not offered, kept) or `retired`. Every change writes an immutable version (`create`, `revise`, `rollback`,
+`suspend`, `resume` or `retire`) with its source (`foreground` with the run, session and message, or `consumer`),
+evidence and rationale, so a skill can be inspected and reversed.
+
+Active learned skills are listed under the category `learned` in `skills_list`, and `skill_view` shows the current
+version, with or without a sandbox, and records the load. A suspended or retired skill answers that it is no longer
+available. The system prompt's skills index is built at session start or compaction, so a change shows up in the
+index from the next session; `skill_view` always reads the current version. With `learning` off, nothing is
+offered or listed, and the stored skills are kept.
+
+The routes below work whether or not `learning` is enabled, like the memory routes. Consumer changes are
+authoritative and enter the history with source `consumer`.
+
+| Route | Body and result |
+|---|---|
+| `GET …/skills/learned?state=` | `state` is `active`, `suspended` or `retired`; any other value is 400. Returns `{"skills": […]}` (no bodies). |
+| `POST …/skills/learned` | `{"name", "description", "body", "category"?}`. 201 with the skill. |
+| `GET …/skills/learned/{skill_id}` | The skill with `body` and `versions`, each with `version`, `change`, `name`, `description`, `category`, `body`, `source` (`kind`, `run_id`, `session_id`, `job_id`), `evidence` (`message_ids`, `observation_ids`), `rationale`, `created_at`. |
+| `PATCH …/skills/learned/{skill_id}` | `{"expected_version": n, …}` with any of `name`, `description`, `body`, `category`. |
+| `POST …/{skill_id}/rollback` | `{"expected_version": n, "version": m}`: a new version equal to version `m`. |
+| `POST …/{skill_id}/suspend`, `…/resume` | `{"expected_version": n}`. |
+| `DELETE …/{skill_id}?expected_version=n` | Retire the skill: `{"retired": true}`. The history is kept until the profile is deleted. |
+
+Each skill is `{"id", "name", "description", "category", "state", "version", "origin", "created_at", "updated_at",
+"consumer_changed_at", "stats": {"loads_30d": n}}`; `origin` is who created it, and `loads_30d` counts
+`skill_view` loads of the current version in the last 30 days. Every change route returns the skill with its
+`body`. A change names the version it expects: 409 `version_conflict` when the skill has moved on. Other errors: 404
+`learned_skill_not_found`, 409 `name_taken` (an active or suspended skill has the name), 409 `skill_limit` (50
+reached), 409 `skill_retired` (a retired skill cannot change), and 400 `invalid_input` for a missing or non-integer
+`expected_version`, an invalid field or an invalid `state`. All routes answer 404 `profile_not_found` for a missing
+or foreign profile. Observations from review, feedback and automatic suspension are planned and not available yet.
+
 ## Verifying a model
 
 `POST /v1/models/verify` checks that a provider and model id work, and whether the model reads images:
@@ -253,7 +309,7 @@ not answer (rate limit, server error, timeout) is 503 `unavailable`.
 ## Deleting a profile
 
 `DELETE /v1/profiles/{profile_id}` with a JSON body `{"operation_id": "<uuid>"}` removes one profile's sessions,
-messages, runs, events, blobs, memory and model/persona configuration, and retires its sandbox by exact recorded
+messages, runs, events, blobs, memory, learned skills and model/persona configuration, and retires its sandbox by exact recorded
 container identity. It is tenant-owned and resumable: a retry with the same operation id continues from the
 persisted phase. A different operation id while a deletion is active is refused with 409 `profile_deletion_busy`.
 
@@ -285,7 +341,9 @@ remove a container by name alone.
 | 401 | `unauthorized` | Missing or wrong key. |
 | 404 | `profile_not_found`, `session_not_found`, `run_not_found` | No such object. |
 | 404 | `memory_not_found` | No such memory entry in this profile. |
-| 409 | `version_conflict` | The memory entry changed since `expected_version`. |
+| 404 | `learned_skill_not_found` | No such learned skill in this profile. |
+| 409 | `version_conflict` | The memory entry or learned skill changed since `expected_version`. |
+| 409 | `name_taken`, `skill_limit`, `skill_retired` | A learned skill's name is in use, the profile has 50 active or suspended skills, or the skill is retired. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |
 | 409 | `sandbox_busy` | `PUT /v1/profiles/{id}` would change the effective sandbox policy (including enabling or clearing it) while the profile has a queued, running or stopping run, unreleased sandbox usage, or unresolved sandbox work. Nothing in the request is applied. |
 | 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |
