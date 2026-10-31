@@ -14,6 +14,7 @@ from keel import prompts
 from keel import compress
 from keel.compactor import Compactor, SessionContext
 from keel.compress import Boundaries
+from keel.learned import IndexEntry
 from keel.memory import snapshot as memory_snapshot
 from keel.models import (
     Completed, ImagePart, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCall, ToolCallReady, Usage,
@@ -341,6 +342,10 @@ class RunExecutor:
             desired.extend(prompts.TOOL_ORDER)
         if profile is not None and profile.memory:
             desired += ["memory", "session_search"]
+        learning = bool(profile is not None and profile.memory and profile.learning)
+        if learning:
+            desired += [name for name in ("skills_list", "skill_view") if name not in desired]
+            desired.append("skill_manage")
         if ctx is None:
             cwd = session.cwd if session and session.cwd else "/"
             ctx = ToolContext(cwd=cwd, store=self.store, profile_id=run.profile_id,
@@ -353,11 +358,20 @@ class RunExecutor:
             if profile is not None and profile.memory:
                 entries = await self.store.memory_entries(run.profile_id)
                 snapshot = memory_snapshot(entries["memory"], entries["user"])
+            index = list(skills)
+            if learning:
+                shipped = {skill.name for skill in skills}
+                for learned in await self.store.learned_skills(run.profile_id, states=("active",)):
+                    if learned.name in shipped:
+                        log.warning("profile %s: learned skill %s has a deployment skill's name and is not listed",
+                                    run.profile_id, learned.name)
+                        continue
+                    index.append(IndexEntry(learned.name, learned.description))
             return build_system_prompt(
                 soul=profile.soul if profile else "", model=run.model, provider=run.provider, now=self._now(),
-                tools=bool(desired), skills=skills, workdir=policy.workdir if policy else None,
+                tools=bool(desired), skills=index, workdir=policy.workdir if policy else None,
                 memory=bool(profile and profile.memory), memory_snapshot=snapshot,
-                history="session_search" in desired), tuple(desired)
+                history="session_search" in desired, learning=learning), tuple(desired)
 
         system = session.system_prompt if session else None
         if system is None:
