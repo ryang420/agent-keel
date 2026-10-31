@@ -195,7 +195,8 @@ class ProfileDeletionStoreMixin:
             await self.db.execute("DELETE FROM blobs WHERE profile_id = ?", profile_id)
             for table in ("memory_entries", "memory_changes", "memory_revisions", "memory_mutations",
                           "message_tokens", "message_search", "history_backfill", "memory_reviews",
-                          "memory_review_jobs"):
+                          "memory_review_jobs", "learned_skills", "learned_skill_versions",
+                          "learned_skill_evidence", "lesson_observations", "skill_loads"):
                 await self.db.execute(f"DELETE FROM {table} WHERE profile_id = ?", profile_id)
             await self._purge_profile_sandbox_evidence(profile_id)
             await self.db.execute("DELETE FROM profiles WHERE id = ?", profile_id)

@@ -20,6 +20,7 @@ from keel.store.base import (
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
 from keel.store.history import HistoryStoreMixin
+from keel.store.learned import LearnedSkillStoreMixin
 from keel.store.memory import MemoryStoreMixin
 from keel.store.migrations import migrate
 from keel.store.reviews import ReviewStoreMixin
@@ -79,7 +80,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(HistoryStoreMixin, MemoryStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
+class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
                ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
@@ -366,6 +367,12 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, ReviewStoreMixin, SandboxSto
                 "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute(
                 "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            for table in ("lesson_observations", "skill_loads", "learned_skill_evidence"):
+                await self.db.execute(f"DELETE FROM {table} WHERE profile_id = ? AND session_id = ?",
+                                      profile_id, session_id)
+            await self.db.execute(
+                "UPDATE learned_skill_versions SET run_id = NULL, session_id = NULL, tool_call_id = NULL "
+                "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self._forget_session_reviews(profile_id, session_id)
             await self.db.execute("DELETE FROM sessions WHERE id = ?", session_id)
         return True
