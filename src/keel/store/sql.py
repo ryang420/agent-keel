@@ -22,6 +22,7 @@ from keel.sandbox.records import SandboxBusy
 from keel.store.history import HistoryStoreMixin
 from keel.store.learned import LearnedSkillStoreMixin
 from keel.store.memory import MemoryStoreMixin
+from keel.store.observations import ObservationStoreMixin
 from keel.store.migrations import migrate
 from keel.store.reviews import ReviewStoreMixin
 from keel.store.sandboxes import SandboxStoreMixin
@@ -80,7 +81,8 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
+class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, ObservationStoreMixin,
+               ReviewStoreMixin, SandboxStoreMixin,
                ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:

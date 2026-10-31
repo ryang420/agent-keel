@@ -196,6 +196,24 @@ class ReviewClaim:
 
 
 @dataclass(frozen=True)
+class Observation:
+    """A lesson observation: what a review, feedback or a skill request saw, awaiting or past the dream."""
+    id: str
+    session_id: str
+    topic: str
+    situation: str
+    approach: str
+    outcome: str
+    evidence: tuple[int, ...]
+    loaded: tuple[tuple[str, int], ...]  # (learned skill id, version) loaded by the cited runs
+    state: str
+    review_job_id: str | None
+    run_id: str | None
+    consumed_by: str | None
+    created_at: float
+
+
+@dataclass(frozen=True)
 class SkillSource:
     """Who changed a learned skill. Set from trusted context, never from model arguments."""
     kind: str  # "foreground", "dream", "consumer" or "automatic"
