@@ -86,3 +86,10 @@ def test_comments_are_checked():
 def test_observation_text_limits():
     assert check_observation("t", "s", "a") is None
     assert check_observation("t", "", "a") is None  # situation may be empty (feedback without a comment)
+
+
+def test_a_request_staged_earlier_in_the_review_counts_as_recorded():
+    staged = stage()
+    assert not call(staged, outcome="requested", evidence=[12])[1]
+    body, error = call(staged, outcome="requested", evidence=[11, 12])
+    assert error and "already recorded" in body["error"] and len(staged.items) == 1

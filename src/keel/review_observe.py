@@ -65,4 +65,6 @@ class StagedObservations:
         if len(self.items) >= self.remaining:
             return _refusal("No more observations can be recorded for this conversation.", "limit")
         self.items.append(StagedObservation(topic, situation, approach, outcome, cited))
+        if outcome == "requested":
+            self.requested.update(cited)
         return tool_json({"success": True, "staged": len(self.items)}), False
