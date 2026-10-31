@@ -118,6 +118,13 @@ def validate_mount_sources(mounts: tuple[Mount, ...], mount_root: str | None) ->
             raise PolicyError("sandbox.mounts[].source entries must not overlap each other.")
 
 
+def env_is_valid(env: object) -> bool:
+    """A sandbox environment: variable names mapped to strings without line breaks or NUL."""
+    return isinstance(env, dict) and all(
+        isinstance(k, str) and _ENV_NAME.fullmatch(k) and isinstance(v, str)
+        and not any(c in v for c in "\0\r\n") for k, v in env.items())
+
+
 def parse_policy(data: dict, mount_root: str | None = None) -> SandboxPolicy:
     if not isinstance(data, dict):
         raise PolicyError("sandbox must be an object.")
@@ -150,9 +157,7 @@ def parse_policy(data: dict, mount_root: str | None = None) -> SandboxPolicy:
         mounts.append(Mount(source, target, bool(raw.get("read_only", False))))
     validate_mount_sources(tuple(mounts), mount_root)
     env = data.get("env") or {}
-    if not isinstance(env, dict) or not all(
-            isinstance(k, str) and _ENV_NAME.fullmatch(k) and isinstance(v, str)
-            and not any(c in v for c in "\0\r\n") for k, v in env.items()):
+    if not env_is_valid(env):
         raise PolicyError("sandbox.env must map variable names to strings without line breaks or NUL.")
     user = data.get("user")
     if user is not None and (not isinstance(user, str) or not _USER.fullmatch(user)):
