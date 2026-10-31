@@ -1,6 +1,6 @@
 # Cross-session memory: user continuity and history recall
 
-Date: 2026-10-24. Status: approved 2026-10-29.
+Date: 2026-10-24. Status: approved 2026-10-29; accepted 2026-10-30 (see the acceptance record at the end).
 
 ## Intent and decisions
 
@@ -308,3 +308,17 @@ snapshot behavior, raw-evidence retrieval, stale-write prevention and deletion s
 
 This is a multi-step feature with schema, runtime and API changes. Approve this design before an implementation
 plan or product-code changes. Keep the implementation plan in `.superpowers/` per repository policy.
+
+## Acceptance record
+
+Accepted 2026-10-30 against §7.
+
+| Gate | Evidence |
+|---|---|
+| Deterministic matrix | `tests/test_memory_acceptance.py` and `tests/test_history_acceptance.py` (each test names its §7 row) together with the existing review, queue, history and memory tests, in CI on PostgreSQL. |
+| Live evaluation | Protocol `memory-eval-v1` (`evals/memory`, 32 scenarios, 16 English and 16 Chinese, suite sha256 `3cd14d97f0722e54b97ff4eb774a4ede1f3746fccb62dab0d1d98445dcd10df1`, keel commit `3032cea`), model `openai.gpt-6-luna` on the `bedrock` provider, 2026-10-30. Memory arm 32/32: preference continuity 16/16, history recall 16/16 (all 16 recall passes found the decision through `session_search`; none had it in memory), English 16/16, Chinese 16/16; cross-profile exposure 0; unsupported durable preferences in the four scope-exception cases 0 (their stored memory holds only the general preference); errors 0. Baseline Keel (memory off) on the same fixtures: 1/32 (one recall answer guessed a likely region). Usage: memory arm foreground 323,370 input / 4,319 output tokens (112,492 cache read), background review 24 jobs, 28 requests, 25,805 input / 1,114 output tokens; baseline 2,494 input / 4,552 output tokens. |
+| Search benchmark | `evals/memory bench`: 100,000 messages in one profile plus 20,000 in two others, Zipf-weighted English and Chinese text; an 8-core arm64 laptop, PostgreSQL 17 in Docker with default settings (shared_buffers 128 MB), warm cache after `VACUUM ANALYZE`. `session_search` p50 41.1 ms, p95 97.5 ms overall (English 1-5 words p95 105.6 ms, Chinese 2-4 characters p95 52.5 ms, no-match p95 6.1 ms; all English and Chinese queries found hits, no no-match query did); search tables 593 MiB (text, tokens and indexes); backfill 444 messages/s; indexing adds 4.1 ms to a message append (5.3 ms vs 1.2 ms mean). Target p95 < 500 ms: met. |
+
+Rollout follows §7: an explicitly enabled test profile, then an opt-in cohort. The memory switch stops learning and
+recall. The deferred items in `CLAUDE.md` (finished review jobs are not pruned; no dirty-row index for the review
+queue) are not part of this gate.
