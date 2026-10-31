@@ -353,7 +353,7 @@ return no conversation text.
              "usage": {"input_tokens": 21040, "output_tokens": 910,
                        "cache_read_tokens": null, "cache_write_tokens": null}}],
   "changes": {"skills": [{"action": "create", "skill_id": "7ab…", "name": "release-notes", "version": 1}],
-              "consumed": [41, 42, 45], "dismissed": [43]},
+              "consumed": ["3f0a…", "5d2c…", "b81e…"], "dismissed": ["c47d…"]},
   "created_at": 1761800000.0, "updated_at": 1761800120.0, "finished_at": 1761800120.0}]}
 ```
 
@@ -363,7 +363,8 @@ suspended automatically). `changes` lists the skills the dream wrote (`action` i
 `retire`), the observations it used (`consumed`) and the ones it dismissed; it is empty until the dream is `done`.
 `usage` lists the last 20 attempts; an unknown count is `null`. A failed dream does not block the next one: when new
 evidence makes the profile due again, a new dream is queued beside the failed one, which stays until an operator
-retries it. `discarded` means its profile, learning switch or memory switch changed underneath it.
+retries it. After a `no_route` or `model_unavailable` failure no new dream is queued until the profile completes a
+run on another model or the failed one is retried. `discarded` means its profile, learning switch or memory switch changed underneath it.
 
 Errors: 400 `invalid_input` (an unknown `status`, or a `limit` outside 1-100), 404 `dream_not_found`, 404
 `profile_not_found`, 409 `dream_not_retryable` (the dream is `done` or `discarded`), 409 `dream_busy` (another dream

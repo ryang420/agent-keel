@@ -23,7 +23,7 @@ service key are required; an invalid value stops the service at start with a mes
 | `KEEL_MEMORY_REVIEW_TURNS` | `10` | Completed runs after which a memory-enabled session is due for a background review, a positive integer. |
 | `KEEL_MEMORY_REVIEW_IDLE_SECONDS` | `60` | Seconds after a session's last completed run before its unreviewed text is due, a positive number. |
 | `KEEL_MEMORY_REVIEW_MAX_AGE_SECONDS` | `600` | Seconds after a session's first unreviewed completed run before it is due even while still active, a positive number. |
-| `KEEL_MEMORY_REVIEW_WORKERS` | `1` | Memory reviews this instance runs at once, beside the run workers; a positive integer. At most one runs per profile across all instances. |
+| `KEEL_MEMORY_REVIEW_WORKERS` | `1` | Memory reviews this instance runs at once, beside the run workers; a positive integer. At most one runs per profile across all instances. Dreams run on the same workers, and a dream holds one for up to `KEEL_DREAM_DEADLINE_SECONDS`, so with learning on the count may need raising. |
 | `KEEL_DREAM_ITERATIONS` | `12` | Model iterations one dream attempt may take, a positive integer. |
 | `KEEL_DREAM_INPUT_TOKENS` | `60000` | Estimated input tokens one dream attempt may send in total across its requests, a positive integer. |
 | `KEEL_DREAM_OUTPUT_TOKENS` | `4000` | Output tokens allowed per dream request, a positive integer. |

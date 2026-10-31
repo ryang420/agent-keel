@@ -229,15 +229,18 @@ automatically), `budget` (the input budget ran out), `deadline`, `iteration_limi
 cut off), all retried; `conflict` (a skill changed after the dream read it, an observation was used elsewhere, or a
 name was taken; the retry re-reads current state); `lease_expired` (the worker stopped renewing its lease);
 `learning_disabled` and `profile_gone` (the dream is `discarded`: learning or memory was turned off, or the profile
-was replaced or is being deleted).
+was replaced or is being deleted). After a `no_route` or `model_unavailable` failure no new dream is queued for the
+profile while its most recently completed run names the same model as the failed job (or still none); a completed run
+on another model, or `POST …/dreams/{id}/retry`, lifts that.
 
 Gates. When the dream stages a change, it is refused unless:
 
-- Evidence: `create` and `revise` cite at least 2 observations from at least 2 different sessions, or 1 `requested`
-  observation, or 1 `feedback_up` observation with a comment. `retire` cites a contradicting observation or is part
-  of a merge. Every cited observation belongs to this dream's input.
-- A new skill whose name or description overlaps a live learned skill (token overlap of 0.6) is not created, and
-  neither is one that duplicates a deployment skill.
+- Evidence: `create`, `revise` and `merge` (which writes new text on its target) cite at least 2 observations from
+  at least 2 different sessions, or 1 `requested` observation, or 1 `feedback_up` observation with a comment.
+  `retire` cites a contradicting observation or is part of a merge. Every cited observation belongs to this dream's
+  input.
+- A new skill whose name or description overlaps a live learned skill (token overlap of 0.6) is not created.
+  Against deployment skills only an exact name clash is checked (next item); their text is not compared.
 - The text is validated like a consumer's (size limits, no secrets, no instruction-like text), and a name that a
   deployment skill, a live learned skill or another staged change already has is refused for create, revise and
   merge. A create is also refused when the profile already holds 50 live skills.
@@ -261,7 +264,8 @@ from reapplying it from older observations. Deleting a profile removes its dream
 
 Migration 13 adds tables and columns only and needs no backfill. As for earlier learning migrations, upgrade every
 serving and worker instance before relying on dreams: an older instance deletes profiles without removing dream
-jobs.
+jobs, and leases memory reviews without checking dream jobs, so a review and a dream of one profile can overlap until
+every instance is upgraded.
 
 ## Complete profile deletion
 

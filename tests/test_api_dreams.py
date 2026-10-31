@@ -67,7 +67,7 @@ async def test_retry_requeues_once_and_refuses_unknown_or_finished_dreams(client
     found = await queued_dream(store, clock)
     await store.fail_dream(found, "internal", "boom", retry=False)
     retried = await http.post(f"/v1/profiles/p1/dreams/{found.job.id}/retry")
-    assert retried.status_code == 200 and retried.json()["status"] == "pending"
+    assert retried.status_code == 200 and (retried.json()["status"], retried.json()["attempts"]) == ("pending", 0)
     assert (await http.post(f"/v1/profiles/p1/dreams/{found.job.id}/retry")).json()["status"] == "pending"
     assert (await http.post("/v1/profiles/p1/dreams/nope/retry")).status_code == 404
     await store.db.execute("UPDATE dream_jobs SET status = 'done' WHERE id = ?", found.job.id)
@@ -75,11 +75,15 @@ async def test_retry_requeues_once_and_refuses_unknown_or_finished_dreams(client
     assert (refused.status_code, refused.json()["error"]["code"]) == (409, "dream_not_retryable")
 
 
-async def test_another_tenant_sees_no_dreams(client, clock):
+async def test_another_tenant_sees_no_dreams_and_cannot_retry_one(client, clock):
     http, store = client
-    await queued_dream(store, clock)
+    found = await queued_dream(store, clock)
+    await store.fail_dream(found, "internal", "boom", retry=False)
     other = {"Authorization": "Bearer key-two"}
     assert (await http.get("/v1/profiles/p1/dreams", headers=other)).status_code == 404
+    assert (await http.post(f"/v1/profiles/p1/dreams/{found.job.id}/retry", headers=other)).status_code == 404
+    [job] = await store.list_dreams("p1")
+    assert (job.status, job.attempts, job.error_code) == ("failed", 1, "internal")
 
 
 async def test_retry_is_refused_while_another_dream_of_the_profile_is_open(client, clock):
