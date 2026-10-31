@@ -41,6 +41,8 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - The unreleased schema migrations are renumbered 9–14 (they were 8–13): 0.3.2 released schema version 8 (command
   runs). A development database that applied them under the old numbers must be recreated.
+- With command runs, a dream takes its model from the profile's last completed model run (a later command run has no
+  model and no longer leaves the dream without a route), and a command run takes no feedback (400 `invalid_input`).
 - Memory review no longer runs as a best-effort task that a busy or restarting instance could drop, and a foreground
   memory write no longer postpones it. `KEEL_MEMORY_REVIEW_TURNS` is now one of three eligibility rules, and
   `KEEL_BACKGROUND_LIMIT` covers titles only. Migration 11 drops the old per-session turn counter; every instance

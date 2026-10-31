@@ -33,10 +33,12 @@ class FeedbackStoreMixin:
             await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
             await self._check_profile_incarnation(profile_id, profile_incarnation)
-            run = await self.db.fetchrow("SELECT id, session_id, status FROM runs WHERE id = ? AND profile_id = ?",
-                                         run_id, profile_id)
+            run = await self.db.fetchrow(
+                "SELECT id, session_id, status, kind FROM runs WHERE id = ? AND profile_id = ?", run_id, profile_id)
             if run is None:
                 return None, "not_found", []
+            if run["kind"] != "model":
+                return None, "command_run", []
             if run["status"] not in TERMINAL:
                 return None, "not_terminal", []
             stamp = self.clock()

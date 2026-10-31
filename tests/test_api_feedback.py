@@ -6,7 +6,7 @@ import pytest
 from keel.api import Keel, create_app
 from keel.config import ServiceCredential
 from keel.events import InMemoryEventBus
-from keel.models import Message, TextPart
+from keel.models import Message, TextPart, Usage
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 from keel.runner import RunExecutor
@@ -74,6 +74,17 @@ async def test_invalid_input_is_rejected(client):
                  {"rating": "up", "comment": 5}):
         response = await http.put(url(run.id), json=body)
         assert response.status_code == 400 and response.json()["error"]["code"] == "invalid_input", body
+    assert (await http.get(url(run.id))).status_code == 404
+
+
+async def test_a_command_run_cannot_be_rated(client):
+    http, store = client
+    await store.ensure_session("p1", "c")
+    run = await store.create_command_run(profile_id="p1", session_id="c",
+                                         command={"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}})
+    await store.finish_run(run.id, "completed", output="", usage=Usage(0, 0, 0, 0))
+    refused = await http.put(url(run.id), json={"rating": "up"})
+    assert refused.status_code == 400 and refused.json()["error"]["code"] == "invalid_input"
     assert (await http.get(url(run.id))).status_code == 404
 
 

@@ -366,9 +366,10 @@ the run's session, without a model call; replacing or deleting the rating drops 
 `down` rating on a run that loaded a learned skill counts toward that skill's automatic suspension. Deleting a
 session or a profile deletes its feedback.
 
-Errors: 400 `invalid_input` (a rating other than `up` or `down`, or an invalid comment), 404 `run_not_found`, 404
-`feedback_not_found` (`GET` or `DELETE` on a run with no rating), 404 `profile_not_found`, 409 `run_not_terminal`
-(the run has not finished), and 409 `profile_deletion_busy` while the profile is being deleted.
+Errors: 400 `invalid_input` (a rating other than `up` or `down`, an invalid comment, or a command run, which takes no
+feedback), 404 `run_not_found`, 404 `feedback_not_found` (`GET` or `DELETE` on a run with no rating), 404
+`profile_not_found`, 409 `run_not_terminal` (the run has not finished), and 409 `profile_deletion_busy` while the
+profile is being deleted.
 
 ## Dreams
 

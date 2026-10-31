@@ -829,6 +829,47 @@ async def test_command_runs_upgrade_a_0_3_1_database(db_url, monkeypatch):
         await fresh.close()
 
 
+async def test_a_0_3_2_database_upgrades_to_the_latest_version_and_matches_a_fresh_one(db_url, monkeypatch):
+    # A database at schema version 8 (0.3.2): a legacy memory list, a finished model run and a finished command run.
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:8])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 8)
+    old = await open_store(db_url)
+    assert await schema_version(old.db) == 8
+    await insert_old_profile(old.db, "p1", 1)
+    await old.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
+                         "p1", "user", json.dumps(["likes tea", "works late"]), 5.0)
+    await old.ensure_session("p1", "s1")
+    await old.ensure_session("p1", "s2")
+    await old.db.execute(
+        "INSERT INTO runs (id, profile_id, session_id, status, provider, model, input, output, created_at, "
+        "finished_at) VALUES ('run_model', 'p1', 's1', 'completed', 'fake', 'm', '[]', 'done', 1, 2)")
+    command = {"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}}
+    await old.db.execute(
+        "INSERT INTO runs (id, profile_id, session_id, status, kind, command, provider, model, input, output, "
+        "created_at, finished_at) VALUES ('run_command', 'p1', 's2', 'completed', 'command', ?, NULL, NULL, '[]', "
+        "'', 3, 4)", json.dumps(command))
+    await old.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION == 14
+        model = await upgraded.get_run_by_id("run_model")
+        assert (model.kind, model.command, model.provider, model.model) == ("model", None, "fake", "m")
+        ran = await upgraded.get_run_by_id("run_command")
+        assert (ran.kind, ran.command, ran.provider, ran.model) == ("command", command, None, None)
+        assert await upgraded.memory_entries("p1") == {"memory": [], "user": ["likes tea", "works late"]}
+        assert "memories" not in await database_table_names(upgraded.db)
+        upgraded_shape = await schema_shape(upgraded.db)
+    finally:
+        await upgraded.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded_shape
+    finally:
+        await fresh.close()
+
+
 async def test_migration_14_adds_dream_jobs_to_a_version_13_database(db_url):
     store = await open_store(db_url)
     try:
