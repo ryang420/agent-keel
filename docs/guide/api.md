@@ -262,7 +262,10 @@ The model creates, revises and retires skills with `skill_manage` (`list`, `crea
 the user explicitly asks it to keep a method; the guidance in its prompt says so. A skill is `active`, `suspended`
 (not offered, kept) or `retired`. Every change writes an immutable version (`create`, `revise`, `rollback`,
 `suspend`, `resume` or `retire`) with its source (`foreground` with the run, session and message, or `consumer`),
-evidence and rationale, so a skill can be inspected and reversed.
+evidence and rationale, so a skill can be inspected and reversed. A dream's changes appear in the versions with
+source `dream` and the dream's job id (`job_id`); `merge` is a dream-only change kind, written on the target of a
+merge after the merged skills are retired with the rationale "merged into <name>". A dream's revise or merge makes
+the skill active again if it was suspended. A merge, like a revise, starts the `stats` fresh.
 
 Active learned skills are listed under the category `learned` in `skills_list`, and `skill_view` shows the current
 version, with or without a sandbox, and records the load. A suspended or retired skill answers that it is no longer
@@ -300,8 +303,7 @@ deleted.
 
 With `learning` on, the background memory review can also record observations: short notes of a method and how it
 turned out (`corrected`, `worked`, `failed` or `requested`), each citing messages of the reviewed text, at most 5 per
-review. They are stored privately, pending for 30 days, and are inputs to a later consolidation step that is planned
-and not available yet; nothing consumes them today.
+review. They are stored privately, pending for 30 days, and are the input of the dream (see Dreams).
 
 A learned skill is suspended automatically when its current version has at least 3 `down` ratings in 30 days and more
 `down` than `up`, but only while `learning` is on. The change is recorded as a version with change `suspend` and
@@ -331,6 +333,41 @@ session or a profile deletes its feedback.
 Errors: 400 `invalid_input` (a rating other than `up` or `down`, or an invalid comment), 404 `run_not_found`, 404
 `feedback_not_found` (`GET` or `DELETE` on a run with no rating), 404 `profile_not_found`, 409 `run_not_terminal`
 (the run has not finished), and 409 `profile_deletion_busy` while the profile is being deleted.
+
+## Dreams
+
+With `learning` on, a background job called a dream consolidates a profile's pending observations into learned
+skills: it creates, revises, merges and retires skills and dismisses observations that teach nothing. These routes
+inspect dreams and retry a failed one; they work whether or not `learning` is enabled, like the memory routes, and
+return no conversation text.
+
+| Route | Body and result |
+|---|---|
+| `GET …/dreams?status=&limit=` | Dreams newest first. `status` is `pending`, `running`, `done`, `failed` or `discarded`; `limit` is 1-100 (default 20). Returns `{"dreams": […]}`. |
+| `POST …/dreams/{dream_id}/retry` | Requeue a `failed` dream with fresh attempts and the profile's current model; returns it. Retrying a `pending` or `running` dream returns it unchanged. |
+
+```json
+{"dreams": [{"id": "9c1e…", "status": "done", "trigger": "observations", "attempts": 1, "error_code": null,
+  "error": null, "provider": "bedrock", "model": "…",
+  "usage": [{"attempt": 1, "outcome": "committed", "requests": 4,
+             "usage": {"input_tokens": 21040, "output_tokens": 910,
+                       "cache_read_tokens": null, "cache_write_tokens": null}}],
+  "changes": {"skills": [{"action": "create", "skill_id": "7ab…", "name": "release-notes", "version": 1}],
+              "consumed": [41, 42, 45], "dismissed": [43]},
+  "created_at": 1761800000.0, "updated_at": 1761800120.0, "finished_at": 1761800120.0}]}
+```
+
+`trigger` is why the dream was queued: `observations` (enough new pending observations), `interval` (a day since the
+last dream), `feedback` (a `down` rating on a run that loaded a learned skill) or `suspension` (a skill was
+suspended automatically). `changes` lists the skills the dream wrote (`action` is `create`, `revise`, `merge` or
+`retire`), the observations it used (`consumed`) and the ones it dismissed; it is empty until the dream is `done`.
+`usage` lists the last 20 attempts; an unknown count is `null`. A failed dream does not block the next one: when new
+evidence makes the profile due again, a new dream is queued beside the failed one, which stays until an operator
+retries it. `discarded` means its profile, learning switch or memory switch changed underneath it.
+
+Errors: 400 `invalid_input` (an unknown `status`, or a `limit` outside 1-100), 404 `dream_not_found`, 404
+`profile_not_found`, 409 `dream_not_retryable` (the dream is `done` or `discarded`), 409 `dream_busy` (another dream
+of this profile is queued or running), and 409 `profile_deletion_busy` while the profile is being deleted.
 
 ## Verifying a model
 
@@ -388,6 +425,9 @@ remove a container by name alone.
 | 409 | `run_not_terminal` | Feedback is accepted only once the run has finished. |
 | 409 | `version_conflict` | The memory entry or learned skill changed since `expected_version`. |
 | 409 | `name_taken`, `skill_limit`, `skill_retired` | A learned skill's name is in use, the profile has 50 active or suspended skills, or the skill is retired. |
+| 404 | `dream_not_found` | No such dream in this profile. |
+| 409 | `dream_not_retryable` | Only a failed dream can be retried. |
+| 409 | `dream_busy` | Another dream of the profile is queued or running. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |
 | 409 | `sandbox_busy` | `PUT /v1/profiles/{id}` would change the effective sandbox policy (including enabling or clearing it) while the profile has a queued, running or stopping run, unreleased sandbox usage, or unresolved sandbox work. Nothing in the request is applied. |
 | 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |

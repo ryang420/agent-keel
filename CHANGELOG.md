@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Dreams: with learning on, a profile's pending observations are consolidated into learned skills by a leased,
+  budgeted background job behind evidence, duplicate, validation, consumer-precedence and version gates, committed
+  atomically; `GET /v1/profiles/{p}/dreams` and `POST …/dreams/{id}/retry`; `KEEL_DREAM_*` settings (migration 13).
 - Observations and run feedback (schema migration 12): with `learning` on, the memory review records observations
   of methods through an `observe` tool, `PUT`, `GET` and `DELETE /v1/profiles/{p}/runs/{r}/feedback` rate finished
   runs, learned-skill `stats` add ratings and run outcomes over 30 days, a skill with repeated `down` ratings is

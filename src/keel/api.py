@@ -742,9 +742,11 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         return review_json(job)
 
     # these import this module's error helpers
+    from keel.api_dreams import add_dream_routes
     from keel.api_feedback import add_feedback_routes
     from keel.api_learned import add_learned_routes
 
     add_learned_routes(app, k, profile_or_404)
     add_feedback_routes(app, k, profile_or_404, run_or_404)
+    add_dream_routes(app, k, profile_or_404)
     return app
