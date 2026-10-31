@@ -101,8 +101,12 @@ def test_curve_refuses_a_missing_budget_before_anything_runs(tmp_path, monkeypat
     assert not list(tmp_path.iterdir())
 
 
+ADMIN = "postgresql://keel:" + "unused@127.0.0.1:1/keel"  # never connected to
+
+
 def test_curve_refuses_a_service_dataset_and_a_missing_model(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("KEEL_LIVE_OPENAI_MODEL", "scripted")
+    monkeypatch.setenv("KEEL_LEARNING_EVAL_ADMIN_DSN", ADMIN)  # the DSN check runs first; CI sets no DSN
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["curve", "--datasets", "crmarenapro", "--max-tokens", "1000", "--root", str(tmp_path),
                   "--dab-root", str(tmp_path / "none")])
@@ -116,6 +120,7 @@ def test_curve_refuses_a_service_dataset_and_a_missing_model(tmp_path, monkeypat
 
 def test_curve_refuses_an_unprepared_checkout(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("KEEL_LIVE_OPENAI_MODEL", "scripted")
+    monkeypatch.setenv("KEEL_LEARNING_EVAL_ADMIN_DSN", ADMIN)  # the DSN check runs first; CI sets no DSN
     code = cli.main(["curve", "--max-tokens", "1000", "--root", str(tmp_path / "out"),
                      "--dab-root", str(tmp_path / "none")])
     assert code == 1 and "prepare" in capsys.readouterr().err
