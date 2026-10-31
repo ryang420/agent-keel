@@ -309,7 +309,7 @@ CREATE INDEX lesson_observations_session ON lesson_observations (profile_id, ses
 CREATE TABLE skill_loads (
     profile_id TEXT NOT NULL, run_id TEXT NOT NULL, session_id TEXT NOT NULL, skill_id TEXT NOT NULL,
     version INTEGER NOT NULL, loaded_at {real} NOT NULL,
-    PRIMARY KEY (run_id, skill_id));
+    PRIMARY KEY (profile_id, run_id, skill_id));
 CREATE INDEX skill_loads_skill ON skill_loads (profile_id, skill_id, loaded_at);
 CREATE INDEX skill_loads_session ON skill_loads (profile_id, session_id)
 """

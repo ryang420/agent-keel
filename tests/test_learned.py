@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from keel.learned import IndexEntry, MAX_BODY, check, document
+from keel.learned import _SLUG, IndexEntry, MAX_BODY, check, document
 from keel.skills import parse_front_matter, render_index
 
 GOOD = ("csv-report", "How to build the weekly CSV report", "1. Load the export.\n2. Group by week.", None)
@@ -21,7 +21,8 @@ def test_bad_names_are_refused(name):
     assert "name" in check(name, *GOOD[1:])
 
 
-@pytest.mark.parametrize("description", ["", "   ", "x" * 201, "two\nlines", None])
+@pytest.mark.parametrize("description", ["", "   ", "x" * 201, "two\nlines", "a\rb", "a\tb", "a\x00b", "a\x7fb", "a\x85b",
+                                         "a\u2028b", "a\u2029b", None])
 def test_bad_descriptions_are_refused(description):
     assert "description" in check(GOOD[0], description, *GOOD[2:])
 
@@ -44,8 +45,9 @@ def test_secrets_and_injection_are_refused_in_every_field():
 
 def test_the_name_pattern_is_linear_on_long_input():
     started = time.perf_counter()
-    check("a" * 100_000 + "!", *GOOD[1:])
-    check("a-" * 50_000, *GOOD[1:])
+    for text in ("a" * 100_000 + "!", "a-" * 50_000):
+        assert _SLUG.fullmatch(text) is None  # the regex itself, not only the length check
+        check(text, *GOOD[1:])
     assert time.perf_counter() - started < 0.5
 
 

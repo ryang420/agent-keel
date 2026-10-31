@@ -338,6 +338,7 @@ class RunExecutor:
                               session_id=run.session_id, run_id=run.id,
                               memory_chars=self.memory_chars, user_chars=self.user_chars)
         desired: list[str] = []
+        sandboxed = ctx is not None
         if ctx is not None:
             desired.extend(prompts.TOOL_ORDER)
         if profile is not None and profile.memory:
@@ -380,9 +381,12 @@ class RunExecutor:
                                                           tools=built)
             system = session.system_prompt
         # The tool list is fixed with the prompt; a session stored before tool lists existed keeps the tools it
-        # was offered then (no session_search) until its next compaction.
-        offered = tuple(name for name in (session.tools if session.tools is not None else desired)
-                        if name in HANDLERS and (session.tools is not None or name != "session_search"))
+        # was offered then (no session_search, no learning tools) until its next compaction.
+        if session.tools is not None:
+            offered = tuple(name for name in session.tools if name in HANDLERS)
+        else:
+            later = {"session_search", "skill_manage"} | (set() if sandboxed else {"skills_list", "skill_view"})
+            offered = tuple(name for name in desired if name in HANDLERS and name not in later)
         stored = await self.store.messages(run.session_id)
         # A run that was swept, crashed or cut short may have left tool calls without results; answer them
         # before this turn so the request pairs every call.

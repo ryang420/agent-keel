@@ -182,8 +182,9 @@ class LearnedSkillStoreMixin:
         history, not pending work (learning §3)."""
         session = await self.db.fetchrow("SELECT generation FROM sessions WHERE id = ? AND profile_id = ?",
                                          source.session_id, profile_id)
-        loads = await self.db.fetch("SELECT skill_id, version FROM skill_loads WHERE run_id = ? ORDER BY skill_id",
-                                    source.run_id or "")
+        loads = await self.db.fetch(
+            "SELECT skill_id, version FROM skill_loads WHERE run_id = ? AND profile_id = ? ORDER BY skill_id",
+            source.run_id or "", profile_id)
         observation = uuid.uuid4().hex
         await self.db.execute(
             "INSERT INTO lesson_observations (id, profile_id, session_id, generation, topic, situation, approach, "
@@ -197,8 +198,12 @@ class LearnedSkillStoreMixin:
         return observation
 
     async def learned_skills(self, profile_id: str, *, states: tuple[str, ...] | None = None) -> list[LearnedSkill]:
-        rows = await self.db.fetch(_SKILL + " ORDER BY name, created_at", profile_id)
-        return [_skill(row) for row in rows if states is None or row["state"] in states]
+        where, args = "", [profile_id]
+        if states is not None:
+            where = f" AND state IN ({', '.join('?' for _ in states)})" if states else " AND FALSE"
+            args += list(states)
+        rows = await self.db.fetch(_SKILL + where + " ORDER BY name, created_at", *args)
+        return [_skill(row) for row in rows]
 
     async def learned_skill(self, profile_id: str, skill_id: str) -> LearnedSkill | None:
         row = await self.db.fetchrow(_SKILL + " AND id = ?", profile_id, skill_id)
@@ -237,8 +242,9 @@ class LearnedSkillStoreMixin:
             await self._check_profile_incarnation(profile_id, profile_incarnation)
             await self.db.execute(
                 "INSERT INTO skill_loads (profile_id, run_id, session_id, skill_id, version, loaded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (run_id, skill_id) DO UPDATE SET version = excluded.version, "
-                "loaded_at = excluded.loaded_at", profile_id, run_id, session_id, skill_id, version, self.clock())
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (profile_id, run_id, skill_id) DO UPDATE SET "
+                "version = excluded.version, loaded_at = excluded.loaded_at",
+                profile_id, run_id, session_id, skill_id, version, self.clock())
 
     async def skill_load_counts(self, profile_id: str, since: float) -> dict[tuple[str, int], int]:
         rows = await self.db.fetch(

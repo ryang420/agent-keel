@@ -737,3 +737,21 @@ async def test_migration_11_adds_the_learning_flag_and_tables(db_url):
             assert (await store.db.fetchrow(f"SELECT COUNT(*) AS n FROM {table}"))["n"] == 0
     finally:
         await store.close()
+
+
+async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.db.execute("UPDATE schema_version SET version = 10")
+        await restore_pre_learning(store.db)
+    finally:
+        await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        assert (await upgraded.get_profile("p1")).learning is False
+        assert {"learned_skills", "learned_skill_versions", "learned_skill_evidence", "lesson_observations",
+                "skill_loads"} <= await database_table_names(upgraded.db)
+    finally:
+        await upgraded.close()

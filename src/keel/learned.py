@@ -30,6 +30,9 @@ def _slug(value, limit: int) -> bool:
     return isinstance(value, str) and len(value) <= limit and _SLUG.fullmatch(value) is not None
 
 
+_CONTROL = re.compile("[\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]")
+
+
 def check(name, description, body, category) -> str | None:
     """Why this skill text must not be stored, or None: the §2 limits, then memory's secret and injection refusal on
     every text field."""
@@ -37,7 +40,7 @@ def check(name, description, body, category) -> str | None:
         return (f"name must be a lowercase slug (letters, digits and single hyphens) of at most {MAX_NAME} "
                 "characters.")
     if (not isinstance(description, str) or not description.strip() or len(description) > MAX_DESCRIPTION
-            or "\n" in description):
+            or _CONTROL.search(description)):
         return f"description must be one non-empty line of at most {MAX_DESCRIPTION} characters."
     if category is not None and not _slug(category, MAX_CATEGORY):
         return f"category must be a lowercase slug of at most {MAX_CATEGORY} characters."
