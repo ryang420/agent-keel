@@ -459,7 +459,6 @@ async def test_the_pool_runs_memory_review_loops_and_releases_on_close(pool_part
 async def test_expire_once_expires_only_observations_older_than_the_window(store, clock):
     from keel.observations import EXPIRY_SECONDS
     from keel.review_observe import StagedObservation
-    store.coordination_clock = clock
     await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
     await store.ensure_session("p1", "s1")
     item = StagedObservation("weekly report", "Asked", "Conclusion first", "corrected", ())

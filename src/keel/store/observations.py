@@ -1,5 +1,6 @@
 """Lesson observation rows (procedural learning design §4, §6): written by a memory review's commit, by feedback and
-by skill_manage; read by the dream (plan ⑦) and the tests. Every query is scoped by profile."""
+by skill_manage; read by the dream (plan ⑦) and the tests. Every query is scoped by profile. Observation times use
+the store's content clock, the same as the skill and version times they are compared with."""
 
 from __future__ import annotations
 

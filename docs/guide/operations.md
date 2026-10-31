@@ -183,8 +183,10 @@ consumed within 30 days expires; the worker's hourly maintenance pass does this 
 Consumers rate runs with `PUT /v1/profiles/{p}/runs/{r}/feedback`, which with learning on also records an observation.
 A learned skill whose current version has 3 or more `down` ratings in 30 days, and more `down` than `up`, is
 suspended automatically while learning is on: its versions list a `suspend` change with source `automatic` and a
-rationale giving the counts. To bring it back, fix or roll back the text and `POST …/{id}/resume`; a skill whose
-current version still has those ratings is suspended again by the next `down` rating. Ratings are removed with
+rationale giving the counts. To bring it back, fix or roll back the text and `POST …/{id}/resume`. Resuming writes
+a new version, and suspension counts only ratings on runs that loaded the current version, so a resumed skill is
+suspended again only after 3 new `down` ratings (and more `down` than `up`) on the resumed version. The `stats` still
+include the earlier ratings, because they cover the whole current text. Ratings are removed with
 `DELETE …/runs/{r}/feedback`, or with the session or profile.
 
 Migration 12 adds `runs.capped`, the observation's review job and run columns, and the `run_feedback` table. It needs

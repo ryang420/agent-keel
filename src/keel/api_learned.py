@@ -24,7 +24,8 @@ def skill_json(skill, outcome: SkillOutcome, *, body: bool = False) -> dict:
     found = {"id": skill.id, "name": skill.name, "description": skill.description, "category": skill.category,
              "state": skill.state, "version": skill.version, "origin": skill.origin,
              "created_at": skill.created_at, "updated_at": skill.updated_at,
-             "consumer_changed_at": skill.consumer_changed_at, "stats": {"loads_30d": outcome.loads, "up_30d": outcome.up, "down_30d": outcome.down,
+             "consumer_changed_at": skill.consumer_changed_at,
+             "stats": {"loads_30d": outcome.loads, "up_30d": outcome.up, "down_30d": outcome.down,
                        "completed_30d": outcome.completed, "failed_30d": outcome.failed,
                        "cancelled_30d": outcome.cancelled}}
     if body:

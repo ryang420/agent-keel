@@ -183,3 +183,27 @@ async def test_text_versions_ignore_state_changes(store):
     await store.change_learned_skill("p1", {"action": "revise", "skill_id": skill_id, "expected_version": 3,
                                             "body": "2."}, source=SkillSource("consumer"))
     assert await store.skill_text_versions("p1") == {skill_id: 4}
+
+
+async def test_a_feedback_observation_is_stamped_on_the_content_clock_and_orders_before_a_later_change(store, clock):
+    await profile(store)
+    skill_id = await skill(store)
+    run = await finished_run(store)
+    await store.put_feedback("p1", run.id, "down", "no")
+    [item] = await store.observations("p1")
+    assert item.created_at == clock()
+    clock.now += 10
+    await store.change_learned_skill("p1", {"action": "revise", "skill_id": skill_id, "expected_version": 1,
+                                            "body": "2."}, source=SkillSource("consumer"))
+    changed = (await store.learned_skill("p1", skill_id)).consumer_changed_at
+    assert item.created_at < changed
+
+
+async def test_a_down_rating_after_a_skill_load_records_the_loaded_version_on_the_observation(store):
+    await profile(store)
+    skill_id = await skill(store)
+    run = await finished_run(store)
+    await store.record_skill_load("p1", "s1", run.id, skill_id, 1)
+    await store.put_feedback("p1", run.id, "down", "wrong")
+    [item] = await store.observations("p1")
+    assert item.outcome == "feedback_down" and item.loaded == ((skill_id, 1),)

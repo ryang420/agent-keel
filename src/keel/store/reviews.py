@@ -352,7 +352,7 @@ class ReviewStoreMixin:
                     left = MAX_PER_JOB - await self.review_observation_count(job.profile_id, job.id)
                     for item in observations[:max(0, left)]:
                         await self._insert_observation(job.profile_id, job.session_id, claim.generation, item,
-                                                       now=now, review_job_id=job.id)
+                                                       now=self.clock(), review_job_id=job.id)
             if done:
                 await self._settle_review(row, "done", usage=usage, cursor=(job.source_through, 0))
                 reviewed = job.source_through

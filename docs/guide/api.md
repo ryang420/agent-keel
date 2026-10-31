@@ -306,6 +306,9 @@ and not available yet; nothing consumes them today.
 A learned skill is suspended automatically when its current version has at least 3 `down` ratings in 30 days and more
 `down` than `up`, but only while `learning` is on. The change is recorded as a version with change `suspend` and
 source kind `automatic`; resume it like any suspended skill.
+Resuming writes a new version, and suspension counts only ratings on runs that loaded the current version, so a
+resumed skill is suspended again only after 3 new `down` ratings (and more `down` than `up`) on the resumed version.
+The `stats` still include the earlier ratings, because they cover the whole current text.
 
 ## Run feedback
 

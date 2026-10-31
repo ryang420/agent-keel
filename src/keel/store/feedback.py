@@ -36,7 +36,6 @@ class FeedbackStoreMixin:
                 return None, "not_found", []
             if run["status"] not in TERMINAL:
                 return None, "not_terminal", []
-            now = await self.coordination_now()
             stamp = self.clock()
             previous = await self.db.fetchrow(
                 "SELECT observation_id FROM run_feedback WHERE profile_id = ? AND run_id = ?", profile_id, run_id)
@@ -45,7 +44,7 @@ class FeedbackStoreMixin:
             profile = await self.db.fetchrow("SELECT learning FROM profiles WHERE id = ?", profile_id)
             observation = None
             if profile["learning"]:
-                observation = await self._feedback_observation(profile_id, run, rating, comment, now)
+                observation = await self._feedback_observation(profile_id, run, rating, comment, stamp)
             await self.db.execute(
                 "INSERT INTO run_feedback (profile_id, run_id, session_id, rating, comment, observation_id, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (profile_id, run_id) DO UPDATE "

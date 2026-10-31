@@ -16,8 +16,8 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("run_feedback, skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, learned_skills, "
-              "memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, sandbox_execs, "
+ALL_TABLES = ("run_feedback, skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, "
+              "learned_skills, memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, sandbox_execs, "
               "sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, memory_changes, "
               "memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, tenants, blobs")
 

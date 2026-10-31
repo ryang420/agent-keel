@@ -153,8 +153,8 @@ class WorkerPool:
         return deleted
 
     async def expire_once(self) -> int:
-        """Expire pending observations older than the window, on the database clock they were stamped with."""
-        return await self.store.expire_observations(await self.store.coordination_now() - EXPIRY_SECONDS)
+        """Expire pending observations older than the window, on the store clock they were stamped with."""
+        return await self.store.expire_observations(self.store.clock() - EXPIRY_SECONDS)
 
     async def _maintain(self) -> None:
         """Hourly: delete old run events (when a retention is set) and expire old observations. Passes on several
