@@ -42,7 +42,8 @@ def pick_bodies(observations, skills, limit: int = MAX_BODIES) -> list:
 
 def render(observations, skills, outcomes: dict, bodies, shipped: set[str]) -> str:
     lines = [FRAME, "", "## Pending observations"]
-    lines += [_line({"id": item.id, "session_id": item.session_id, "date": _day(item.created_at),
+    lines += [_line({"id": item.id, "session_id": item.session_id, "evidence": list(item.evidence),
+                     "date": _day(item.created_at),
                      "outcome": item.outcome, "topic": item.topic, "situation": item.situation,
                      "approach": item.approach, "loaded_skills": [skill_id for skill_id, _ in item.loaded]})
               for item in observations]

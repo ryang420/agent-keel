@@ -15,10 +15,8 @@ from keel.compress import message_tokens, text_tokens
 from keel.dream_gates import DreamRules
 from keel.dream_input import pick_bodies, render
 from keel.dream_stage import STAGED, StagedDream
-from keel.models import (Completed, Message, ModelRequest, ReasoningReady, TextDelta, TextPart, ToolCallReady)
-from keel.providers.base import ModelError
-from keel.providers.retry import RETRYABLE, stream_with_retries
-from keel.review import AttemptUsage, JobFailed, keep_lease
+from keel.models import Message, ModelRequest, TextPart
+from keel.review import AttemptUsage, JobFailed, collect, keep_lease, run_attempt
 from keel.tools.base import ToolArgumentError, ToolContext, tool_json
 from keel.tools.history import session_search
 
@@ -67,25 +65,10 @@ class Dreamer:
     async def _attempt(self, claim) -> None:
         """Never raises except on cancellation: every outcome is recorded on the job."""
         state = AttemptUsage(claim.job.attempts)
-        try:
-            async with asyncio.timeout(self.settings.deadline_seconds):
-                await self._dream(claim, state)
-            return
-        except JobFailed as failure:
-            code, message, retry = failure.code, str(failure), failure.retry
-        except TimeoutError:
-            code, message, retry = "deadline", "The dream did not finish in time.", True
-        except ModelError as error:
-            code, message, retry = f"model_{error.code}", str(error), error.code in RETRYABLE
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("dream %s failed", claim.job.id)
-            code, message, retry = "internal", "The dream failed with an internal error.", True
-        try:
-            await self.store.fail_dream(claim, code, message, retry=retry, usage=state.entry(code))
-        except Exception:
-            log.warning("could not record the failure of dream %s", claim.job.id, exc_info=True)
+        await run_attempt(self._dream(claim, state), deadline=self.settings.deadline_seconds, state=state,
+                          fail=lambda code, message, retry, usage: self.store.fail_dream(
+                              claim, code, message, retry=retry, usage=usage),
+                          what=f"dream {claim.job.id}", noun="dream")
 
     async def _dream(self, claim, state: AttemptUsage) -> None:
         job, s = claim.job, self.settings
@@ -128,18 +111,8 @@ class Dreamer:
             request = ModelRequest(provider=job.provider, model=job.model, system=system, messages=tuple(messages),
                                    tools=tools, reasoning_effort="low", max_output_tokens=s.output_tokens,
                                    cache_scope="")
-            calls, said, reasoning = [], [], []
-            cut_off = False
-            async for event in stream_with_retries(provider, request, sleep=self.sleep, context=f"dream {job.id}"):
-                if isinstance(event, TextDelta):
-                    said.append(event.text)
-                elif isinstance(event, ToolCallReady):
-                    calls.append(event.call)
-                elif isinstance(event, ReasoningReady):
-                    reasoning.append(event.item)
-                elif isinstance(event, Completed):
-                    state.usage = state.usage + event.usage
-                    cut_off = cut_off or event.status == "incomplete"
+            calls, said, reasoning, cut_off = await collect(provider, request, sleep=self.sleep,
+                                                            context=f"dream {job.id}", state=state)
             messages.append(Message("assistant", (TextPart("".join(said)),) if said else (), tool_calls=tuple(calls),
                                     reasoning=tuple(reasoning)))
             if cut_off:

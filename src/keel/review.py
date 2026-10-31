@@ -78,6 +78,48 @@ async def keep_lease(attempt: asyncio.Task, renew, lease_seconds: float, what: s
     await attempt
 
 
+async def run_attempt(work, *, deadline: float, state: AttemptUsage, fail, what: str, noun: str) -> None:
+    """Run one attempt's coroutine under its deadline. A failure becomes (code, message, retry), recorded through
+    `fail(code, message, retry, usage)`; only a cancel propagates."""
+    try:
+        async with asyncio.timeout(deadline):
+            await work
+        return
+    except JobFailed as failure:
+        code, message, retry = failure.code, str(failure), failure.retry
+    except TimeoutError:
+        code, message, retry = "deadline", f"The {noun} did not finish in time.", True
+    except ModelError as error:
+        code, message, retry = f"model_{error.code}", str(error), error.code in RETRYABLE
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("%s failed", what)
+        code, message, retry = "internal", f"The {noun} failed with an internal error.", True
+    try:
+        await fail(code, message, retry, state.entry(code))
+    except Exception:
+        log.warning("could not record the failure of %s", what, exc_info=True)
+
+
+async def collect(provider, request, *, sleep, context: str, state: AttemptUsage) -> tuple[list, list, list, bool]:
+    """Stream one request: its tool calls, text parts and reasoning items, and whether it was cut off. Usage is
+    added to the attempt."""
+    calls, text, reasoning = [], [], []
+    cut_off = False
+    async for event in stream_with_retries(provider, request, sleep=sleep, context=context):
+        if isinstance(event, TextDelta):
+            text.append(event.text)
+        elif isinstance(event, ToolCallReady):
+            calls.append(event.call)
+        elif isinstance(event, ReasoningReady):
+            reasoning.append(event.item)
+        elif isinstance(event, Completed):
+            state.usage = state.usage + event.usage
+            cut_off = cut_off or event.status == "incomplete"
+    return calls, text, reasoning, cut_off
+
+
 def chunk_tokens(context_window: int) -> int:
     """New text per attempt: the default, smaller for a model whose window is small."""
     return min(CHUNK_TOKENS, max(500, (context_window - OUTPUT_TOKENS) // 4))
@@ -121,25 +163,10 @@ class MemoryReviewer:
     async def _attempt(self, claim) -> None:
         """Never raises except on cancellation: every outcome is recorded on the job."""
         state = AttemptUsage(claim.job.attempts)
-        try:
-            async with asyncio.timeout(DEADLINE_S):
-                await self._review(claim, state)
-            return
-        except JobFailed as failure:
-            code, message, retry = failure.code, str(failure), failure.retry
-        except TimeoutError:
-            code, message, retry = "deadline", "The review did not finish in time.", True
-        except ModelError as error:
-            code, message, retry = f"model_{error.code}", str(error), error.code in RETRYABLE
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("memory review %s failed", claim.job.id)
-            code, message, retry = "internal", "The review failed with an internal error.", True
-        try:
-            await self.store.fail_review(claim, code, message, retry=retry, usage=state.entry(code))
-        except Exception:
-            log.warning("could not record the failure of memory review %s", claim.job.id, exc_info=True)
+        await run_attempt(self._review(claim, state), deadline=DEADLINE_S, state=state,
+                          fail=lambda code, message, retry, usage: self.store.fail_review(
+                              claim, code, message, retry=retry, usage=usage),
+                          what=f"memory review {claim.job.id}", noun="review")
 
     async def _review(self, claim, state: AttemptUsage) -> None:
         job = claim.job
@@ -194,19 +221,8 @@ class MemoryReviewer:
             request = ModelRequest(provider=job.provider, model=job.model, system=system, messages=tuple(messages),
                                    tools=tools, reasoning_effort="low", max_output_tokens=OUTPUT_TOKENS,
                                    cache_scope="")
-            calls, text, reasoning = [], [], []
-            cut_off = False
-            async for event in stream_with_retries(provider, request, sleep=self.sleep,
-                                                   context=f"memory review {job.id}"):
-                if isinstance(event, TextDelta):
-                    text.append(event.text)
-                elif isinstance(event, ToolCallReady):
-                    calls.append(event.call)
-                elif isinstance(event, ReasoningReady):
-                    reasoning.append(event.item)
-                elif isinstance(event, Completed):
-                    state.usage = state.usage + event.usage
-                    cut_off = cut_off or event.status == "incomplete"
+            calls, text, reasoning, cut_off = await collect(provider, request, sleep=self.sleep,
+                                                            context=f"memory review {job.id}", state=state)
             messages.append(Message("assistant", (TextPart("".join(text)),) if text else (), tool_calls=tuple(calls),
                                     reasoning=tuple(reasoning)))
             if cut_off:

@@ -132,3 +132,25 @@ async def test_learning_turned_off_mid_dream_commits_nothing(store, clock):
     assert await store.learned_skills("p1") == []
     [job] = await store.list_dreams("p1")
     assert (job.status, job.error_code) == ("discarded", "learning_disabled")
+
+
+async def test_a_deadline_overrun_fails_the_attempt_for_a_retry(store, clock):
+    provider = FakeProvider()
+    settings = DreamSettings(deadline_seconds=0.05, rules=DreamRules(min_observations=2))
+    dreamer, _ = await setup(store, clock, provider, settings=settings)
+    provider.script = [[30.0, *DONE]]
+    assert await dreamer.run_once("w1")
+    [job] = await store.list_dreams("p1")
+    assert (job.status, job.error_code) == ("pending", "deadline")
+    assert {o.state for o in await store.observations("p1")} == {"pending"}
+
+
+async def test_a_cut_off_response_commits_nothing_and_retries(store, clock):
+    provider = FakeProvider()
+    dreamer, ids = await setup(store, clock, provider)
+    provider.script = [[*step("dismiss_observation", observation_id=ids[0], reason="noise")[:1],
+                        Completed(Usage(10, 2, 0, 0), status="incomplete")]]
+    assert await dreamer.run_once("w1")
+    [job] = await store.list_dreams("p1")
+    assert (job.status, job.error_code) == ("pending", "incomplete")
+    assert {o.state for o in await store.observations("p1")} == {"pending"}
