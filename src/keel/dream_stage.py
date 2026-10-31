@@ -56,10 +56,14 @@ class StagedDream:
         handlers = {"skill_view": self._view, "create_skill": self._create, "revise_skill": self._revise,
                     "merge_skills": self._merge, "retire_skill": self._retire,
                     "dismiss_observation": self._dismiss}
+        if name not in handlers:
+            return _refusal(f"Unknown tool: {name}.")
         return handlers[name](args)
 
     def _view(self, args: dict) -> tuple[str, bool]:
         name = args.get("name")
+        if not isinstance(name, str):
+            return _refusal("name must be a skill name.")
         if name in self.shipped:
             return _refusal(f"{name} is a deployment skill; its text is not shown here. Do not duplicate it.",
                             "not_found")
@@ -89,6 +93,8 @@ class StagedDream:
         return skill, None
 
     def _invalid(self, fields: dict, excluded: set[str]) -> str | None:
+        if any(not isinstance(value, str) for key, value in fields.items() if key != "category" or value is not None):
+            return "name, description, body and category must be text."
         if reason := check(fields["name"], fields["description"], fields["body"], fields["category"]):
             return reason
         if fields["name"] in self.shipped:
@@ -203,7 +209,7 @@ class StagedDream:
 
     def _dismiss(self, args: dict) -> tuple[str, bool]:
         observation_id, reason = args.get("observation_id"), args.get("reason")
-        if observation_id not in self.observations:
+        if not isinstance(observation_id, str) or observation_id not in self.observations:
             return _refusal("Dismiss only an observation you were given.")
         if observation_id in self.proposal.consumed:
             return _refusal("That observation supports a staged change; it cannot also be dismissed.")

@@ -94,6 +94,23 @@ def test_dismissed_and_cited_observations_exclude_each_other():
     assert dismissed["code"] == "invalid"
 
 
+def test_a_list_argument_is_refused_not_raised():
+    staged = stage()
+    viewed, error = call(staged, "skill_view", name=["weekly-report"])
+    assert error and viewed["code"] == "invalid"
+    dismissed, error = call(staged, "dismiss_observation", observation_id=["o1"], reason="x")
+    assert error and dismissed["code"] == "invalid"
+    created, error = call(staged, "create_skill", name=["csv-cleanup"], description="Clean a CSV export", body="1.",
+                          observations=["o1", "o2"])
+    assert error and created["code"] == "invalid"
+    assert staged.proposal.ops == [] and staged.proposal.dismissed == {}
+
+
+def test_an_unknown_tool_name_is_refused():
+    result, error = call(stage(), "delete_everything")
+    assert error and result["success"] is False and "Unknown tool" in result["error"]
+
+
 def test_skill_view_reads_the_snapshot_including_suspended_skills():
     staged = StagedDream([], [learned("k3", "old-way", "Old", state="suspended")], {"shipped-skill"})
     result, error = call(staged, "skill_view", name="old-way")
