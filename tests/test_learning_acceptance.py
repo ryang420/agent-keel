@@ -22,6 +22,7 @@ import asyncio
 import json
 
 from keel.dream import Dreamer
+from keel.dream_stage import DreamProposal
 from keel.providers.fake import FakeProvider
 from keel.store.base import SkillSource
 
@@ -179,6 +180,10 @@ async def test_a_foreground_revise_during_a_dream_discards_it_and_the_retry_uses
     current = await store.learned_skill("p1", skill["id"])
     assert (current.version, current.body) == (3, "1. Dream text.")
     assert (await store.list_dreams("p1"))[0].status == "done"
+    versions = await store.learned_skill_versions("p1", skill["id"])
+    assert [(v.version, v.source_kind) for v in versions] == [(1, "dream"), (2, "foreground"), (3, "dream")]
+    retry_input = " ".join(m.text for m in model.requests[2].messages)  # the retry's first request: current state
+    assert "1. Foreground text." in retry_input
 
 
 async def test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_one(store, clock):
@@ -189,6 +194,14 @@ async def test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_o
     fields = {k: v for k, v in CSV.items() if k != "action"}
     create = step("create_skill", **fields, observations=ids, rationale="twice")
     hanging = FakeProvider(script=[create, ["hang"]])
+    claims = []
+    claim_dream = store.claim_dream
+
+    async def recording(*args, **kwargs):
+        claims.append(await claim_dream(*args, **kwargs))
+        return claims[-1]
+
+    store.claim_dream = recording
     task = asyncio.create_task(Dreamer(store, registry(hanging), FORCE, sleep=no_sleep).run_once("w1"))
     for _ in range(200):
         if len(hanging.requests) >= 2:
@@ -207,3 +220,6 @@ async def test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_o
     assert len(await store.learned_skills("p1")) == 1
     [version] = await store.learned_skill_versions("p1", (await store.learned_skills("p1"))[0].id)
     assert version.version == 1
+    committed = [claim for claim in claims if claim is not None][-1]
+    assert await store.commit_dream(committed, DreamProposal(), usage=None) == "lost"  # a spent claim commits nothing
+    assert [(s.version, s.name) for s in await store.learned_skills("p1")] == [(1, "csv-export")]
