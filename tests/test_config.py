@@ -197,3 +197,10 @@ def test_sandbox_reap_timeout_has_finite_positive_default_and_override():
     for bad in ("0", "-1", "nan", "inf", "86400.5", "1e300"):
         with pytest.raises(ValueError, match="KEEL_SANDBOX_REAP_SECONDS"):
             Settings.from_env({**BASE, "KEEL_SANDBOX_REAP_SECONDS": bad})
+
+
+def test_the_command_timeout_cap_defaults_to_an_hour_and_must_be_positive():
+    assert Settings.from_env(BASE).command_timeout_max_s == 3600
+    assert Settings.from_env({**BASE, "KEEL_COMMAND_TIMEOUT_MAX_S": "7200"}).command_timeout_max_s == 7200
+    with pytest.raises(ValueError, match="KEEL_COMMAND_TIMEOUT_MAX_S"):
+        Settings.from_env({**BASE, "KEEL_COMMAND_TIMEOUT_MAX_S": "0"})

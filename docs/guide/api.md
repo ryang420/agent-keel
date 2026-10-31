@@ -50,7 +50,7 @@ Errors have one shape, with a machine-readable code:
 }
 ```
 
-- `models`: the provider and model pairs runs may use.
+- `models`: the provider and model pairs runs may use. It may be empty for a profile that only starts command runs.
 - `sandbox`: the policy; see [sandbox.md](sandbox.md). Empty or missing means the sandbox tools are not offered.
 - `soul`: text that replaces the default identity ("You are a helpful assistant.") in the system prompt. A session builds its system prompt once, at its first run, so a changed `soul` or `skills` list applies to new sessions.
 - `skills`: the names of the skills to enable.
@@ -98,12 +98,44 @@ clears it, and enabling or clearing a sandbox counts as a change.
 The response (202): `{"run_id": "…", "status": "queued", "session_id": "…"}`. A fast worker may already have
 claimed the run, in which case `status` is `running`.
 
+## Starting a command run
+
+`POST /v1/profiles/{profile_id}/runs` with `"kind": "command"` runs one command in the profile's sandbox without a
+model:
+
+```json
+{
+  "kind": "command",
+  "session_id": "job-1",
+  "command": {"argv": ["python3", "job.py"], "cwd": "/work/jobs/1", "timeout_s": 1800, "env": {"MODE": "full"}}
+}
+```
+
+- `kind` is `"model"` (the default) or `"command"`. A command run takes no `provider`, `model`, `input`,
+  `instructions`, `reasoning_effort` or `file_context`; sending any of them is 400 `invalid_input`, as is a
+  `command` on a model run.
+- The profile needs a sandbox. Its `models` may be empty.
+- `argv`: 1 to 64 strings, at most 16,384 bytes (UTF-8) in total, the first not empty, without NUL. They are passed
+  as given, never through a shell.
+- `cwd`: an absolute path at or under the sandbox `workdir`. The command starts there; if the directory does not
+  exist, the command exits with code 125.
+- `timeout_s`: a number from 1 to `KEEL_COMMAND_TIMEOUT_MAX_S` (default 3600).
+- `env`: optional, with the rules of `sandbox.env`. It is set over the policy's `env` for this command only.
+- One run per session, `KEEL_MAX_RUNNING`, tenant checks and stop work as for a model run. A command run adds no
+  messages to its session and does not title it.
+
+The response is a model run's. The run completes when the command exits with 0, with the last 50,000 characters of
+its output (stdout and stderr merged) as `output`. A non-zero exit fails it with `command_failed`, a timeout with
+`command_timed_out`, and a cleanup the sandbox could not confirm with `sandbox_uncertain`; a failed run keeps the
+output tail too. Its `usage` is all zero.
+
 ## Run
 
-`run_id`, `status` (`queued`, `running`, `stopping`, `completed`, `failed`, `cancelled`), `session_id`,
-`provider`, `model`, `reasoning_effort`, `output` (the final text), `usage`
-(`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`; null when unknown), `error_code`,
-`error`, `created_at`, `started_at`, `finished_at`.
+`run_id`, `status` (`queued`, `running`, `stopping`, `completed`, `failed`, `cancelled`), `session_id`, `kind`
+(`model` or `command`), `provider`, `model` (both null for a command run), `reasoning_effort`, `output` (the final
+text), `usage` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`; null when unknown),
+`error_code`, `error`, `created_at`, `started_at`, `finished_at`, and for a command run `command` (as normalised when
+it was started).
 
 Stopping a queued run cancels it at once, and its `run.cancelled` event is committed with the cancellation.
 Stopping a running run moves it to `stopping`; the worker ends it as `cancelled` and kills its running command.
@@ -126,10 +158,12 @@ below. Events are stored: pass `after=<last seq>` to resume without losing or re
 
 | Event | Fields |
 |---|---|
-| `run.started` | `provider`, `model`, `reasoning_effort` |
+| `run.started` | `provider`, `model`, `reasoning_effort`; for a command run only `kind: "command"` |
 | `message.delta` | `text`: a piece of the model's answer |
 | `tool.started` | `tool_call_id`, `tool`, `preview` |
 | `tool.completed` | `tool_call_id`, `tool`, `duration_s`, `error` (boolean), `preview` |
+| `command.started` | `argv`, `cwd` (command runs) |
+| `command.completed` | `exit_code`, `timed_out`, `duration_s`, `output` (the last 50,000 characters). Not sent when the run is stopped or its cleanup could not be confirmed. |
 | `context.compacted` | `messages_before`, `messages_after`, `tokens_before`, `tokens_after` (estimates), `usage` (the summary call's; it is also counted in the run's `usage`) |
 | `run.completed` | `output`, `usage`, and `incomplete: true` when the model reported an incomplete response |
 | `run.failed` | `error_code`, `message` |
@@ -235,5 +269,8 @@ A failed run reports its cause in `error_code` (on the run and in `run.failed`):
 | `invalid_reasoning` | A provider refused replayed reasoning. keel retries once without it. |
 | `bad_request` | The provider refused the request. |
 | `sandbox_unavailable` | The sandbox policy is invalid, or its container could not be created or reached. |
+| `command_failed` | A command run's command exited with a non-zero code. |
+| `command_timed_out` | A command run's command ran past its `timeout_s` and was killed. |
+| `sandbox_uncertain` | The sandbox could not confirm that a command run's command and its processes ended; the sandbox is held for recovery. |
 | `worker_lost` | The worker stopped renewing the run's lease, or the service shut down while it ran. |
 | `internal_error` | An unexpected failure inside the run. |

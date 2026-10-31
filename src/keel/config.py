@@ -151,6 +151,7 @@ class Settings:
     lease_seconds: float = 30.0
     aws_region: str = "us-east-1"
     max_iterations: int = 60
+    command_timeout_max_s: int = 3600
     compression_threshold: float = 0.75
     event_retention_days: int = 7
     background_limit: int = 4
@@ -218,6 +219,7 @@ class Settings:
             lease_seconds=_positive_float(env, "KEEL_LEASE_SECONDS", 30.0),
             aws_region=(env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1").strip(),
             max_iterations=_positive_int(env, "KEEL_MAX_ITERATIONS", 60),
+            command_timeout_max_s=_positive_int(env, "KEEL_COMMAND_TIMEOUT_MAX_S", 3600),
             compression_threshold=_fraction(env, "KEEL_COMPRESSION_THRESHOLD", 0.75),
             event_retention_days=_positive_int(env, "KEEL_EVENT_RETENTION_DAYS", 7),
             background_limit=_positive_int(env, "KEEL_BACKGROUND_LIMIT", 4),

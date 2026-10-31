@@ -39,7 +39,8 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
 
     settings = Settings(credentials=(ServiceCredential(1, "k"),),
                         database_url=f"sqlite:///{tmp_path / 'k.db'}", sandbox="none",
-                        compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3)
+                        compression_threshold=0.5, memory_chars=100, user_chars=50, memory_review_turns=3,
+                        command_timeout_max_s=120)
     keel, pool, closables, backend = await build(settings)
     try:
         assert backend is None and keel.executor.coordinator is None and pool.coordinator is None
@@ -48,6 +49,7 @@ async def test_the_service_starts_without_a_sandbox_backend(tmp_path):
         assert (keel.executor.memory_chars, keel.executor.user_chars, keel.executor.memory_review_turns) == (
             100, 50, 3)
         assert pool.event_retention_s == 7 * 86_400
+        assert keel.command_timeout_max_s == 120
     finally:
         for item in closables:
             close = getattr(item, "aclose", None) or getattr(item, "close")

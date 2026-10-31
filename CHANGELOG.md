@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Command runs: `POST /v1/profiles/{p}/runs` with `"kind": "command"` and `command: {argv, cwd, timeout_s, env}`
+  runs one argv in the profile's sandbox without a model (a profile with no models can start one), under the same
+  supervisor, leases, session rule and stop as a model run. Its `output` is the last 50,000 characters of the
+  command's output and its usage is zero. Exit 0 completes the run; a non-zero exit, a timeout, an unconfirmed
+  cleanup or a missing sandbox fails it as `command_failed`, `command_timed_out`, `sandbox_uncertain` or
+  `sandbox_unavailable`. New events `command.started` and `command.completed`; runs report `kind`, and command runs
+  their `command`. `KEEL_COMMAND_TIMEOUT_MAX_S` (default 3600) caps `timeout_s`.
+
 ### Changed
 
 - Schema version 8: `runs.kind` (`model` or `command`) and `runs.command`; `runs.provider` and `runs.model` may be

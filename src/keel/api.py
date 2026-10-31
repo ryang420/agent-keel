@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from keel.commands import CommandError, parse_command
 from keel.config import tenant_id_for
 from keel.deletion import (
     ProfileDeletionBusyError, ProfileDeletionService, ProfileDeletionUnavailableError,
@@ -38,6 +39,8 @@ IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_B64_CHARS = (MAX_IMAGE_BYTES + 2) // 3 * 4  # the longest base64 text a permitted image can have
+# A command run has no model: these model-run fields are refused rather than ignored.
+_MODEL_FIELDS = ("provider", "model", "input", "instructions", "reasoning_effort", "file_context")
 
 
 @dataclass
@@ -51,6 +54,7 @@ class Keel:
     sandbox_mount_root: str | None = None
     background: object = None
     coordinator: object = None
+    command_timeout_max_s: int = 3600
 
 
 class ApiError(Exception):
@@ -84,11 +88,16 @@ async def _json_body(request: Request) -> dict:
 
 
 def run_json(run) -> dict:
-    """Serialize a stored run's identity, status, output, usage, errors and timestamps."""
-    return {"run_id": run.id, "status": run.status, "session_id": run.session_id, "provider": run.provider,
+    """Serialize a stored run's identity, kind, status, output, usage, errors and timestamps (and a command run's
+    command)."""
+    body = {"run_id": run.id, "status": run.status, "session_id": run.session_id, "provider": run.provider,
             "model": run.model, "reasoning_effort": run.reasoning_effort, "output": run.output,
             "usage": run.usage.to_dict(), "error_code": run.error_code, "error": run.error,
-            "created_at": run.created_at, "started_at": run.started_at, "finished_at": run.finished_at}
+            "created_at": run.created_at, "started_at": run.started_at, "finished_at": run.finished_at,
+            "kind": run.kind}
+    if run.command is not None:
+        body["command"] = run.command
+    return body
 
 
 def message_json(stored) -> dict:
@@ -115,6 +124,12 @@ def _sse_frame(event) -> str:
     """Serialize one stored event as an SSE frame, preserving the existing payload and cursor fields."""
     payload = {**event.data, "seq": event.seq, "type": event.type, "run_id": event.run_id, "at": event.at}
     return f"id: {event.seq}\nevent: {event.type}\ndata: {json.dumps(payload)}\n\n"
+
+
+def _workdir(profile) -> str | None:
+    """The profile's sandbox workdir, or None for a profile without a sandbox."""
+    workdir = profile.sandbox.get("workdir") if profile.sandbox else None
+    return workdir if isinstance(workdir, str) else None
 
 
 def _input_parts(body: dict) -> list[dict]:
@@ -382,9 +397,50 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         return {"id": profile.id, "models": profile.models, "sandbox": profile.sandbox, "soul": profile.soul,
                 "skills": profile.skills, "memory": profile.memory, "updated_at": profile.updated_at}
 
+    async def start_command_run(request: Request, profile_id: str, body: dict):
+        """Queue a command run: one command in the profile's sandbox, without a model. Tenant, session, capacity and
+        guard checks are a model run's; the model checks are replaced by the command's."""
+        keel_ = k(request)
+        profile = await profile_or_404(request, profile_id)
+        sent = [field for field in _MODEL_FIELDS if field in body]
+        if sent:
+            raise ApiError(400, "invalid_input", f"A command run takes no {sent[0]}.")
+        try:
+            command = parse_command(body.get("command"), workdir=_workdir(profile),
+                                    max_timeout_s=keel_.command_timeout_max_s)
+        except CommandError as exc:
+            raise ApiError(400, "invalid_input", str(exc)) from exc
+        session_id = _check_id(body.get("session_id") or f"ses_{uuid.uuid4().hex}", "session_id")
+        existing = await keel_.store.get_session(profile_id, session_id)
+        if existing is not None and await keel_.store.active_run_for_session(session_id) is not None:
+            raise ApiError(409, "session_busy", "This session already has a run in progress.")
+        if await keel_.store.count_in_flight() >= keel_.max_running:
+            return JSONResponse({"error": {"code": "at_capacity", "message": "Too many runs in progress."}},
+                                status_code=429, headers={"Retry-After": "1"})
+        try:
+            await keel_.store.ensure_session(profile_id, session_id)
+        except SessionNotFound:
+            raise ApiError(404, "session_not_found", "No such session.")
+        try:
+            async with keel_.store.profile_guard(profile_id) as exists:
+                # Checked again under the guard against the profile as it is now, as a model run's model is.
+                current = await keel_.store.get_profile(profile_id) if exists else None
+                if current is None or current.tenant_id != request.state.tenant_id:
+                    raise ApiError(404, "profile_not_found", "No such profile.")
+                try:
+                    parse_command(command, workdir=_workdir(current), max_timeout_s=keel_.command_timeout_max_s)
+                except CommandError as exc:
+                    raise ApiError(400, "invalid_input", str(exc)) from exc
+                run = await keel_.store.create_command_run(profile_id=profile_id, session_id=session_id,
+                                                           command=command)
+        except SessionBusy as exc:
+            raise ApiError(409, "session_busy", "This session already has a run in progress.") from exc
+        return {"run_id": run.id, "status": run.status, "session_id": session_id}
+
     @app.post("/v1/profiles/{profile_id}/runs", status_code=202)
     async def start_run(request: Request, profile_id: str):
-        """Queue a run and return its run_id, status and session_id with HTTP 202.
+        """Queue a model run, or with kind "command" a command run, and return its run_id, status and session_id
+        with HTTP 202.
 
         Validate the selected model and text/image input, creating a session when needed and
         storing images as blobs. Reject busy sessions with 409 and capacity exhaustion with 429.
@@ -392,6 +448,13 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         """
         keel_ = k(request)
         body = await _json_body(request)
+        kind = "model" if body.get("kind") is None else body["kind"]
+        if kind not in ("model", "command"):
+            raise ApiError(400, "invalid_input", "kind must be 'model' or 'command'.")
+        if kind == "command":
+            return await start_command_run(request, profile_id, body)
+        if "command" in body:
+            raise ApiError(400, "invalid_input", "command is only accepted with kind 'command'.")
         profile = await profile_or_404(request, profile_id)
         provider, model = body.get("provider"), body.get("model")
         if {"provider": provider, "model": model} not in profile.models:
