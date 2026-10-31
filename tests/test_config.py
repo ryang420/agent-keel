@@ -211,6 +211,13 @@ def test_sqlite_database_urls_are_rejected(url):
         Settings.from_env({**BASE, "KEEL_DATABASE_URL": url})
 
 
+def test_the_command_timeout_cap_defaults_to_an_hour_and_must_be_positive():
+    assert Settings.from_env(BASE).command_timeout_max_s == 3600
+    assert Settings.from_env({**BASE, "KEEL_COMMAND_TIMEOUT_MAX_S": "7200"}).command_timeout_max_s == 7200
+    with pytest.raises(ValueError, match="KEEL_COMMAND_TIMEOUT_MAX_S"):
+        Settings.from_env({**BASE, "KEEL_COMMAND_TIMEOUT_MAX_S": "0"})
+
+
 def test_dream_settings_default_to_the_spec_and_parse_from_the_environment():
     base = Settings.from_env(BASE)
     assert (base.dream_iterations, base.dream_input_tokens, base.dream_output_tokens, base.dream_deadline_seconds,

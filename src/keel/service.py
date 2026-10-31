@@ -86,7 +86,8 @@ async def build(settings: Settings, *, providers: ProviderRegistry | None = None
                       review_workers=settings.memory_review_workers)
     keel = Keel(store=store, bus=bus, providers=registry, executor=executor, credentials=settings.credentials,
                 max_running=settings.max_running, sandbox_mount_root=settings.sandbox_mount_root,
-                background=background, coordinator=coordinator)
+                background=background, coordinator=coordinator,
+                command_timeout_max_s=settings.command_timeout_max_s)
     return keel, pool, closables, coordinator
 
 

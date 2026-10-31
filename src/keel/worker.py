@@ -196,7 +196,7 @@ class WorkerPool:
         return await self.store.backfill_history(BACKFILL_BATCH)
 
     async def _backfill(self) -> None:
-        """Index history older than migration 9, a batch at a time, until none is left; then check twice a minute.
+        """Index history older than migration 10, a batch at a time, until none is left; then check twice a minute.
         Instances may overlap: each batch runs under the profile lock and indexing is idempotent."""
         while not self._closing:
             try:

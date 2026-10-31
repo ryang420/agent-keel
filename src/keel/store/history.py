@@ -1,5 +1,5 @@
 """History search index (cross-session memory design §3): written with each message, read only through ownership
-checks, and backfilled for messages older than migration 9."""
+checks, and backfilled for messages older than migration 10."""
 
 from __future__ import annotations
 
