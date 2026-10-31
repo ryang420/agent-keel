@@ -25,6 +25,7 @@ from keel.store.learned import LearnedSkillStoreMixin
 from keel.store.memory import MemoryStoreMixin
 from keel.store.observations import ObservationStoreMixin
 from keel.store.migrations import migrate
+from keel.store.dreams import DreamStoreMixin
 from keel.store.reviews import ReviewStoreMixin
 from keel.store.sandboxes import SandboxStoreMixin
 from keel.store.deletions import ProfileDeletionAuthority, ProfileDeletionStoreMixin
@@ -83,7 +84,7 @@ def _event(row: dict) -> Event:
 
 
 class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin,
-               ObservationStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
+               ObservationStoreMixin, ReviewStoreMixin, DreamStoreMixin, SandboxStoreMixin,
                ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
