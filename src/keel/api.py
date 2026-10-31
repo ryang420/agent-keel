@@ -324,10 +324,12 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.put("/v1/profiles/{profile_id}")
     async def put_profile(request: Request, profile_id: str):
-        """Create or replace a profile's models, sandbox policy, persona, memory flag and enabled skills.
+        """Create or replace a profile's models, sandbox policy, persona, memory and learning flags and enabled
+        skills.
 
-        Omitted fields reset to empty values, and an omitted memory flag is false. Validate the body and sandbox
-        policy before saving, returning 400 invalid_input on invalid configuration and the saved profile on success.
+        Omitted fields reset to empty values, and an omitted memory or learning flag is false. Validate the body and
+        sandbox policy before saving, returning 400 invalid_input on invalid configuration and the saved profile on
+        success.
         A change of the effective sandbox policy while the profile has runs in progress or unreleased sandbox work is
         409 sandbox_busy, and nothing is applied.
         """
@@ -337,7 +339,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         if not isinstance(models, list):
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
         skills, sandbox, soul = body.get("skills"), body.get("sandbox"), body.get("soul")
-        memory = body.get("memory", False)
+        memory, learning = body.get("memory", False), body.get("learning", False)
         skills = [] if skills is None else skills
         sandbox = {} if sandbox is None else sandbox
         soul = "" if soul is None else soul
@@ -355,6 +357,10 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(400, "invalid_input", "soul must be a string.")
         if not isinstance(memory, bool):
             raise ApiError(400, "invalid_input", "memory must be a boolean.")
+        if not isinstance(learning, bool):
+            raise ApiError(400, "invalid_input", "learning must be a boolean.")
+        if learning and not memory:
+            raise ApiError(400, "invalid_input", "learning requires memory.")
         if not all(isinstance(m, dict) and m.get("provider") and m.get("model") for m in models):
             raise ApiError(400, "invalid_input", "models must be a list of {'provider', 'model'}.")
         store = k(request).store
@@ -393,11 +399,13 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
                 try:
                     profile = await store.upsert_profile(
                         profile_id, models=[{"provider": m["provider"], "model": m["model"]} for m in models],
-                        sandbox=sandbox, soul=soul, skills=skills, memory=memory, tenant_id=request.state.tenant_id)
+                        sandbox=sandbox, soul=soul, skills=skills, memory=memory,
+                        learning=learning, tenant_id=request.state.tenant_id)
                 except ProfileTenantMismatch:
                     raise ApiError(404, "profile_not_found", "No such profile.")
         return {"id": profile.id, "models": profile.models, "sandbox": profile.sandbox, "soul": profile.soul,
-                "skills": profile.skills, "memory": profile.memory, "updated_at": profile.updated_at}
+                "skills": profile.skills, "memory": profile.memory, "learning": profile.learning,
+                "updated_at": profile.updated_at}
 
     @app.post("/v1/profiles/{profile_id}/runs", status_code=202)
     async def start_run(request: Request, profile_id: str):

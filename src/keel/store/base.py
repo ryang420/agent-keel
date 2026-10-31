@@ -80,6 +80,7 @@ class Profile:
     memory: bool = False
     tenant_id: int | None = None
     incarnation: str | None = None
+    learning: bool = False
 
 
 @dataclass(frozen=True)

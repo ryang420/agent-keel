@@ -36,7 +36,8 @@ def _j(value) -> str:
 def _profile(row: dict) -> Profile:
     return Profile(id=row["id"], models=json.loads(row["models"]), sandbox=json.loads(row["sandbox"]),
                    soul=row["soul"], skills=json.loads(row["skills"]), updated_at=row["updated_at"],
-                   memory=bool(row["memory"]), tenant_id=row["tenant_id"], incarnation=row.get("incarnation"))
+                   memory=bool(row["memory"]), tenant_id=row["tenant_id"], incarnation=row.get("incarnation"),
+                   learning=bool(row["learning"]))
 
 
 def _session(row: dict) -> Session:
@@ -118,23 +119,25 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, ReviewStoreMixin, SandboxSto
     # profiles
 
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
-                             skills: list[str], memory: bool = False, tenant_id: int | None = None) -> Profile:
+                             skills: list[str], memory: bool = False, learning: bool = False,
+                             tenant_id: int | None = None) -> Profile:
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             await self.assert_profile_writable(profile_id)
             incarnation = uuid.uuid4().hex
             previous = await self.db.fetchrow("SELECT memory FROM profiles WHERE id = ?", profile_id)
             written = await self.db.fetchrow(
-            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id, incarnation) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, learning, tenant_id, "
+            "incarnation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET models = excluded.models, sandbox = excluded.sandbox, "
             "soul = excluded.soul, skills = excluded.skills, updated_at = excluded.updated_at, "
-            "memory = excluded.memory, tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id), "
+            "memory = excluded.memory, learning = excluded.learning, "
+            "tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id), "
             "incarnation = COALESCE(profiles.incarnation, excluded.incarnation) "
             "WHERE excluded.tenant_id IS NULL OR profiles.tenant_id IS NULL "
             "OR profiles.tenant_id = excluded.tenant_id RETURNING id",
-                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), tenant_id,
-                incarnation)
+                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), int(learning),
+                tenant_id, incarnation)
             if written is not None and memory and (previous is None or not previous["memory"]):
                 await self._restart_reviews(profile_id)
         saved = await self.get_profile(profile_id)
