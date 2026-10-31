@@ -80,6 +80,7 @@ class Profile:
     memory: bool = False
     tenant_id: int | None = None
     incarnation: str | None = None
+    learning: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,54 @@ class ReviewClaim:
     token: str
     generation: str
     profile_incarnation: str
+
+
+@dataclass(frozen=True)
+class SkillSource:
+    """Who changed a learned skill. Set from trusted context, never from model arguments."""
+    kind: str  # "foreground", "dream", "consumer" or "automatic"
+    run_id: str | None = None
+    session_id: str | None = None
+    message_id: int | None = None
+    tool_call_id: str | None = None
+    job_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LearnedSkill:
+    id: str
+    name: str
+    description: str
+    category: str | None
+    body: str
+    version: int
+    state: str  # "active", "suspended" or "retired"
+    origin: str  # "foreground", "dream" or "consumer"
+    consumer_changed_at: float | None
+    created_at: float
+    updated_at: float
+
+    def summary(self) -> dict:
+        return {"id": self.id, "name": self.name, "description": self.description, "category": self.category,
+                "state": self.state, "version": self.version}
+
+
+@dataclass(frozen=True)
+class LearnedSkillVersion:
+    version: int
+    name: str
+    description: str
+    category: str | None
+    body: str
+    change: str
+    source_kind: str
+    run_id: str | None
+    session_id: str | None
+    job_id: str | None
+    rationale: str | None
+    created_at: float
+    message_ids: tuple[int, ...]
+    observation_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)

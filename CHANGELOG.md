@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Learned skills (schema migration 11): a profile with the new `learning` flag (which requires `memory`) keeps
+  versioned, text-only skills with provenance and evidence. The `skill_manage` tool creates, revises and retires them
+  at the user's explicit request, `skills_list` and `skill_view` show active ones under `learned`, the prompt index
+  lists them from the next session, and `GET`, `POST`, `PATCH` and `DELETE /v1/profiles/{p}/skills/learned…` let a
+  consumer inspect, edit, roll back, suspend, resume and retire them.
 - Durable background memory review (schema migration 10): a completed run marks its session's new text, which is
   reviewed after 10 completed runs, a minute idle, or ten minutes of activity, by a worker loop with database leases,
   one review per profile at a time, staged edits committed atomically with the job, and bounded retries.

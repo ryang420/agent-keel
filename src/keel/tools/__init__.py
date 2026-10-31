@@ -7,7 +7,7 @@ import json
 import logging
 
 from keel.sandbox.base import SandboxError
-from keel.tools import files, history, memory, shell, skill_tools  # noqa: F401  (registers their tools)
+from keel.tools import files, history, learning, memory, shell, skill_tools  # noqa: F401  (registers their tools)
 from keel.tools.base import (
     HANDLERS, MAX_TOOL_RESULT_CHARS, NEEDS_SANDBOX, ToolArgumentError, ToolContext, ToolOutcome, cap_json_result,
     error_result,

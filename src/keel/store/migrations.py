@@ -270,10 +270,54 @@ CREATE INDEX memory_review_jobs_due ON memory_review_jobs (status, next_attempt_
 CREATE INDEX memory_review_jobs_profile ON memory_review_jobs (profile_id, created_at)
 """
 
+# Procedural learning (learning design §2, §3): the profile switch, profile-private learned skills with an immutable
+# version per change, the evidence each version cites, lesson observations (written by skill_manage now, by review
+# and feedback later) and the learned skills each run loaded.
+_V11 = """
+ALTER TABLE profiles ADD COLUMN learning INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE learned_skills (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, category TEXT,
+    body TEXT NOT NULL, version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'suspended', 'retired')),
+    origin TEXT NOT NULL CHECK (origin IN ('foreground', 'dream', 'consumer')),
+    consumer_changed_at {real}, created_at {real} NOT NULL, updated_at {real} NOT NULL);
+CREATE UNIQUE INDEX learned_skills_name ON learned_skills (profile_id, name) WHERE state <> 'retired';
+CREATE INDEX learned_skills_profile ON learned_skills (profile_id, state);
+CREATE TABLE learned_skill_versions (
+    profile_id TEXT NOT NULL, skill_id TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL,
+    description TEXT NOT NULL, category TEXT, body TEXT NOT NULL,
+    change TEXT NOT NULL CHECK (change IN ('create', 'revise', 'merge', 'retire', 'rollback', 'suspend', 'resume')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('foreground', 'dream', 'consumer', 'automatic')),
+    run_id TEXT, session_id TEXT, tool_call_id TEXT, job_id TEXT, rationale TEXT, created_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, skill_id, version));
+CREATE INDEX learned_skill_versions_session ON learned_skill_versions (profile_id, session_id);
+CREATE TABLE learned_skill_evidence (
+    profile_id TEXT NOT NULL, skill_id TEXT NOT NULL, version INTEGER NOT NULL, session_id TEXT NOT NULL,
+    message_id {bigint}, observation_id TEXT);
+CREATE INDEX learned_skill_evidence_version ON learned_skill_evidence (profile_id, skill_id, version);
+CREATE INDEX learned_skill_evidence_session ON learned_skill_evidence (profile_id, session_id);
+CREATE TABLE lesson_observations (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, generation TEXT NOT NULL,
+    topic TEXT NOT NULL, situation TEXT NOT NULL, approach TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('worked', 'failed', 'corrected', 'requested', 'feedback_up',
+                                             'feedback_down')),
+    evidence TEXT NOT NULL DEFAULT '[]', loaded TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL CHECK (state IN ('pending', 'consumed', 'dismissed', 'expired')),
+    consumed_by TEXT, created_at {real} NOT NULL);
+CREATE INDEX lesson_observations_profile ON lesson_observations (profile_id, state, created_at);
+CREATE INDEX lesson_observations_session ON lesson_observations (profile_id, session_id);
+CREATE TABLE skill_loads (
+    profile_id TEXT NOT NULL, run_id TEXT NOT NULL, session_id TEXT NOT NULL, skill_id TEXT NOT NULL,
+    version INTEGER NOT NULL, loaded_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, run_id, skill_id));
+CREATE INDEX skill_loads_skill ON skill_loads (profile_id, skill_id, loaded_at);
+CREATE INDEX skill_loads_session ON skill_loads (profile_id, session_id)
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
     Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9),
-    Migration(10, _V10))
+    Migration(10, _V10), Migration(11, _V11))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

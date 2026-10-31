@@ -5,6 +5,7 @@ from pathlib import Path
 from keel import prompts
 
 PROMPTS = Path(prompts.__file__).parent
+KEEL_OWN = {"skill_manage.json", "learning.md"}  # keel's own texts, which may name skill_manage
 FORBIDDEN = [r"[Hh]ermes", r"skill_manage", r"web_search", r"vision_analyze", r"background=true", r"\bpty\b",
              r"\bnotify\b", r"heartbeat", r"persistent session kernel"]
 
@@ -40,10 +41,12 @@ def test_memory_is_not_among_the_default_tools():
 
 def test_texts_mention_nothing_keel_lacks():
     files = list(PROMPTS.glob("*.md")) + list((PROMPTS / "tools").glob("*.json"))
-    assert len(files) == 24
+    assert len(files) == 26
     for path in files:
         content = path.read_text(encoding="utf-8")
         for pattern in FORBIDDEN:
+            if path.name in KEEL_OWN and pattern == "skill_manage":
+                continue  # keel's own text, like memory.json
             assert not re.search(pattern, content), f"{path.name} mentions {pattern}"
 
 

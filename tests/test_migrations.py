@@ -16,7 +16,8 @@ from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schem
 from keel.store.ownership import require_tenant_ownership
 
 COORDINATION_TABLES = {"sandboxes", "sandbox_uses", "sandbox_execs", "sandbox_operations"}
-ALL_TABLES = ("memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, sandbox_execs, "
+ALL_TABLES = ("skill_loads, lesson_observations, learned_skill_evidence, learned_skill_versions, learned_skills, "
+              "memory_review_jobs, memory_reviews, history_backfill, message_tokens, message_search, sandbox_execs, "
               "sandbox_operations, sandbox_uses, sandboxes, schema_version, memory_mutations, memory_changes, "
               "memory_revisions, memory_entries, run_events, runs, messages, sessions, profiles, tenants, blobs")
 
@@ -95,6 +96,20 @@ async def restore_legacy_memories(db) -> None:
         await db.execute(f"DROP TABLE {table}")
     await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
+
+
+async def restore_pre_learning(db) -> None:
+    """Undo migration 11 on a database that is being rewound to an older schema version."""
+    for table in ("skill_loads", "lesson_observations", "learned_skill_evidence", "learned_skill_versions",
+                  "learned_skills"):
+        await db.execute(f"DROP TABLE {table}")
+    await db.execute("ALTER TABLE profiles DROP COLUMN learning")
+
+
+async def insert_old_profile(db, profile_id: str, tenant_id: int) -> None:
+    """Write a profile row into a database older than migration 11, which `upsert_profile` can no longer reach."""
+    await db.execute("INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id, "
+                     "incarnation) VALUES (?, '[]', '{}', '', '[]', 1.0, 0, ?, ?)", profile_id, tenant_id, "inc")
 
 
 async def restore_pre_review_queue(db) -> None:
@@ -416,6 +431,7 @@ async def test_migration_4_keeps_existing_profiles_unowned(db_url):
     store = await open_store(db_url)
     await store.upsert_profile("p1", models=[], sandbox={}, soul="kept", skills=[])
     await store.db.execute("UPDATE schema_version SET version = 3")
+    await restore_pre_learning(store.db)
     await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
@@ -473,6 +489,7 @@ async def test_a_v4_database_gains_the_coordination_tables(db_url):
     for table in ("sandbox_execs", "sandbox_operations", "sandbox_uses", "sandboxes"):
         await store.db.execute(f"DROP TABLE {table}")
     await store.db.execute("UPDATE schema_version SET version = 4")
+    await restore_pre_learning(store.db)
     await restore_pre_review_queue(store.db)
     await restore_pre_history_index(store.db)
     await restore_legacy_memories(store.db)
@@ -626,7 +643,7 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
     monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:7])
     monkeypatch.setattr(migrations, "LATEST_VERSION", 7)
     store = await open_store(db_url)
-    await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[], tenant_id=1)
+    await insert_old_profile(store.db, "p1", 1)
     await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
                            "p1", "user", json.dumps(["likes tea", "likes tea", "works late"]), 5.0)
     await store.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
@@ -656,7 +673,7 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
     monkeypatch.setattr(migrations, "LATEST_VERSION", 8)
     store = await open_store(db_url)
     for profile in ("p1", "p2"):
-        await store.upsert_profile(profile, models=[], sandbox={}, soul="", skills=[], tenant_id=1)
+        await insert_old_profile(store.db, profile, 1)
         await store.ensure_session(profile, f"{profile}-s")
     ids = {}
     for profile in ("p1", "p2"):
@@ -693,6 +710,7 @@ async def test_migration_10_adds_review_tables_and_session_generations(db_url):
         await store.ensure_session("p1", "s1")
         await store.ensure_session("p1", "s2")
         await store.db.execute("UPDATE schema_version SET version = 9")
+        await restore_pre_learning(store.db)
         await restore_pre_review_queue(store.db)
     finally:
         await store.close()
@@ -706,5 +724,34 @@ async def test_migration_10_adds_review_tables_and_session_generations(db_url):
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'sessions'")}
         assert "turns_since_memory" not in columns
         assert await upgraded.db.fetchrow("SELECT 1 AS n FROM memory_reviews") is None  # no auto-review of old history
+    finally:
+        await upgraded.close()
+
+
+async def test_migration_11_adds_the_learning_flag_and_tables(db_url):
+    store = await open_store(db_url)
+    try:
+        assert (await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])).learning is False
+        for table in ("learned_skills", "learned_skill_versions", "learned_skill_evidence", "lesson_observations",
+                      "skill_loads"):
+            assert (await store.db.fetchrow(f"SELECT COUNT(*) AS n FROM {table}"))["n"] == 0
+    finally:
+        await store.close()
+
+
+async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_url):
+    store = await open_store(db_url)
+    try:
+        await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
+        await store.db.execute("UPDATE schema_version SET version = 10")
+        await restore_pre_learning(store.db)
+    finally:
+        await store.close()
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        assert (await upgraded.get_profile("p1")).learning is False
+        assert {"learned_skills", "learned_skill_versions", "learned_skill_evidence", "lesson_observations",
+                "skill_loads"} <= await database_table_names(upgraded.db)
     finally:
         await upgraded.close()

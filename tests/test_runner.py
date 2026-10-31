@@ -506,6 +506,20 @@ async def test_a_session_from_before_the_upgrade_keeps_the_plan_one_tool_set(set
     assert (await store.get_session("p1", "s1")).system_prompt == "an old prompt"
 
 
+async def test_a_session_from_before_the_upgrade_is_not_offered_the_learning_tools(setup):
+    store, provider, executor = setup
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True, learning=True)
+    await store.ensure_session("p1", "s1")
+    await store.set_session_prompt("s1", "an old prompt", "fake", "m")  # tools stays NULL
+    provider.script = [[ToolCallReady(ToolCall("c1", "skill_manage", "{}")), Completed(Usage(1, 1, 0, 0))],
+                       [TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]]
+    await executor.execute(await start(store))
+    assert [tool["name"] for tool in provider.requests[0].tools] == ["memory"]
+    tool_result = [m.message for m in await store.messages("s1") if m.message.role == "tool"][-1]
+    assert "Unknown tool: skill_manage" in tool_result.text
+
+
 async def test_a_session_with_stored_sandbox_tools_on_a_profile_without_a_sandbox_refuses_them(setup):
     store, provider, executor = setup
     await store.ensure_session("p1", "s1")

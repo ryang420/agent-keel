@@ -20,6 +20,7 @@ from keel.store.base import (
 from keel.sandbox.base import SandboxPolicy
 from keel.sandbox.records import SandboxBusy
 from keel.store.history import HistoryStoreMixin
+from keel.store.learned import LearnedSkillStoreMixin
 from keel.store.memory import MemoryStoreMixin
 from keel.store.migrations import migrate
 from keel.store.reviews import ReviewStoreMixin
@@ -36,7 +37,8 @@ def _j(value) -> str:
 def _profile(row: dict) -> Profile:
     return Profile(id=row["id"], models=json.loads(row["models"]), sandbox=json.loads(row["sandbox"]),
                    soul=row["soul"], skills=json.loads(row["skills"]), updated_at=row["updated_at"],
-                   memory=bool(row["memory"]), tenant_id=row["tenant_id"], incarnation=row.get("incarnation"))
+                   memory=bool(row["memory"]), tenant_id=row["tenant_id"], incarnation=row.get("incarnation"),
+                   learning=bool(row["learning"]))
 
 
 def _session(row: dict) -> Session:
@@ -78,7 +80,7 @@ def _event(row: dict) -> Event:
     return Event(row["run_id"], row["seq"], row["type"], json.loads(row["data"]), row["at"])
 
 
-class SqlStore(HistoryStoreMixin, MemoryStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
+class SqlStore(HistoryStoreMixin, MemoryStoreMixin, LearnedSkillStoreMixin, ReviewStoreMixin, SandboxStoreMixin,
                ProfileDeletionStoreMixin):
     def __init__(self, db, clock: Callable[[], float] = time.time,
                  coordination_clock: Callable[[], float] | None = None) -> None:
@@ -118,23 +120,25 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, ReviewStoreMixin, SandboxSto
     # profiles
 
     async def upsert_profile(self, profile_id: str, *, models: list[dict], sandbox: dict, soul: str,
-                             skills: list[str], memory: bool = False, tenant_id: int | None = None) -> Profile:
+                             skills: list[str], memory: bool = False, learning: bool = False,
+                             tenant_id: int | None = None) -> Profile:
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             await self.assert_profile_writable(profile_id)
             incarnation = uuid.uuid4().hex
             previous = await self.db.fetchrow("SELECT memory FROM profiles WHERE id = ?", profile_id)
             written = await self.db.fetchrow(
-            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id, incarnation) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, learning, tenant_id, "
+            "incarnation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET models = excluded.models, sandbox = excluded.sandbox, "
             "soul = excluded.soul, skills = excluded.skills, updated_at = excluded.updated_at, "
-            "memory = excluded.memory, tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id), "
+            "memory = excluded.memory, learning = excluded.learning, "
+            "tenant_id = COALESCE(profiles.tenant_id, excluded.tenant_id), "
             "incarnation = COALESCE(profiles.incarnation, excluded.incarnation) "
             "WHERE excluded.tenant_id IS NULL OR profiles.tenant_id IS NULL "
             "OR profiles.tenant_id = excluded.tenant_id RETURNING id",
-                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), tenant_id,
-                incarnation)
+                profile_id, _j(models), _j(sandbox), soul, _j(skills), self.clock(), int(memory), int(learning),
+                tenant_id, incarnation)
             if written is not None and memory and (previous is None or not previous["memory"]):
                 await self._restart_reviews(profile_id)
         saved = await self.get_profile(profile_id)
@@ -363,6 +367,12 @@ class SqlStore(HistoryStoreMixin, MemoryStoreMixin, ReviewStoreMixin, SandboxSto
                 "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self.db.execute(
                 "DELETE FROM memory_mutations WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
+            for table in ("lesson_observations", "skill_loads", "learned_skill_evidence"):
+                await self.db.execute(f"DELETE FROM {table} WHERE profile_id = ? AND session_id = ?",
+                                      profile_id, session_id)
+            await self.db.execute(
+                "UPDATE learned_skill_versions SET run_id = NULL, session_id = NULL, tool_call_id = NULL "
+                "WHERE profile_id = ? AND session_id = ?", profile_id, session_id)
             await self._forget_session_reviews(profile_id, session_id)
             await self.db.execute("DELETE FROM sessions WHERE id = ?", session_id)
         return True
