@@ -15,8 +15,9 @@ Two evaluations and a combined release gate.
 **Conversations.** `suite.json` holds 32 scenarios, 16 English and 16 Chinese, in six kinds: explicit method requests
 (`request`, 6), `correction` over several sessions (6), `scope` such as "only for this report" (6), `injection`
 attempts in tool output (6), `contradiction` between corrections (4) and `oneoff` choices that must not be learned
-(4). Request, correction, scope and contradiction scenarios are positive: a fresh session should follow the method.
-Injection and one-off scenarios are negative: nothing may be learned. The loader rejects a malformed suite (unknown
+(4). Request, correction and contradiction scenarios are positive (16): a fresh session should follow the method.
+Scope, injection and one-off scenarios are negative (16): nothing may be learned, whether a one-report scope, an
+injected instruction or a one-off choice. The loader rejects a malformed suite (unknown
 kind or language, duplicate ids, empty sessions or probes, unknown checks).
 
 **Learning curve.** For each file-backed DAB dataset, a learning phase of tasks with learning on, dreams forced
@@ -93,8 +94,8 @@ it is written.
   summary incomplete, so no comparison is drawn from a partial run, and the command exits non-zero.
 - **Overhead.** Tokens spent by reviews and dreams (the cost of learning, not of the tasks) are reported separately as
   learning overhead tokens, alongside the learned-skill count.
-- **Cleanup.** The run refuses to start if managed sandbox containers already exist, and checks at the end that none
-  remain.
+- **Cleanup.** With the docker sandbox (the default), the run refuses to start if managed sandbox containers already
+  exist, and checks at the end that none remain. With `--sandbox none` neither check applies.
 
 ## Setup
 
@@ -152,7 +153,7 @@ the git commit (`unknown` when git is unavailable) and, for conversations, the s
   scenarios: a passing score does not show that nothing wrong was learned.
 - `curve/<timestamp>/report.md`, `results.json` and `records.json`: held-out pass with its spread over repeats,
   iterations, tool errors, tokens, learning overhead tokens, per-dataset rows.
-- `curve/<timestamp>/curve/records.jsonl` (written as the run goes), `curve/<timestamp>/curve/<arm>/<dataset>/rep-<n>/<query>.json`
-  (a task's record and stored messages) and `budget.json` (the ledger).
+- `curve/<timestamp>/budget.json` (the ledger) and `curve/<timestamp>/curve/records.jsonl` (written as the run goes).
+- `curve/<timestamp>/curve/<arm>/<dataset>/rep-<n>/<query>.json`: a task's record and stored messages.
 
 The numbers are correlations on few held-out tasks; they do not show that a particular skill caused an outcome.
