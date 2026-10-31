@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from keel.store.base import DreamBusy, DreamClaim, DreamJob, DreamNotRetryable, ProfileDeletionBusy
+from keel.store.base import DreamBusy, DreamClaim, DreamJob, DreamNotRetryable, ProfileDeletionBusy, SkillSource
 from keel.store.reviews import REVIEW_ATTEMPTS, RETRY_BASE_S, USAGE_KEPT
 
 DREAM_STATUSES = ("pending", "running", "done", "failed", "discarded")
@@ -32,6 +32,10 @@ def _usage(row: dict, entry: dict | None) -> str:
     if entry is not None:
         kept.append(entry)
     return json.dumps(kept[-USAGE_KEPT:])
+
+
+class _Rejected(Exception):
+    """A staged change the store refused at commit (a name taken meanwhile, the skill cap): roll back and retry."""
 
 
 class DreamStoreMixin:
@@ -275,3 +279,88 @@ class DreamStoreMixin:
                 "finished_at = NULL, updated_at = ? WHERE id = ? RETURNING *",
                 provider, model, await self.coordination_now(), self.clock(), job_id)
             return _job(updated)
+
+    async def commit_dream(self, claim: DreamClaim, proposal, *, usage: dict | None) -> str:
+        """Apply a complete proposal atomically: skill versions citing their observations, observation states and
+        the job's completion. Nothing is written unless this claim still holds its lease, the profile is current with
+        learning on, every skill the proposal read is at the version it read and every observation it uses is still
+        pending (expiry runs without the profile lock)."""
+        job = claim.job
+
+        def entry(outcome: str) -> dict | None:  # a refused commit must not be recorded as a committed one
+            return None if usage is None else {**usage, "outcome": outcome}
+
+        try:
+            async with self.db.transaction():
+                await self.lock_profile(job.profile_id)
+                row = await self._owned_dream(claim)
+                if row is None:
+                    return "lost"
+                gone = await self._dream_gone(job.profile_id, claim.profile_incarnation)
+                if gone is not None:
+                    await self._settle_dream(row, "discarded", code=gone, message="The dream's owner changed.",
+                                             usage=entry("discarded"))
+                    return "discarded"
+                sessions, moved = await self._dream_moved(job.profile_id, proposal)
+                if moved is not None:
+                    await self._retry_or_fail_dream(row, "conflict", moved, retry=True, usage=entry("conflict"))
+                    return "conflict"
+                made = await self._apply_dream(job, proposal, sessions)
+                marker = f"dream:{job.id}"
+                if proposal.consumed:
+                    used = sorted(proposal.consumed)
+                    await self.db.execute(
+                        "UPDATE lesson_observations SET state = 'consumed', consumed_by = ? WHERE profile_id = ? "
+                        "AND state = 'pending' AND id IN (" + ", ".join("?" for _ in used) + ")",
+                        marker, job.profile_id, *used)
+                for observation_id, reason in proposal.dismissed.items():
+                    await self.db.execute(
+                        "UPDATE lesson_observations SET state = 'dismissed', consumed_by = ?, note = ? "
+                        "WHERE profile_id = ? AND id = ? AND state = 'pending'",
+                        marker, reason, job.profile_id, observation_id)
+                await self._settle_dream(row, "done", usage=usage, changes={
+                    "skills": made, "consumed": sorted(proposal.consumed), "dismissed": sorted(proposal.dismissed)})
+                return "committed"
+        except _Rejected as rejected:
+            async with self.db.transaction():
+                await self.lock_profile(job.profile_id)
+                row = await self._owned_dream(claim)
+                if row is None:
+                    return "lost"
+                await self._retry_or_fail_dream(row, "conflict", str(rejected), retry=True, usage=entry("conflict"))
+            return "conflict"
+
+    async def _dream_moved(self, profile_id: str, proposal) -> tuple[dict[str, str], str | None]:
+        """(session of each used observation, why the proposal is stale or None), under the caller's lock."""
+        for skill_id, version in proposal.read.items():
+            row = await self.db.fetchrow("SELECT version, state FROM learned_skills WHERE profile_id = ? AND id = ?",
+                                         profile_id, skill_id)
+            if row is None or row["version"] != version or row["state"] == "retired":
+                return {}, "A learned skill changed while the dream ran."
+        used = sorted(proposal.consumed | set(proposal.dismissed))
+        if not used:
+            return {}, None
+        rows = await self.db.fetch(
+            "SELECT id, session_id FROM lesson_observations WHERE profile_id = ? AND state = 'pending' AND id IN ("
+            + ", ".join("?" for _ in used) + ") FOR UPDATE", profile_id, *used)
+        if len(rows) != len(used):
+            return {}, "An observation changed while the dream ran."
+        return {row["id"]: row["session_id"] for row in rows}, None
+
+    async def _apply_dream(self, job: DreamJob, proposal, sessions: dict[str, str]) -> list[dict]:
+        profile = await self.db.fetchrow("SELECT skills FROM profiles WHERE id = ?", job.profile_id)
+        shipped = set(json.loads(profile["skills"]))
+        source = SkillSource("dream", job_id=job.id)
+        made = []
+        for op in proposal.ops:
+            op = {**op, "cited": [(item, sessions[item]) for item in op.get("cited", ())]}
+            if op["action"] == "create":
+                result = await self._create_skill(job.profile_id, op, shipped, source)
+            else:
+                result = await self._change_skill(job.profile_id, op["action"], op, shipped, source)
+            if not result["success"]:
+                raise _Rejected(result["error"])
+            skill = result["skill"]
+            made.append({"action": op["action"], "skill_id": skill["id"], "name": skill["name"],
+                         "version": skill["version"]})
+        return made
