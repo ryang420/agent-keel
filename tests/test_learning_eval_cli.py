@@ -262,3 +262,13 @@ def test_curve_refuses_a_missing_admin_dsn_before_the_run_directory_exists(tmp_p
         cli.main(["curve", "--max-tokens", "1000", "--root", str(tmp_path / "out"), "--dab-root", str(tmp_path)])
     assert "CREATEDB" in str(exit_info.value)
     assert not (tmp_path / "out").exists()
+
+
+def test_a_bedrock_curve_refuses_a_missing_region_before_anything_is_written(tmp_path, monkeypatch):
+    monkeypatch.setenv("KEEL_LIVE_MODEL", "scripted")
+    for name in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["curve", "--provider", "bedrock", "--max-tokens", "1000", "--root", str(tmp_path)])
+    assert "no region is assumed" in str(exit_info.value)
+    assert not list(tmp_path.iterdir())

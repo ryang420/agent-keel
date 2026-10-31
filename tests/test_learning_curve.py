@@ -244,3 +244,27 @@ def test_failed_and_timed_out_runs_are_wrong_answers_left_out_of_the_effort_mean
     report = (tmp_path / "report.md").read_text()
     assert "| Failed | Timeout |" in report and "| learning | 33% ± 0% (1 repeats) | 0 | 1 | 1 | 4.0 |" in report
     assert "| a | 0 | learning | 2 | 1 | 2 |" in report
+
+
+async def test_a_bedrock_curve_needs_no_openai_key_and_uses_the_region_given(tmp_path, pg_dsn, monkeypatch):
+    """The curve reaches the model on bedrock as on openai: no OpenAI key is required, and the service's providers are
+    built for the region the caller passed."""
+    for name in ("KEEL_OPENAI_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    seen = []
+
+    def providers_for(settings):
+        seen.append(settings.aws_region)
+        registry = ProviderRegistry()
+        registry.register(FakeProvider(name="bedrock",
+                                       script=[[TextDelta("ANSWER: 42"), Completed(Usage(10, 2, 0, 0))]] * 200))
+        return registry
+
+    monkeypatch.setattr(curve, "default_providers", providers_for)
+    repo, cases = toy(tmp_path)
+    paths = inputs.Paths(tmp_path / "eval").ensure()
+    records = await execute_curve(cases, repo=repo, paths=paths, ledger=Ledger.grant(paths.budget, 1_000_000),
+                                  mount_root=tmp_path / "mounts", admin_dsn=pg_dsn, provider="bedrock", model="m",
+                                  repeats=1, sandbox="none", timeout_s=60, aws_region="eu-test-1")
+    assert seen == ["eu-test-1"]
+    assert all(r["passed"] for r in records if r.get("kind") == "task")
