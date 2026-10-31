@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import UTC, datetime
 import hashlib
 import json
-from datetime import UTC, datetime
 import os
 from pathlib import Path
 import subprocess
@@ -90,15 +90,19 @@ async def _run(args) -> int:
     scenarios = load_suite(args.suite)
     subset = bool(args.scenarios) or args.arm != "both"
     if args.scenarios:
-        wanted = set(args.scenarios.split(","))
+        wanted = {item for item in args.scenarios.split(",") if item}
+        unknown = sorted(wanted - {s.id for s in scenarios})
+        if unknown or not wanted:
+            raise SystemExit(f"unknown scenario ids: {', '.join(unknown) or '(none given)'}")
         scenarios = [s for s in scenarios if s.id in wanted]
     model = _model(args, args.provider)
     if args.provider == "bedrock" and not _region():
         raise SystemExit("set AWS_REGION or AWS_DEFAULT_REGION for --provider bedrock; no region is assumed")
+    admin = _admin_dsn(args)  # every refusal happens before anything is written
     started = datetime.now(UTC)
     out = Path(args.root) / "runs" / _stamp(started)
     out.mkdir(parents=True, exist_ok=True)
-    async with temporary_database(_admin_dsn(args)) as dsn:
+    async with temporary_database(admin) as dsn:
         settings = _settings(dsn)
         providers = default_providers(settings)
         store = await open_store(dsn)
@@ -160,8 +164,23 @@ async def _curve(args) -> int:
 
 
 def _gate(args) -> int:
-    curve = json.loads(Path(args.curve).read_text(encoding="utf-8"))["summary"]
-    conversations = json.loads(Path(args.conversations).read_text(encoding="utf-8"))["summary"]
+    try:
+        curve_data = json.loads(Path(args.curve).read_text(encoding="utf-8"))
+        conversation_data = json.loads(Path(args.conversations).read_text(encoding="utf-8"))
+        curve, conversations = curve_data["summary"], conversation_data["summary"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"error: cannot read the result files: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    problems = []
+    if conversation_data.get("meta", {}).get("gate_applicable") is False:
+        problems.append("the conversations results are from a subset run")
+    if not isinstance(conversations, dict) or not {"learning", "baseline"} <= set(conversations):
+        problems.append("the conversations results need both the learning and the baseline arm")
+    if not isinstance(curve, dict) or not curve.get("complete") or curve.get("errors"):
+        problems.append("the curve results are not a complete, error-free run")
+    if problems:
+        print("error: the gate is refused: " + "; ".join(problems), file=sys.stderr)
+        return 1
     verdict = combine(curve, conversations)
     (Path(args.conversations).parent / "gate.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
     print(f"gate {'PASSED' if verdict['passed'] else 'FAILED'}")

@@ -41,12 +41,12 @@ def write_conversations(out: Path, summary: dict, outcomes, meta: dict) -> None:
     for arm, data in summary.items():
         lines.append(f"| {arm} | {data['corrections']} | {data['negatives_learned']} | {data['exposure']} | "
                      f"{_yes(data['attributable'])} | {_yes(data['reversible'])} | {data['errors']} |")
-    if "learning" in summary and meta.get("gate_applicable", True):
+    if not meta.get("gate_applicable", True):
+        lines += ["", "Gate: not applicable (subset run)"]
+    elif "learning" in summary:
         verdict = "PASSED" if summary["learning"]["gate"]["passed"] else "FAILED"
         lines += ["", f"Conversation gate (learning arm): {verdict}. The combined release gate also needs the "
                       "learning curve (`gate` command)."]
-    elif "learning" in summary:
-        lines += ["", "Gate: not applicable (subset run)"]
     errors = [o for o in outcomes if any(f.startswith("error:") for f in o.failures)]
     if errors:
         lines += ["", f"Cases that errored (counted as failures): {len(errors)}"]
