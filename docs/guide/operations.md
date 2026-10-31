@@ -48,6 +48,14 @@ A missing profile is created empty for `tenant_id`: no models, no skills, an emp
 update through the API (`PUT /v1/profiles/{id}`) fills it in before its first run. The command exits 1 when any line is
 `invalid`.
 
+## Upgrading to command runs
+
+0.3.2 adds command runs (schema version 8: `runs.kind`, `runs.command`, and `runs.provider` and `runs.model` become
+nullable). The change is applied at start like every schema change. On SQLite it rebuilds the `runs` table, which takes
+time in proportion to its size. A database at schema version 8 is refused by 0.3.1, so roll back by restoring the
+backup. Upgrade every instance before starting the first command run: a 0.3.1 instance still running against the
+upgraded database would claim a command run as a model run and fail it.
+
 ## Upgrading to atomic run termination
 
 This release commits a run's terminal state and its terminal event in one transaction. It needs no schema migration,

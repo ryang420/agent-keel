@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Schema version 8: `runs.kind` (`model` or `command`) and `runs.command`; `runs.provider` and `runs.model` may be
+  null for a command run. PostgreSQL alters `runs` in place; SQLite rebuilds it. A database at this version is refused
+  by 0.3.1.
+
 ## [0.3.1] - 2026-10-31
 
 ### Fixed

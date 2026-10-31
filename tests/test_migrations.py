@@ -12,7 +12,7 @@ from keel.config import ServiceCredential, Settings
 from keel.service import build
 from keel.sandbox.base import parse_policy, profile_mount_root
 from keel.store import migrations, open_store
-from keel.store.base import OwnershipError, UniqueViolation
+from keel.store.base import OwnershipError, SessionBusy, UniqueViolation
 from keel.store.db import SqliteDb
 from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
 from keel.store.ownership import require_tenant_ownership
@@ -640,3 +640,38 @@ async def test_coordination_time_is_read_at_call_time_inside_a_transaction(db_ur
         assert after - before >= 0.03
     finally:
         await store.close()
+
+
+async def test_command_runs_upgrade_a_0_3_1_database(db_url, monkeypatch):
+    # A database at schema version 7 (0.3.1) with a finished model run.
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:7])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 7)
+    old = await open_store(db_url)
+    await old.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}],
+                             sandbox={"image": "img", "workdir": "/w"}, soul="", skills=[])
+    await old.ensure_session("p1", "s1")
+    await old.db.execute(
+        "INSERT INTO runs (id, profile_id, session_id, status, provider, model, input, output, created_at, "
+        "finished_at) VALUES ('run_old', 'p1', 's1', 'completed', 'fake', 'm', '[]', 'done', 1, 2)")
+    await old.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        kept = await upgraded.get_run_by_id("run_old")
+        assert (kept.kind, kept.command, kept.provider, kept.model, kept.output) == ("model", None, "fake", "m", "done")
+        await upgraded.ensure_session("p1", "s2")
+        command = {"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}}
+        new = await upgraded.create_command_run(profile_id="p1", session_id="s2", command=command)
+        assert (new.kind, new.command, new.provider, new.model) == ("command", command, None, None)
+        with pytest.raises(SessionBusy):  # the one-run-per-session index survived the upgrade
+            await upgraded.create_command_run(profile_id="p1", session_id="s2", command=command)
+        upgraded_shape = await schema_shape(upgraded.db)
+    finally:
+        await upgraded.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded_shape
+    finally:
+        await fresh.close()

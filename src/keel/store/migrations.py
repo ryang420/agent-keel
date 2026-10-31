@@ -22,9 +22,12 @@ class SchemaTooNew(Exception):
 class Migration:
     version: int
     template: str  # statements separated by ";", with {real}, {serial} and {bigint} filled per dialect
+    sqlite_template: str | None = None  # SQLite's statements instead, for a change SQLite cannot make with ALTER
 
     def statements(self, dialect: str) -> list[str]:
         sql = self.template
+        if dialect == "sqlite" and self.sqlite_template is not None:
+            sql = self.sqlite_template
         if dialect == "sqlite":
             # SQLite only auto-increments an INTEGER PRIMARY KEY when it is declared exactly that way.
             # Tenant ids are assigned by the operator, so only {serial} columns get AUTOINCREMENT.
@@ -191,9 +194,51 @@ ALTER TABLE profiles ADD COLUMN incarnation TEXT;
 ALTER TABLE runs ADD COLUMN profile_incarnation TEXT;
 """
 
+# Command runs (docs/design/2026-10-31-command-runs.md): a run is a model run or one sandbox command, and a command
+# run has no provider or model. The PostgreSQL statements are idempotent, so a database whose recorded version was set
+# back can apply them again. SQLite cannot drop NOT NULL, so it rebuilds `runs` with its version 7 columns and indexes.
+_V8 = """
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'model';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS command TEXT;
+ALTER TABLE runs ALTER COLUMN provider DROP NOT NULL;
+ALTER TABLE runs ALTER COLUMN model DROP NOT NULL;
+ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_kind_fields;
+ALTER TABLE runs ADD CONSTRAINT runs_kind_fields CHECK (
+    kind IN ('model', 'command')
+    AND (kind <> 'model' OR (provider IS NOT NULL AND model IS NOT NULL))
+    AND (kind <> 'command' OR command IS NOT NULL))
+"""
+
+_V8_SQLITE = """
+CREATE TABLE runs_v8 (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL,
+    provider TEXT, model TEXT, reasoning_effort TEXT, input TEXT NOT NULL,
+    instructions TEXT, output TEXT NOT NULL DEFAULT '', usage TEXT NOT NULL DEFAULT '{{}}',
+    error_code TEXT, error TEXT, lease_owner TEXT, lease_expires_at {real},
+    created_at {real} NOT NULL, started_at {real}, finished_at {real}, current_exec_id TEXT,
+    profile_incarnation TEXT, kind TEXT NOT NULL DEFAULT 'model', command TEXT,
+    CONSTRAINT runs_kind_fields CHECK (
+        kind IN ('model', 'command')
+        AND (kind <> 'model' OR (provider IS NOT NULL AND model IS NOT NULL))
+        AND (kind <> 'command' OR command IS NOT NULL)));
+INSERT INTO runs_v8 (id, profile_id, session_id, status, provider, model, reasoning_effort, input, instructions,
+    output, usage, error_code, error, lease_owner, lease_expires_at, created_at, started_at, finished_at,
+    current_exec_id, profile_incarnation)
+    SELECT id, profile_id, session_id, status, provider, model, reasoning_effort, input, instructions,
+    output, usage, error_code, error, lease_owner, lease_expires_at, created_at, started_at, finished_at,
+    current_exec_id, profile_incarnation FROM runs;
+DROP TABLE runs;
+ALTER TABLE runs_v8 RENAME TO runs;
+CREATE INDEX runs_status ON runs (status, created_at);
+CREATE INDEX runs_session ON runs (session_id);
+CREATE UNIQUE INDEX runs_one_in_flight_per_session ON runs (session_id)
+    WHERE status IN ('queued', 'running', 'stopping');
+CREATE INDEX runs_finished ON runs (finished_at)
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8, _V8_SQLITE))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

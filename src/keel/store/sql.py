@@ -67,7 +67,8 @@ def _run(row: dict) -> Run:
         row["reasoning_effort"], json.loads(row["input"]), row["instructions"], row["output"],
         Usage.from_dict(json.loads(row["usage"])), row["error_code"], row["error"], row["lease_owner"],
         row["lease_expires_at"], row["created_at"], row["started_at"], row["finished_at"],
-        row["current_exec_id"], row["profile_incarnation"],
+        row["current_exec_id"], row["profile_incarnation"], kind=row["kind"],
+        command=None if row["command"] is None else json.loads(row["command"]),
     )
 
 
@@ -479,8 +480,18 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             raise SessionBusy(session_id) from exc
         return await self.get_run_by_id(run_id)
 
+    async def create_command_run(self, *, profile_id: str, session_id: str, command: dict) -> Run:
+        """Queue a command run: one sandbox command, with no provider, model or input."""
+        run_id = "run_" + uuid.uuid4().hex
+        try:
+            await self._insert_run(run_id, profile_id, session_id, None, None, None, [], None,
+                                   kind="command", command=command)
+        except UniqueViolation as exc:
+            raise SessionBusy(session_id) from exc
+        return await self.get_run_by_id(run_id)
+
     async def _insert_run(self, run_id, profile_id, session_id, provider, model, reasoning_effort,
-                          input_parts, instructions) -> None:
+                          input_parts, instructions, *, kind: str = "model", command: dict | None = None) -> None:
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
@@ -490,10 +501,10 @@ class SqlStore(SandboxStoreMixin, ProfileDeletionStoreMixin):
             profile_incarnation = profile["incarnation"] if profile is not None else None
             await self.db.execute(
                 "INSERT INTO runs (id, profile_id, session_id, status, provider, model, reasoning_effort, input, "
-                "instructions, output, usage, created_at, profile_incarnation) "
-                "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, '', '{}', ?, ?)",
+                "instructions, output, usage, created_at, profile_incarnation, kind, command) "
+                "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, '', '{}', ?, ?, ?, ?)",
                 run_id, profile_id, session_id, provider, model, reasoning_effort, _j(input_parts), instructions,
-                self.clock(), profile_incarnation)
+                self.clock(), profile_incarnation, kind, None if command is None else _j(command))
 
     async def get_run(self, profile_id: str, run_id: str) -> Run | None:
         row = await self.db.fetchrow("SELECT * FROM runs WHERE id = ? AND profile_id = ?", run_id, profile_id)

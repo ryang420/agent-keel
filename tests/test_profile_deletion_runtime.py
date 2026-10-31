@@ -451,7 +451,7 @@ async def test_an_inflight_delete_cannot_retire_a_recreated_incarnations_sandbox
 
         dsn = os.environ["KEEL_TEST_POSTGRES_DSN"]
     else:
-        [dbrow] = await store.db.fetch("PRAGMA database_list")
+        dbrow = await store.db.fetchrow("PRAGMA database_list")  # the first row is "main"; "temp" may follow
         dsn = "sqlite:///" + dbrow["file"]
     other = await open_store(dsn)
     other.coordination_clock = clock
