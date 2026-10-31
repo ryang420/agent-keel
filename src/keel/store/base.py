@@ -61,6 +61,14 @@ class ReviewSourceGone(StoreError):
     """The session a memory review read no longer exists in that generation."""
 
 
+class DreamNotRetryable(StoreError):
+    """Only a failed dream can be retried."""
+
+
+class DreamBusy(StoreError):
+    """Another dream of the profile is already queued or running."""
+
+
 class UniqueViolation(Exception):
     """Raised by the database adapter when a unique constraint rejects a write."""
 
@@ -196,6 +204,35 @@ class ReviewClaim:
 
 
 @dataclass(frozen=True)
+class DreamJob:
+    """A dream job as operators see it: trigger, route, status, usage and the changes it made; never transcript text."""
+    id: str
+    profile_id: str
+    status: str  # "pending", "running", "done", "failed" or "discarded"
+    trigger: str  # "observations", "interval", "feedback" or "suspension"
+    provider: str | None
+    model: str | None
+    attempts: int
+    error_code: str | None
+    error: str | None
+    usage: list
+    changes: dict
+    created_at: float
+    updated_at: float
+    finished_at: float | None
+
+
+@dataclass(frozen=True)
+class DreamClaim:
+    """A leased dream. The token fences every later write; `input_at` is when this attempt read its input, on the
+    content clock."""
+    job: DreamJob
+    token: str
+    profile_incarnation: str
+    input_at: float
+
+
+@dataclass(frozen=True)
 class RunFeedback:
     run_id: str
     session_id: str
@@ -233,6 +270,7 @@ class Observation:
     run_id: str | None
     consumed_by: str | None
     created_at: float
+    note: str | None = None  # why a dream dismissed it
 
 
 @dataclass(frozen=True)

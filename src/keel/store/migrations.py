@@ -329,10 +329,28 @@ CREATE TABLE run_feedback (
 CREATE INDEX run_feedback_session ON run_feedback (profile_id, session_id)
 """
 
+# Procedural learning, the dream (learning design §5, §7): profile-level dream jobs run on the memory review worker,
+# the start of every dream attempt (a few per profile per day) and the reason a dream dismissed an observation.
+_V13 = """
+CREATE TABLE dream_jobs (
+    id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, profile_incarnation TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'discarded')),
+    trigger TEXT NOT NULL, provider TEXT, model TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at {real} NOT NULL, lease_owner TEXT, lease_token TEXT, lease_expires_at {real}, input_at {real},
+    error_code TEXT, error TEXT, usage TEXT NOT NULL DEFAULT '[]', changes TEXT NOT NULL DEFAULT '{{}}',
+    created_at {real} NOT NULL, updated_at {real} NOT NULL, finished_at {real});
+CREATE UNIQUE INDEX dream_jobs_open ON dream_jobs (profile_id) WHERE status IN ('pending', 'running');
+CREATE INDEX dream_jobs_due ON dream_jobs (status, next_attempt_at);
+CREATE INDEX dream_jobs_profile ON dream_jobs (profile_id, created_at);
+CREATE TABLE dream_attempts (profile_id TEXT NOT NULL, job_id TEXT NOT NULL, started_at {real} NOT NULL);
+CREATE INDEX dream_attempts_profile ON dream_attempts (profile_id, started_at);
+ALTER TABLE lesson_observations ADD COLUMN note TEXT
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
     Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9),
-    Migration(10, _V10), Migration(11, _V11), Migration(12, _V12))
+    Migration(10, _V10), Migration(11, _V11), Migration(12, _V12), Migration(13, _V13))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

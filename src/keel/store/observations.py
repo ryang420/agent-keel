@@ -10,14 +10,15 @@ import uuid
 from keel.store.base import Observation
 
 _COLUMNS = ("id, session_id, topic, situation, approach, outcome, evidence, loaded, state, review_job_id, run_id, "
-            "consumed_by, created_at")
+            "consumed_by, created_at, note")
 
 
 def _observation(row: dict) -> Observation:
     return Observation(row["id"], row["session_id"], row["topic"], row["situation"], row["approach"], row["outcome"],
                        tuple(json.loads(row["evidence"])),
                        tuple((item["skill_id"], item["version"]) for item in json.loads(row["loaded"])),
-                       row["state"], row["review_job_id"], row["run_id"], row["consumed_by"], row["created_at"])
+                       row["state"], row["review_job_id"], row["run_id"], row["consumed_by"], row["created_at"],
+                       row["note"])
 
 
 class ObservationStoreMixin:
