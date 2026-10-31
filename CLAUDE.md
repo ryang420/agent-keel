@@ -85,8 +85,9 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
   entries, the change ledger, memory tool v2 and the memory API (migration 8), the history index,
   `session_search` and per-session tool lists (migration 9), and the durable review queue (migration 10: leased
   background memory reviews, review API) and learned skills (store, `skill_manage`, the `learning` flag and the
-  learned-skill API, migration 11) are merged (`[Unreleased]`), and cross-session memory was accepted 2026-10-30 (see its acceptance record); next are the
-  remaining learning plans (observations and feedback, dream, learning acceptance).
+  learned-skill API, migration 11) are merged (`[Unreleased]`), and cross-session memory was accepted 2026-10-30 (see
+  its acceptance record); next are the remaining learning plans (observations and feedback, dream, learning
+  acceptance).
 - M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown

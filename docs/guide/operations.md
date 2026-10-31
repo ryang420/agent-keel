@@ -147,8 +147,8 @@ start again (no mixed-version rollout): an older binary still counts turns in a 
 ## Learned skills
 
 Profiles with `learning` on keep learned skills in PostgreSQL (migration 11: `learned_skills`, their immutable
-`learned_skill_versions` and evidence, and `skill_loads`). Migration 11 adds a column and tables only, and needs no
-backfill. Inspect a profile's skills with `GET /v1/profiles/{p}/skills/learned` (state, version, origin and 30-day
+`learned_skill_versions` and `learned_skill_evidence`, `lesson_observations` and `skill_loads`). Migration 11
+adds a column and tables only, and needs no backfill. Inspect a profile's skills with `GET /v1/profiles/{p}/skills/learned` (state, version, origin and 30-day
 load counts) and one skill's full history with `GET …/skills/learned/{id}`: each version has its source (the run,
 session and message, or `consumer`), evidence and rationale. Act on a bad skill through the same API:
 
@@ -164,7 +164,12 @@ Sessions already open keep the skills index in their stored prompt until they co
 Turning `learning` off removes `skill_manage` and hides every learned skill from `skills_list` and `skill_view`
 (for new sessions, and for open ones at their next call); nothing is deleted, and turning it on again restores the
 active skills. The routes keep working while learning is off. Deleting a profile deletes its skills, versions and
-load counts.
+load counts. Deleting a session removes that session's skill loads, observations and evidence rows, and its version
+rows lose their run and session provenance; the skills and their text stay.
+
+Before enabling `learning` on any profile (and before deleting a profile that has learned skills), upgrade every
+serving and worker instance to this version, as for migrations 9 and 10. An instance still on migration 10 deletes
+sessions and profiles without touching the learned tables.
 
 ## Complete profile deletion
 

@@ -253,7 +253,7 @@ A profile with `learning` on can keep methods as learned skills: text-only, priv
 from the deployment's read-only `skills`. A skill has a `name` (lowercase slug, at most 64 characters), a one-line
 `description` (at most 200), an optional `category` (slug, at most 32) and a `body` (at most 8000 characters, no
 front matter). A profile holds at most 50 active or suspended skills. A deployment skill of the same name hides a
-learned one. Bodies and descriptions are checked like memory text: empty text, secrets and instruction-like text
+learned one. Names, bodies and descriptions are checked like memory text: empty text, secrets and instruction-like text
 are refused.
 
 The model creates, revises and retires skills with `skill_manage` (`list`, `create`, `revise`, `retire`), only when
@@ -283,12 +283,15 @@ authoritative and enter the history with source `consumer`.
 
 Each skill is `{"id", "name", "description", "category", "state", "version", "origin", "created_at", "updated_at",
 "consumer_changed_at", "stats": {"loads_30d": n}}`; `origin` is who created it, and `loads_30d` counts
-`skill_view` loads of the current version in the last 30 days. Every change route returns the skill with its
-`body`. A change names the version it expects: 409 `version_conflict` when the skill has moved on. Other errors: 404
+`skill_view` loads of the current version in the last 30 days. Every change route except DELETE returns the
+skill with its `body`. A change names the version it expects: 409 `version_conflict` when the skill has moved on.
+Other errors: 404
 `learned_skill_not_found`, 409 `name_taken` (an active or suspended skill has the name), 409 `skill_limit` (50
 reached), 409 `skill_retired` (a retired skill cannot change), and 400 `invalid_input` for a missing or non-integer
-`expected_version`, an invalid field or an invalid `state`. All routes answer 404 `profile_not_found` for a missing
-or foreign profile. Observations from review, feedback and automatic suspension are planned and not available yet.
+`expected_version`, an invalid field, an invalid `state`, a rollback to a version that does not exist, or a suspend
+or resume from the wrong state (resume needs a suspended skill, suspend an active one). All routes answer 404
+`profile_not_found` for a missing or foreign profile, and 409 `profile_deletion_busy` while the profile is being
+deleted. Observations from review, feedback and automatic suspension are planned and not available yet.
 
 ## Verifying a model
 
