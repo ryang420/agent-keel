@@ -79,7 +79,8 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
   context compression in place, run-event pruning, model titles, the opt-in `memory` tool and background review,
   reliability and fault-injection tests, explicit tenant ownership with independent profiles (§12), complete
   profile deletion, the coordinated sandbox lifecycle, and Claude models on the `bedrock` provider
-  (`docs/design/2026-10-23-bedrock-anthropic-messages.md`).
+  (`docs/design/2026-10-23-bedrock-anthropic-messages.md`). 0.3.1 is a patch on 0.3.0: a sandbox command no
+  longer waits out the whole kill grace once its process group is empty.
 - Open work: cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`) and, on top of it,
   procedural learning (`docs/design/2026-10-29-procedural-learning.md`), both approved 2026-10-29. Memory
   entries, the change ledger, memory tool v2 and the memory API (migration 8), the history index,
