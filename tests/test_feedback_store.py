@@ -55,7 +55,7 @@ async def test_feedback_is_stored_with_an_observation_citing_the_run(store):
     assert await store.get_feedback("p1", run.id) == feedback
 
 
-async def test_replacing_feedback_replaces_a_pending_observation_but_not_a_consumed_one(store):
+async def test_replacing_feedback_replaces_a_pending_observation_but_not_a_consumed_one(store, clock):
     await profile(store)
     run = await finished_run(store)
     await store.put_feedback("p1", run.id, "up", None)
@@ -63,6 +63,7 @@ async def test_replacing_feedback_replaces_a_pending_observation_but_not_a_consu
     [item] = await store.observations("p1")
     assert item.outcome == "feedback_down"
     await store.db.execute("UPDATE lesson_observations SET state = 'consumed' WHERE id = ?", item.id)
+    clock.now += 10  # a later content time, so the order by created_at is deterministic
     feedback, _, _ = await store.put_feedback("p1", run.id, "up", None)
     items = await store.observations("p1")
     assert [(i.outcome, i.state) for i in items] == [("feedback_down", "consumed"), ("feedback_up", "pending")]
