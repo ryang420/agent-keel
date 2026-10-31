@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Learning acceptance: deterministic §10 acceptance tests, and opt-in evaluations in `evals/learning/` (protocol
+  `learning-eval-v1`): 32 conversation scenarios (English and Chinese) against a memory-only baseline, a DAB learning
+  curve against a learning-off baseline, and the combined release gate.
 - Dreams: with learning on, a profile's pending observations are consolidated into learned skills by a leased,
   budgeted background job behind evidence, duplicate, validation, consumer-precedence and version gates, committed
   atomically; `GET /v1/profiles/{p}/dreams` and `POST …/dreams/{id}/retry`; `KEEL_DREAM_*` settings (migration 13).
