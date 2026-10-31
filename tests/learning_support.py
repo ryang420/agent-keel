@@ -7,7 +7,7 @@ from keel.background import Background
 from keel.dream import Dreamer, DreamSettings
 from keel.dream_gates import DreamRules
 from keel.events import InMemoryEventBus
-from keel.models import Completed, Message, TextPart, TextDelta, ToolCall, ToolCallReady, Usage
+from keel.models import Completed, Message, TextDelta, TextPart, ToolCall, ToolCallReady, Usage
 from keel.providers.base import ProviderRegistry
 from keel.review import MemoryReviewer, ReviewSettings
 from keel.review_observe import StagedObservation

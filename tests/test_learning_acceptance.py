@@ -18,13 +18,15 @@ not evidence that learning helps.
 | 13 ordinary session with learning on | tests/test_runner_learning.py::test_a_from_now_on_request_becomes_a_skill_listed_in_the_next_session_only |
 """
 
+import asyncio
 import json
 
+from keel.dream import Dreamer
 from keel.providers.fake import FakeProvider
 from keel.store.base import SkillSource
 
-from tests.learning_support import (DONE, OK, drain_dreams, drain_reviews, executor_for, learning_profile, observe,
-                                    registry, seed_run, step, turn, user_message_ids)
+from tests.learning_support import (DONE, FORCE, OK, drain_dreams, drain_reviews, executor_for, learning_profile,
+                                    no_sleep, observe, registry, seed_run, step, turn, user_message_ids)
 
 CSV = {"action": "create", "name": "csv-export", "description": "Export a CSV after dropping empty rows",
        "body": "1. Drop empty rows.\n2. Export with a header row."}
@@ -51,7 +53,8 @@ async def test_the_same_correction_in_three_sessions_becomes_one_skill_and_never
     await corrected_sessions(store, clock, ("s1", "s2", "s3"), executor, model, providers)
     pending = await store.observations("p1", states=("pending",))
     assert len(pending) == 3 and {o.session_id for o in pending} == {"s1", "s2", "s3"}
-    model.script += [step("create_skill", **{k: v for k, v in CSV.items() if k != "action"}, observations=[o.id for o in pending], rationale="corrected thrice"),
+    create = {k: v for k, v in CSV.items() if k != "action"}
+    model.script += [step("create_skill", **create, observations=[o.id for o in pending], rationale="corrected thrice"),
                      DONE]
     await drain_dreams(store, providers)
     [skill] = await store.learned_skills("p1")
@@ -102,11 +105,12 @@ async def test_three_down_ratings_suspend_without_a_model_call_and_a_dream_revis
     for index in range(3):
         run = await turn(store, executor, f"s{index}", "Export the CSV.")
         await store.record_skill_load("p1", f"s{index}", run.id, skill["id"], 1)
-        before = len(executor_model.requests)
         await store.put_feedback("p1", run.id, "down", None)
-        assert len(executor_model.requests) == before  # suspension needs no model call
     suspended = await store.learned_skill("p1", skill["id"])
-    assert suspended.state == "suspended"
+    assert suspended.state == "suspended"  # suspended by the feedback alone: no Dreamer exists yet
+    executor_model.script.append(OK)
+    await turn(store, executor, "fresh", "Export the CSV again.")
+    assert skill["name"] not in executor_model.requests[-1].system  # a suspended skill leaves the skills index
     feedback = await store.observations("p1", states=("pending",))
     assert [o.outcome for o in feedback] == ["feedback_down"] * 3
     model = FakeProvider(script=[step("revise_skill", skill_id=skill["id"], body="1. Drop empty rows.\n"
@@ -144,3 +148,62 @@ async def test_a_consumer_rollback_stands_against_older_observations(store, cloc
     current = await store.learned_skill("p1", skill["id"])
     assert (current.version, current.body) == (3, CSV["body"])
     assert json.loads(model.requests[-1].messages[-1].text)["code"] == "consumer_precedence"
+
+
+async def test_a_foreground_revise_during_a_dream_discards_it_and_the_retry_uses_current_state(store, clock):
+    store.coordination_clock = clock
+    await learning_profile(store)
+    await seed_run(store)
+    skill = (await store.change_learned_skill("p1", CSV, source=SkillSource("dream", job_id="old")))["skill"]
+    clock.now += 10
+    ids = [await observe(store, "s1"), await observe(store, "s2")]
+
+    class Racing(FakeProvider):
+        async def stream(self, request):
+            if len(self.requests) == 1:  # after the dream staged its revise, the user revises in the foreground
+                await store.change_learned_skill("p1", {"action": "revise", "skill_id": skill["id"],
+                                                        "expected_version": 1, "body": "1. Foreground text."},
+                                                 source=SkillSource("foreground"))
+            async for event in super().stream(request):
+                yield event
+
+    revise = step("revise_skill", skill_id=skill["id"], body="1. Dream text.", observations=ids, rationale="r")
+    model = Racing(script=[revise, DONE, revise, DONE])
+    await drain_dreams(store, registry(model))
+    [job] = await store.list_dreams("p1")
+    assert (job.status, job.error_code) == ("pending", "conflict")
+    assert {o.state for o in await store.observations("p1")} == {"pending"}
+    assert (await store.learned_skill("p1", skill["id"])).body == "1. Foreground text."
+    clock.now += 60  # past the retry backoff
+    await drain_dreams(store, registry(model))
+    current = await store.learned_skill("p1", skill["id"])
+    assert (current.version, current.body) == (3, "1. Dream text.")
+    assert (await store.list_dreams("p1"))[0].status == "done"
+
+
+async def test_a_dream_killed_mid_proposal_writes_nothing_and_one_commit_stays_one(store, clock):
+    store.coordination_clock = clock
+    await learning_profile(store)
+    await seed_run(store)
+    ids = [await observe(store, "s1"), await observe(store, "s2")]
+    fields = {k: v for k, v in CSV.items() if k != "action"}
+    create = step("create_skill", **fields, observations=ids, rationale="twice")
+    hanging = FakeProvider(script=[create, ["hang"]])
+    task = asyncio.create_task(Dreamer(store, registry(hanging), FORCE, sleep=no_sleep).run_once("w1"))
+    for _ in range(200):
+        if len(hanging.requests) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert await store.learned_skills("p1") == []
+    [job] = await store.list_dreams("p1")
+    assert (job.status, job.attempts) == ("pending", 0)
+    model = FakeProvider(script=[create, DONE])
+    await drain_dreams(store, registry(model))
+    claim_rows = await store.db.fetch("SELECT id FROM dream_jobs WHERE status = 'done'")
+    assert len(claim_rows) == 1 and len(await store.learned_skills("p1")) == 1
+    await drain_dreams(store, registry(FakeProvider(script=[create, DONE])))  # nothing is due: nothing reapplied
+    assert len(await store.learned_skills("p1")) == 1
+    [version] = await store.learned_skill_versions("p1", (await store.learned_skills("p1"))[0].id)
+    assert version.version == 1
