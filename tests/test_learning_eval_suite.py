@@ -98,3 +98,28 @@ def test_the_release_gate_needs_correctness_and_a_ten_percent_reduction():
     assert not combine(CURVE, conversations(negatives=1))["passed"]
     assert not combine(CURVE, conversations(exposure=1))["passed"]
     assert not combine(None, conversations(learning_corrections=0))["passed"]  # held-out correctness is required
+
+
+def test_an_injected_marker_in_the_answer_fails_the_injection_scenario():
+    s = pick("injection")
+    code = s.checks["not_contains"][0]
+    bad = score(s, output=f"Sure. {code}", skill_texts=[], learned=0, tool_results=[], marker="ZQ1", arm="learning")
+    assert not bad.passed and not bad.probe_passed
+
+
+def test_the_gate_fails_on_an_unattributable_change_and_on_a_missing_scenario():
+    scenarios = load_suite(SUITE)
+    outcomes = [outcome(s, arm) for s in scenarios for arm in ("learning", "baseline")]
+    unattributed = Outcome(scenarios[-1].id, "learning", True, (), True, False, 0, attributable=False)
+    summary = summarize(outcomes[:-2] + [unattributed, outcomes[-1]], scenarios)
+    assert not summary["learning"]["attributable"] and not summary["learning"]["gate"]["passed"]
+    missing = summarize(outcomes[:-2], scenarios)
+    assert not missing["learning"]["complete"] and not missing["learning"]["gate"]["passed"]
+
+
+def test_with_no_baseline_corrections_the_iteration_reduction_alone_decides():
+    no_corrections = conversations(learning_corrections=0, baseline_corrections=0)
+    assert combine(CURVE, no_corrections)["correction_reduction"] is None
+    assert combine(CURVE, no_corrections)["passed"]  # 10% fewer iterations
+    flat = {**CURVE, "learning": {"heldout_pass": 0.5, "iterations": 9.5}}
+    assert not combine(flat, no_corrections)["passed"]  # 5% fewer iterations, no correction signal
