@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Observations and run feedback (schema migration 12): with `learning` on, the memory review records observations
+  of methods through an `observe` tool, `PUT`, `GET` and `DELETE /v1/profiles/{p}/runs/{r}/feedback` rate finished
+  runs, learned-skill `stats` add ratings and run outcomes over 30 days, a skill with repeated `down` ratings is
+  suspended automatically, and pending observations expire after 30 days in the worker's maintenance pass.
 - Learned skills (schema migration 11): a profile with the new `learning` flag (which requires `memory`) keeps
   versioned, text-only skills with provenance and evidence. The `skill_manage` tool creates, revises and retires them
   at the user's explicit request, `skills_list` and `skill_view` show active ones under `learned`, the prompt index

@@ -454,3 +454,30 @@ async def test_the_pool_runs_memory_review_loops_and_releases_on_close(pool_part
     assert sorted(t.get_name() for t in pool._tasks if t.get_name().startswith("keel-memory-review")) == [
         "keel-memory-review-0", "keel-memory-review-1"]
     await asyncio.wait_for(pool.close(), 5)
+
+
+async def test_expire_once_expires_only_observations_older_than_the_window(store, clock):
+    from keel.observations import EXPIRY_SECONDS
+    from keel.review_observe import StagedObservation
+    store.coordination_clock = clock
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
+    await store.ensure_session("p1", "s1")
+    item = StagedObservation("weekly report", "Asked", "Conclusion first", "corrected", ())
+    old = await store._insert_observation("p1", "s1", "g", item, now=clock.now)
+    clock.now += EXPIRY_SECONDS + 86_400
+    recent = await store._insert_observation("p1", "s1", "g", item, now=clock.now - 86_400)
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", clock=clock)
+    assert await pool.expire_once() == 1
+    states = {o.id: o.state for o in await store.observations("p1")}
+    assert states == {old: "expired", recent: "pending"}
+
+
+async def test_the_maintenance_task_runs_without_an_event_retention(store, clock):
+    executor = RunExecutor(store, InMemoryEventBus(), ProviderRegistry())
+    pool = WorkerPool(store, InMemoryEventBus(), executor, owner="w1", workers=1, poll_seconds=0.01, clock=clock)
+    await pool.start()
+    try:
+        assert [t for t in pool._tasks if t.get_name() == "keel-maintenance"]
+    finally:
+        await asyncio.wait_for(pool.close(drain_seconds=0.1), 2)

@@ -171,6 +171,27 @@ Before enabling `learning` on any profile (and before deleting a profile that ha
 serving and worker instance to this version, as for migrations 9 and 10. An instance still on migration 10 deletes
 sessions and profiles without touching the learned tables.
 
+### Observations, feedback and suspension
+
+With `learning` on, the memory review also offers the model an `observe` tool, staged with its memory proposal and
+committed with it (a failed review leaves none): at most 5 per review, each citing messages of the reviewed text, and
+`worked` only for a run that completed without reaching its iteration cap. They are private to the profile and
+visible through the store only; a later consolidation step (planned) will consume them. A pending observation not
+consumed within 30 days expires; the worker's hourly maintenance pass does this (it now always runs, with or without
+`KEEL_EVENT_RETENTION_DAYS`), on any instance, and repeating it is harmless.
+
+Consumers rate runs with `PUT /v1/profiles/{p}/runs/{r}/feedback`, which with learning on also records an observation.
+A learned skill whose current version has 3 or more `down` ratings in 30 days, and more `down` than `up`, is
+suspended automatically while learning is on: its versions list a `suspend` change with source `automatic` and a
+rationale giving the counts. To bring it back, fix or roll back the text and `POST …/{id}/resume`; a skill whose
+current version still has those ratings is suspended again by the next `down` rating. Ratings are removed with
+`DELETE …/runs/{r}/feedback`, or with the session or profile.
+
+Migration 12 adds `runs.capped`, the observation's review job and run columns, and the `run_feedback` table. It needs
+no backfill; runs that finished earlier count as not capped. Upgrade every serving and worker instance before relying
+on feedback and observations, as for migration 11: an instance still on migration 11 deletes sessions and profiles
+without removing feedback, and does not record whether a run reached its cap.
+
 ## Complete profile deletion
 
 A consumer may ask the service to remove one profile completely through the delete/complete contract in
