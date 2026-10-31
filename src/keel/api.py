@@ -741,4 +741,7 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             raise ApiError(404, "review_not_found", "No such review.")
         return review_json(job)
 
+    from keel.api_learned import add_learned_routes  # it imports this module's error helpers
+
+    add_learned_routes(app, k, profile_or_404)
     return app
