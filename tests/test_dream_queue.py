@@ -211,3 +211,43 @@ async def test_list_is_newest_first_bounded_and_filterable(dreams, clock):
     jobs = await dreams.list_dreams("p1", limit=2)
     assert len(jobs) == 2 and jobs[0].created_at > jobs[1].created_at
     assert {job.status for job in await dreams.list_dreams("p1", status="failed")} == {"failed"}
+
+
+async def test_profiles_that_are_not_due_never_crowd_out_one_that_is(dreams, clock, monkeypatch):
+    monkeypatch.setattr("keel.store.dreams._BATCH", 3)
+    for index in range(5):  # each dreamed after its observations: old pending rows, nothing new, not a day yet
+        profile = f"idle{index}"
+        await learning_profile(dreams, profile)
+        await observe(dreams, session=f"i{index}", count=2, profile=profile)
+    clock.now += 3600
+    await dreams.db.execute(
+        "INSERT INTO dream_jobs (id, profile_id, profile_incarnation, status, trigger, next_attempt_at, input_at, "
+        "created_at, updated_at) SELECT 'done-' || id, id, incarnation, 'done', 'observations', ?, ?, ?, ? "
+        "FROM profiles", clock.now, clock.now, clock.now, clock.now)
+    clock.now += 60
+    await learning_profile(dreams, "busy")
+    await observe(dreams, session="b1", count=8, profile="busy")
+    clock.now += 3600
+    found = await claim(dreams)
+    assert found is not None and found.job.profile_id == "busy"
+    assert [job.status for job in await dreams.list_dreams("idle0")] == ["done"]
+
+
+async def test_a_model_failure_is_not_requeued_until_the_route_changes(dreams, clock):
+    await learning_profile(dreams)
+    await observe(dreams, count=8)
+    clock.now += 3600
+    found = await claim(dreams)
+    await dreams.fail_dream(found, "no_route", "no run", retry=False)
+    clock.now += 60
+    assert await claim(dreams) is None
+    assert [job.status for job in await dreams.list_dreams("p1")] == ["failed"]  # no churn of identical jobs
+    await completed_run(dreams)  # a model to take a route from
+    clock.now += 60
+    again = await claim(dreams)
+    assert (again.job.provider, again.job.model) == ("fake", "m")
+    await dreams.fail_dream(again, "model_unavailable", "gone", retry=False)
+    clock.now += 60
+    assert await claim(dreams) is None
+    retried = await dreams.retry_dream("p1", again.job.id)  # an operator retry lifts it
+    assert retried.status == "pending" and (await claim(dreams)).job.id == again.job.id

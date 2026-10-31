@@ -103,6 +103,7 @@ async def restore_pre_dreams(db) -> None:
     """Undo migration 13 on a database that is being rewound to an older schema version."""
     for table in ("dream_attempts", "dream_jobs"):
         await db.execute(f"DROP TABLE {table}")
+    await db.execute("DROP INDEX lesson_observations_pending")
     await db.execute("ALTER TABLE lesson_observations DROP COLUMN note")
 
 

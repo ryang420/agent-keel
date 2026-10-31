@@ -344,6 +344,7 @@ CREATE INDEX dream_jobs_due ON dream_jobs (status, next_attempt_at);
 CREATE INDEX dream_jobs_profile ON dream_jobs (profile_id, created_at);
 CREATE TABLE dream_attempts (profile_id TEXT NOT NULL, job_id TEXT NOT NULL, started_at {real} NOT NULL);
 CREATE INDEX dream_attempts_profile ON dream_attempts (profile_id, started_at);
+CREATE INDEX lesson_observations_pending ON lesson_observations (profile_id, created_at) WHERE state = 'pending';
 ALTER TABLE lesson_observations ADD COLUMN note TEXT
 """
 

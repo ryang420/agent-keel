@@ -15,6 +15,7 @@ DREAM_STATUSES = ("pending", "running", "done", "failed", "discarded")
 DAY_S = 86_400.0
 _ERROR_CHARS = 500
 _BATCH = 50  # profiles examined per queue pass
+_PARKING = ("no_route", "model_unavailable")  # failures a new job on the same route would repeat
 
 
 def _job(row: dict) -> DreamJob:
@@ -72,15 +73,36 @@ class DreamStoreMixin:
                 REVIEW_ATTEMPTS, REVIEW_ATTEMPTS, self.clock(), now, self.clock(), now)
 
     async def _queue_dreams(self, rules) -> None:
-        """Examine profiles with pending observations whose newest is past the debounce, oldest pending first."""
+        """Queue every profile the scan finds due, oldest pending observation first. The scan applies the rules of
+        `_dream_trigger` (which re-checks each profile under its lock) and leaves out profiles parked on a model
+        failure (`_route_parked`), so profiles that are not due cannot fill the batch and starve one that is."""
+        now = self.clock()
         rows = await self.db.fetch(
-            "SELECT o.profile_id FROM lesson_observations o JOIN profiles p ON p.id = o.profile_id "
-            "WHERE o.state = 'pending' AND p.memory = 1 AND p.learning = 1 AND p.incarnation IS NOT NULL "
-            "AND NOT EXISTS (SELECT 1 FROM dream_jobs j WHERE j.profile_id = o.profile_id "
+            "SELECT p.id AS profile_id FROM profiles p "
+            "CROSS JOIN LATERAL (SELECT COALESCE(MAX(j.input_at), 0) AS since FROM dream_jobs j "
+            "WHERE j.profile_id = p.id AND j.status = 'done') last "
+            "CROSS JOIN LATERAL (SELECT MIN(o.created_at) AS oldest, MAX(o.created_at) AS newest, "
+            "COUNT(*) FILTER (WHERE o.created_at > last.since) AS fresh, "
+            "COUNT(*) FILTER (WHERE o.created_at > last.since AND o.outcome = 'feedback_down' AND o.loaded <> '[]') "
+            "AS flagged FROM lesson_observations o WHERE o.profile_id = p.id AND o.state = 'pending') pending "
+            "WHERE p.memory = 1 AND p.learning = 1 AND p.incarnation IS NOT NULL AND pending.newest <= ? "
+            "AND (pending.flagged > 0 OR pending.fresh >= ? "
+            "OR EXISTS (SELECT 1 FROM learned_skill_versions v WHERE v.profile_id = p.id AND v.change = 'suspend' "
+            "AND v.source_kind = 'automatic' AND v.created_at > last.since) "
+            "OR (pending.oldest <= ? AND last.since <= ?)) "
+            "AND NOT EXISTS (SELECT 1 FROM dream_jobs j WHERE j.profile_id = p.id "
             "AND j.status IN ('pending', 'running')) "
-            "AND NOT EXISTS (SELECT 1 FROM profile_deletions d WHERE d.profile_id = o.profile_id) "
-            "GROUP BY o.profile_id HAVING MAX(o.created_at) <= ? ORDER BY MIN(o.created_at) LIMIT ?",
-            self.clock() - rules.debounce_seconds, _BATCH)
+            "AND NOT EXISTS (SELECT 1 FROM profile_deletions d WHERE d.profile_id = p.id) "
+            "AND NOT EXISTS (SELECT 1 FROM (SELECT j.status, j.error_code, j.provider, j.model FROM dream_jobs j "
+            "WHERE j.profile_id = p.id ORDER BY j.created_at DESC, j.id DESC LIMIT 1) prior "
+            "LEFT JOIN LATERAL (SELECT r.provider, r.model FROM runs r WHERE r.profile_id = p.id "
+            "AND r.status = 'completed' ORDER BY r.finished_at DESC NULLS LAST, r.created_at DESC LIMIT 1) route "
+            "ON TRUE "
+            "WHERE prior.status = 'failed' AND prior.error_code IN ('no_route', 'model_unavailable') "
+            "AND prior.provider IS NOT DISTINCT FROM route.provider AND prior.model IS NOT DISTINCT FROM route.model) "
+            "ORDER BY pending.oldest, p.id LIMIT ?",
+            now - rules.debounce_seconds, rules.min_observations, now - rules.interval_seconds,
+            now - rules.interval_seconds, _BATCH)
         for row in rows:
             await self._queue_dream(row["profile_id"], rules)
 
@@ -99,12 +121,23 @@ class DreamStoreMixin:
             if trigger is None:
                 return
             route = await self._dream_route(profile_id)
+            if await self._route_parked(profile_id, route):
+                return
             stamp = self.clock()
             await self.db.execute(
                 "INSERT INTO dream_jobs (id, profile_id, profile_incarnation, status, trigger, provider, model, "
                 "next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
                 uuid.uuid4().hex, profile_id, profile["incarnation"], trigger, route[0], route[1],
                 await self.coordination_now(), stamp, stamp)
+
+    async def _route_parked(self, profile_id: str, route: tuple[str | None, str | None]) -> bool:
+        """The profile's last dream failed for want of a usable model and the route has not changed since: a new job
+        would fail the same way. An operator retry or a completed run on another model lifts it."""
+        prior = await self.db.fetchrow(
+            "SELECT status, error_code, provider, model FROM dream_jobs WHERE profile_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", profile_id)
+        return (prior is not None and prior["status"] == "failed" and prior["error_code"] in _PARKING
+                and (prior["provider"], prior["model"]) == route)
 
     async def _dream_trigger(self, profile_id: str, rules, now: float) -> str | None:
         """Why the profile is due (§5), or None. Counts only evidence newer than the last completed dream's input,
@@ -342,7 +375,7 @@ class DreamStoreMixin:
             return {}, None
         rows = await self.db.fetch(
             "SELECT id, session_id FROM lesson_observations WHERE profile_id = ? AND state = 'pending' AND id IN ("
-            + ", ".join("?" for _ in used) + ") FOR UPDATE", profile_id, *used)
+            + ", ".join("?" for _ in used) + ") ORDER BY id FOR UPDATE", profile_id, *used)
         if len(rows) != len(used):
             return {}, "An observation changed while the dream ran."
         return {row["id"]: row["session_id"] for row in rows}, None
