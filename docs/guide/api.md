@@ -419,13 +419,13 @@ remove a container by name alone.
 | 400 | `model_not_vision_capable` | The input has images and the model cannot read them. |
 | 401 | `unauthorized` | Missing or wrong key. |
 | 404 | `profile_not_found`, `session_not_found`, `run_not_found` | No such object. |
+| 404 | `dream_not_found` | No such dream in this profile. |
 | 404 | `memory_not_found` | No such memory entry in this profile. |
 | 404 | `learned_skill_not_found` | No such learned skill in this profile. |
 | 404 | `feedback_not_found` | The run has no feedback. |
 | 409 | `run_not_terminal` | Feedback is accepted only once the run has finished. |
 | 409 | `version_conflict` | The memory entry or learned skill changed since `expected_version`. |
 | 409 | `name_taken`, `skill_limit`, `skill_retired` | A learned skill's name is in use, the profile has 50 active or suspended skills, or the skill is retired. |
-| 404 | `dream_not_found` | No such dream in this profile. |
 | 409 | `dream_not_retryable` | Only a failed dream can be retried. |
 | 409 | `dream_busy` | Another dream of the profile is queued or running. |
 | 409 | `session_busy` | The session already has a run in progress (also when deleting it). |

@@ -5,10 +5,12 @@ import pytest
 
 from keel.api import Keel, create_app
 from keel.config import ServiceCredential
+from keel.dream_gates import DreamRules
 from keel.events import InMemoryEventBus
 from keel.models import Message, TextPart
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
+from keel.review_observe import StagedObservation
 from keel.runner import RunExecutor
 from keel.store.base import SkillSource
 
@@ -29,13 +31,13 @@ async def client(store):
         yield http, store
 
 
-from keel.dream_gates import DreamRules
-from keel.review_observe import StagedObservation
-
-
 async def queued_dream(store, clock):
     store.coordination_clock = clock
-    for session in ("s1", "s2"):
+    return await more_observations(store, clock, ("s1", "s2"))
+
+
+async def more_observations(store, clock, sessions):
+    for session in sessions:
         await store.ensure_session("p1", session)
         row = await store.db.fetchrow("SELECT generation FROM sessions WHERE id = ?", session)
         await store._insert_observation("p1", session, row["generation"],
@@ -57,6 +59,7 @@ async def test_dreams_are_listed_newest_first_with_route_usage_and_changes(clien
     assert (await http.get("/v1/profiles/p1/dreams?status=done")).json() == {"dreams": []}
     assert (await http.get("/v1/profiles/p1/dreams?status=bogus")).status_code == 400
     assert (await http.get("/v1/profiles/p1/dreams?limit=0")).status_code == 400
+    assert (await http.get("/v1/profiles/p1/dreams?limit=101")).status_code == 400
 
 
 async def test_retry_requeues_once_and_refuses_unknown_or_finished_dreams(client, clock):
@@ -77,3 +80,13 @@ async def test_another_tenant_sees_no_dreams(client, clock):
     await queued_dream(store, clock)
     other = {"Authorization": "Bearer key-two"}
     assert (await http.get("/v1/profiles/p1/dreams", headers=other)).status_code == 404
+
+
+async def test_retry_is_refused_while_another_dream_of_the_profile_is_open(client, clock):
+    http, store = client
+    failed = await queued_dream(store, clock)
+    await store.fail_dream(failed, "internal", "boom", retry=False)
+    second = await more_observations(store, clock, ("s3",))
+    assert second is not None and second.job.id != failed.job.id
+    refused = await http.post(f"/v1/profiles/p1/dreams/{failed.job.id}/retry")
+    assert (refused.status_code, refused.json()["error"]["code"]) == (409, "dream_busy")

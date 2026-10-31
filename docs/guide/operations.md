@@ -201,13 +201,15 @@ the observations' `consumed_by` and `note` columns written by the commit). A dre
 observations and writes learned skills; no new process or setting turns it on.
 
 A profile becomes due when it has pending observations, the newest is at least `KEEL_DREAM_DEBOUNCE_SECONDS` (one
-hour) old, and one of these holds, counting only observations newer than the input of the last completed dream:
+hour) old, and one of these holds. The first three count only evidence newer than the input of the last completed
+dream:
 
 - `feedback`: a pending `feedback_down` observation of a run that loaded a learned skill.
 - `suspension`: a learned skill was suspended automatically.
 - `observations`: at least `KEEL_DREAM_MIN_OBSERVATIONS` (8) pending observations.
 - `interval`: the oldest pending observation and the last completed dream are both at least a day old
-  (`KEEL_DREAM_INTERVAL_SECONDS`), so even one observation is eventually consolidated.
+  (`KEEL_DREAM_INTERVAL_SECONDS`), so even one observation is eventually consolidated. This rule looks at ages, not
+  at what is new.
 
 A failed dream does not block the next one. A profile has at most one open (pending or running) dream, and a dream
 never runs beside a memory review of the same profile; they share the profile's lease. A profile starts at most
@@ -229,22 +231,24 @@ name was taken; the retry re-reads current state); `lease_expired` (the worker s
 `learning_disabled` and `profile_gone` (the dream is `discarded`: learning or memory was turned off, or the profile
 was replaced or is being deleted).
 
-Gates, applied while the dream stages its changes and again at commit:
+Gates. When the dream stages a change, it is refused unless:
 
 - Evidence: `create` and `revise` cite at least 2 observations from at least 2 different sessions, or 1 `requested`
   observation, or 1 `feedback_up` observation with a comment. `retire` cites a contradicting observation or is part
   of a merge. Every cited observation belongs to this dream's input.
-- A new skill whose name or description overlaps a live learned skill (token overlap of 0.6) is refused, and so is
-  one that duplicates a deployment skill.
-- The text is validated like a consumer's: size limits, no secrets, no instruction-like text.
+- A new skill whose name or description overlaps a live learned skill (token overlap of 0.6) is not created, and
+  neither is one that duplicates a deployment skill.
 - Consumer precedence: a change to a skill whose last consumer edit, rollback, suspension or resumption is newer than
   every cited observation is refused.
 - One change per skill per dream. A revise or merge makes a suspended skill active again; a merge retires its sources
   with the rationale "merged into <name>" and writes a `merge` version on the target.
-- At commit, every touched skill's version must equal the one the dream read and every used observation must still
-  be pending. Otherwise the whole proposal is discarded and the attempt fails as `conflict`. The lease, the
-  profile's incarnation, the learning flag and deletion admission are checked too, and the changes, observation
-  states and the job's completion are written in one transaction.
+
+At commit, nothing is written unless the lease, the profile's incarnation, the learning flag and deletion admission
+still hold, every skill the dream read is still at the version it read (and not retired), and every used observation
+is still pending. A consumer edit made while the dream ran therefore shows up as a version conflict. The text is
+validated again, and a name taken or the skill limit reached in the meantime also fails the commit. On any conflict
+the whole proposal is discarded and the attempt fails as `conflict`; the retry re-reads current state. The changes,
+observation states and the job's completion are written in one transaction.
 
 Used observations become `consumed` with `consumed_by` set to `dream:<job id>`; dismissed ones become `dismissed`
 with the reason in `note`. Inspect dreams with `GET /v1/profiles/{p}/dreams` and requeue a failed one with `POST
