@@ -542,3 +542,42 @@ async def test_a_stored_tool_without_a_definition_is_not_offered_and_does_not_br
     await executor.execute(run)
     assert [tool["name"] for tool in provider.requests[0].tools] == ["read_file"]
     assert (await store.get_run("p1", run.id)).status == "completed"
+
+
+async def test_a_run_that_reaches_the_iteration_cap_is_recorded_as_capped(store):
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[],
+                               memory=True)
+    listing = [ToolCallReady(ToolCall("c1", "memory", json.dumps({"action": "list"}))), Completed(Usage(1, 1, 0, 0))]
+    provider = FakeProvider(script=[listing, [TextDelta("summary"), Completed(Usage(1, 1, 0, 0))]])
+    registry = ProviderRegistry()
+    registry.register(provider)
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep, max_iterations=1,
+                           background=Background())
+    await store.ensure_session("p1", "s1")
+    await store.set_title("p1", "s1", "Kept", "user")
+    await store.create_run(profile_id="p1", session_id="s1", provider="fake", model="m", reasoning_effort="low",
+                           input_parts=[{"type": "text", "text": "go"}], instructions=None)
+    run = await store.claim_run("w1", 9_999_999)
+    await executor.execute(run)
+    done = await store.get_run("p1", run.id)
+    assert done.status == "completed" and done.capped is True
+    assert provider.requests[-1].tools == ()
+
+
+async def test_an_ordinary_completion_is_not_capped_and_only_completed_runs_can_be(store):
+    await store.upsert_profile("p1", models=[{"provider": "fake", "model": "m"}], sandbox={}, soul="", skills=[])
+    provider = FakeProvider(script=[[TextDelta("ok"), Completed(Usage(1, 1, 0, 0))]])
+    registry = ProviderRegistry()
+    registry.register(provider)
+    executor = RunExecutor(store, InMemoryEventBus(), registry, sleep=no_sleep, background=Background())
+    for session in ("s1", "s2"):
+        await store.ensure_session("p1", session)
+        await store.set_title("p1", session, f"Kept {session}", "user")
+        await store.create_run(profile_id="p1", session_id=session, provider="fake", model="m", reasoning_effort="low",
+                               input_parts=[{"type": "text", "text": "go"}], instructions=None)
+    first = await store.claim_run("w1", 9_999_999)
+    await executor.execute(first)
+    assert (await store.get_run("p1", first.id)).capped is False
+    second = await store.claim_run("w1", 9_999_999)
+    with pytest.raises(ValueError):
+        await store.finish_run(second.id, "failed", error_code="x", error="y", capped=True)

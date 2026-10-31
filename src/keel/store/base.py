@@ -275,6 +275,7 @@ class Run:
     finished_at: float | None
     current_exec_id: str | None = None
     profile_incarnation: str | None = None
+    capped: bool = False
 
 
 @dataclass(frozen=True)

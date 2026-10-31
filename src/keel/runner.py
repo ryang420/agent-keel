@@ -152,10 +152,10 @@ class RunExecutor:
 
     async def _finish(self, run: Run, status: str, *, output: str, usage: Usage,
                       error_code: str | None = None, error: str | None = None,
-                      incomplete: bool = False) -> bool:
+                      incomplete: bool = False, capped: bool = False) -> bool:
         """Commit the terminal transition; True only when this executor won it, so completion work may run."""
         transition = await self.store.finish_run(run.id, status, output=output, usage=usage, error_code=error_code,
-                                                 error=error, incomplete=incomplete)
+                                                 error=error, incomplete=incomplete, capped=capped)
         if transition is None or transition.event is None:
             return False
         await self.bus.notify(run.id)
@@ -419,7 +419,8 @@ class RunExecutor:
                 state.pending = []
                 raise
             if not calls:
-                if await self._finish(run, "completed", output=output, usage=state.usage, incomplete=incomplete):
+                if await self._finish(run, "completed", output=output, usage=state.usage, incomplete=incomplete,
+                                     capped=final):
                     # The worker may cancel a terminal run at any moment; completion work still finishes.
                     await self._shielded(run, self._after_complete(run, profile), "finish the completed run")
                 return

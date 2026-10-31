@@ -314,10 +314,25 @@ CREATE INDEX skill_loads_skill ON skill_loads (profile_id, skill_id, loaded_at);
 CREATE INDEX skill_loads_session ON skill_loads (profile_id, session_id)
 """
 
+# Procedural learning, observations and feedback (learning design §4, §6): whether a run ended at the iteration cap,
+# which review job or run produced an observation, and one feedback row per run.
+_V12 = """
+ALTER TABLE runs ADD COLUMN capped INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE lesson_observations ADD COLUMN review_job_id TEXT;
+ALTER TABLE lesson_observations ADD COLUMN run_id TEXT;
+CREATE INDEX lesson_observations_job ON lesson_observations (profile_id, review_job_id);
+CREATE TABLE run_feedback (
+    profile_id TEXT NOT NULL, run_id TEXT NOT NULL, session_id TEXT NOT NULL,
+    rating TEXT NOT NULL CHECK (rating IN ('up', 'down')), comment TEXT, observation_id TEXT,
+    created_at {real} NOT NULL, updated_at {real} NOT NULL,
+    PRIMARY KEY (profile_id, run_id));
+CREATE INDEX run_feedback_session ON run_feedback (profile_id, session_id)
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
     Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9),
-    Migration(10, _V10), Migration(11, _V11))
+    Migration(10, _V10), Migration(11, _V11), Migration(12, _V12))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 
