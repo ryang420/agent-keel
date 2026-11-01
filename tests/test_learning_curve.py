@@ -296,3 +296,21 @@ async def test_a_provider_that_stops_answering_stops_the_curve_as_an_error(tmp_p
     assert sequence["retire"]["status"] == "retired"
     summary = summarize_curve(records)
     assert not summary["complete"] and summary["errors"] >= curve.PROVIDER_DOWN_LIMIT
+
+
+async def test_each_dream_call_and_job_outcome_is_kept_beside_the_sequence(tmp_path, pg_dsn):
+    """The curve's database is dropped at the end, so why a dream declined must be kept as it goes: every dream call's
+    new messages and reply, and each dream job's status, error and changes on the sequence record."""
+    repo, cases = toy(tmp_path)
+    records = await _run(tmp_path, pg_dsn, cases, repo)
+    root = tmp_path / "eval" / "curve"
+    lines = [json.loads(line) for line in
+             (root / "learning" / "stockindex" / "rep-0" / "dreams.jsonl").read_text().splitlines()]
+    assert lines and all(line["reply"]["text"] == "ANSWER: 42" for line in lines)
+    assert lines[0]["messages"] and lines[0]["messages"][0]["role"] == "user"
+    assert not (root / "baseline" / "stockindex" / "rep-0" / "dreams.jsonl").exists()
+    learning = next(r for r in records if r.get("kind") == "sequence" and r["arm"] == "learning")
+    assert learning["dream_jobs"] and all(job["status"] == "done" and job["changes"] is not None
+                                          for job in learning["dream_jobs"])
+    baseline = next(r for r in records if r.get("kind") == "sequence" and r["arm"] == "baseline")
+    assert baseline["dream_jobs"] == []

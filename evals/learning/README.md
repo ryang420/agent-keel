@@ -196,5 +196,9 @@ the git commit (`unknown` when git is unavailable) and, for conversations, the s
   review and dream jobs per dataset and repeat, per-dataset rows.
 - `curve/<timestamp>/budget.json` (the ledger) and `curve/<timestamp>/curve/records.jsonl` (written as the run goes).
 - `curve/<timestamp>/curve/<arm>/<dataset>/rep-<n>/<query>.json`: a task's record and stored messages.
+- `curve/<timestamp>/curve/learning/<dataset>/rep-<n>/dreams.jsonl`: one line per dream model call, with the messages
+  added since the attempt's previous call (redacted), the reply's text and tool calls, its usage and any error, so a
+  refused proposal (a tool result) survives the dropped database. Each sequence record also lists its dream jobs
+  (`dream_jobs`: status, trigger, attempts, error code and error, committed changes).
 
 The numbers are correlations on few held-out tasks; they do not show that a particular skill caused an outcome.

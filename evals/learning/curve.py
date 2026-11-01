@@ -29,6 +29,7 @@ from evals.dab.prompt import build
 from evals.dab.runner import (MIN_RUN_FLOOR, TERMINAL, _budgeted, _retire_profile, _settings, _wait_for_cleanup,
                               extract_answer, managed_containers, temporary_database)
 from evals.dab.suite import Case
+from evals.learning.transcripts import DreamRecorder
 
 ARMS = ("learning", "baseline")
 DRAIN = ReviewSettings(turns=1, idle_seconds=0.0, max_age_seconds=0.0)
@@ -164,7 +165,7 @@ def _overhead(ledger: Ledger, labels: tuple[str, ...]) -> int:
 
 async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, paths: Paths, arm: str, repeat: int,
                 profile_id: str, repo: Path, provider: str, model: str, reasoning_effort: str, timeout_s: float,
-                ledger: Ledger, emit, breaker: Breaker) -> dict:
+                ledger: Ledger, emit, breaker: Breaker, recorder: DreamRecorder) -> dict:
     """The learning phase then the held-out tasks on one profile; returns the sequence's measurements."""
     dataset = cases[0].dataset.name
     learn, held = split(cases)
@@ -230,7 +231,11 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
                     await _drain(reviewer)
                     if arm == "learning":
                         charging.switch(dream_label)
-                        await _drain(dreamer)
+                        recorder.start(paths.root / "curve" / arm / dataset / f"rep-{repeat}" / "dreams.jsonl")
+                        try:
+                            await _drain(dreamer)
+                        finally:
+                            recorder.start(None)
             except Exception as exc:  # noqa: BLE001 - one task's failure is a record, never the loss of the run
                 emit({**base, "status": "setup_failed", "passed": False, "error": _short(exc)})
     learned = await keel.store.learned_skills(profile_id)
@@ -242,6 +247,9 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
                   "reviews_not_done": sum(job.status != "done" for job in reviews),
                   "dreams": sum(job.status == "done" for job in dreams),
                   "dreams_not_done": sum(job.status != "done" for job in dreams),
+                  "dream_jobs": [{"status": job.status, "trigger": job.trigger, "attempts": job.attempts,
+                                  "error_code": job.error_code, "error": redact(job.error or "")[:300],
+                                  "changes": job.changes} for job in reversed(dreams)],
                   "overhead_tokens": _overhead(ledger, (review_label, dream_label)),
                   "skills": [{"name": s.name, "state": s.state, "version": s.version} for s in learned]})
     return stats
@@ -249,7 +257,7 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
 
 async def _sequence(client, keel, charging: Charging, cases: list[Case], *, paths: Paths, arm: str, repeat: int,
                     repo: Path, mount_root: Path, image: str, provider: str, model: str, reasoning_effort: str,
-                    timeout_s: float, ledger: Ledger, breaker: Breaker) -> list[dict]:
+                    timeout_s: float, ledger: Ledger, breaker: Breaker, recorder: DreamRecorder) -> list[dict]:
     dataset = cases[0].dataset.name
     profile_id = f"curve-{arm}-{dataset.lower()}-{repeat}"
     log = paths.root / "curve" / "records.jsonl"
@@ -277,7 +285,7 @@ async def _sequence(client, keel, charging: Charging, cases: list[Case], *, path
             stats = await _play(client, keel, charging, cases, staged, paths=paths, arm=arm, repeat=repeat,
                                 profile_id=profile_id, repo=repo, provider=provider, model=model,
                                 reasoning_effort=reasoning_effort, timeout_s=timeout_s, ledger=ledger, emit=emit,
-                                breaker=breaker)
+                                breaker=breaker, recorder=recorder)
         except Exception as exc:  # noqa: BLE001 - keep what ran; the sequence record carries the error
             stats = {"error": _short(exc)}
         try:
@@ -316,8 +324,9 @@ async def execute_curve(cases: list[Case], *, repo: Path, paths: Paths, ledger: 
         if aws_region:
             settings = replace(settings, aws_region=aws_region)  # bedrock reaches the model in the region given
         charging = Charging(ledger)
-        registry = _budgeted(providers if providers is not None else default_providers(settings), charging,
-                             max_output)
+        recorder = DreamRecorder()
+        registry = _budgeted(recorder.wrap(providers if providers is not None else default_providers(settings)),
+                             charging, max_output)
         app = create_service(settings, providers=registry)
         async with app.router.lifespan_context(app):
             keel = app.state.keel
@@ -334,7 +343,8 @@ async def execute_curve(cases: list[Case], *, repo: Path, paths: Paths, ledger: 
                                                        repeat=repeat, paths=paths, repo=repo,
                                                        mount_root=mount_root, image=image, provider=provider,
                                                        model=model, reasoning_effort=reasoning_effort,
-                                                       timeout_s=timeout_s, ledger=ledger, breaker=breaker)
+                                                       timeout_s=timeout_s, ledger=ledger, breaker=breaker,
+                                                       recorder=recorder)
     if sandbox != "none":
         await _wait_for_cleanup()
         if managed_containers():

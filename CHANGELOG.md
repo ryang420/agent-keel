@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- The learning curve (`evals/learning`) keeps each dream's model calls and job outcome in `dreams.jsonl` beside its
+  sequence, and each sequence record lists its `dream_jobs`, so a curve that learns nothing shows why.
+
 ## [0.4.0] - 2026-11-01
 
 Cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`, accepted 2026-10-30) and procedural learning
