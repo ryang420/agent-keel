@@ -113,11 +113,17 @@ it is written.
 - **Order.** The arm order alternates per (repeat, dataset), so a budget stop cannot fall systematically on one arm.
 - **Budget.** `--max-tokens` is a cumulative cap over every model call, reviews and dreams included. A task that hits
   it is recorded as `budget_exhausted` from the budget ledger.
-- **Errors.** Records with a setup failure, a block or a budget stop are excluded from every metric and make the
-  summary incomplete, so no comparison is drawn from a partial run, and the command exits non-zero.
-- **Failed and timed-out runs.** A held-out run that failed, or that was stopped at the deadline (`timeout`, however
-  quickly the stop lands), counts as a wrong answer for correctness and is left out of the iteration, tool-error and
-  token means. The summary and the report give per-arm counts of both.
+- **Errors.** Records with a setup failure, a block, a budget stop or a provider failure are excluded from every
+  metric and make the summary incomplete, so no comparison is drawn from a partial run, and the command exits non-zero.
+- **Provider failures.** A run that failed with a provider error (`auth`, `rate_limited` or `server_error`: expired
+  credentials, an outage) never got an answer from the model, so it is the error `provider_failed`, not a wrong
+  answer, and no feedback is sent for it. Three in a row, across sequences, stop the curve: the current sequence is
+  recorded and its profile retired, no further sequence starts, and the command exits non-zero. A session token's
+  lifetime bounds how long a curve can run; refresh the credentials before a long run.
+- **Failed and timed-out runs.** A held-out run that failed for any other reason, or that was stopped at the deadline
+  (`timeout`, however quickly the stop lands), counts as a wrong answer for correctness and is left out of the
+  iteration, tool-error and token means. The summary and the report give per-arm counts of both. A record that did
+  not end `executed` carries the run's `error_code` and its redacted `error`.
 - **Overhead.** Tokens spent by reviews and dreams (the cost of learning, not of the tasks) are reported separately as
   learning overhead tokens, alongside the learned-skill count. The summary and the report also give the learned skills
   per dataset and repeat, and each sequence records how many review and dream jobs did not end `done`.

@@ -35,12 +35,36 @@ DRAIN = ReviewSettings(turns=1, idle_seconds=0.0, max_age_seconds=0.0)
 FORCE = DreamSettings(rules=DreamRules(min_observations=1, debounce_seconds=0.0, interval_seconds=1e9,
                                        daily_attempts=1000))
 FEEDBACK = {True: ("up", "Correct."), False: ("down", "Not correct.")}
-ERROR_STATUSES = frozenset({"setup_failed", "blocked", "budget_exhausted"})
+ERROR_STATUSES = frozenset({"setup_failed", "blocked", "budget_exhausted", "provider_failed"})
 UNMEASURED = frozenset({"failed", "timeout"})  # wrong answers for correctness, left out of the effort means
+# a run failed with one of these never got an answer from the model: an error, not a wrong answer
+PROVIDER_DOWN = frozenset({"auth", "rate_limited", "server_error"})
+PROVIDER_DOWN_LIMIT = 3  # in a row, across sequences: the provider is down, so stop instead of spending the rest
 
 
 class CurveError(RuntimeError):
     """The curve cannot run as asked."""
+
+
+class ProviderDown(CurveError):
+    """The provider failed PROVIDER_DOWN_LIMIT tasks in a row (expired credentials, an outage)."""
+
+
+class Breaker:
+    """Counts provider failures in a row over the whole curve; tripped once there are PROVIDER_DOWN_LIMIT."""
+
+    def __init__(self) -> None:
+        self.failures = 0
+        self.tripped: ProviderDown | None = None
+
+    def record(self, status: str, error_code: str | None, error: str) -> None:
+        if status != "provider_failed":
+            self.failures = 0
+            return
+        self.failures += 1
+        if self.failures >= PROVIDER_DOWN_LIMIT:
+            self.tripped = ProviderDown(f"the provider failed {self.failures} tasks in a row ({error_code}: "
+                                        f"{error}); the curve stopped")
 
 
 def split(cases: list[Case]) -> tuple[list[Case], list[Case]]:
@@ -140,7 +164,7 @@ def _overhead(ledger: Ledger, labels: tuple[str, ...]) -> int:
 
 async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, paths: Paths, arm: str, repeat: int,
                 profile_id: str, repo: Path, provider: str, model: str, reasoning_effort: str, timeout_s: float,
-                ledger: Ledger, emit) -> dict:
+                ledger: Ledger, emit, breaker: Breaker) -> dict:
     """The learning phase then the held-out tasks on one profile; returns the sequence's measurements."""
     dataset = cases[0].dataset.name
     learn, held = split(cases)
@@ -156,6 +180,9 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
     review_label, dream_label = f"{arm}/{dataset}#{repeat}/review", f"{arm}/{dataset}#{repeat}/dream"
     for phase, chosen in (("learn", learn), ("heldout", held)):
         for case in chosen:
+            if breaker.tripped is not None:
+                stats["error"] = _short(breaker.tripped)
+                break
             base = {"kind": "task", "arm": arm, "dataset": dataset, "repeat": repeat, "phase": phase,
                     "case": case.case_id}
             try:
@@ -177,6 +204,8 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
                 # a stopped reservation surfaces as a generic internal error, so the ledger is the evidence
                 if status == "failed" and (_exhausted(ledger, label) or "budget" in (run.get("error") or "").lower()):
                     status = "budget_exhausted"
+                elif status == "failed" and run.get("error_code") in PROVIDER_DOWN:
+                    status = "provider_failed"
                 if status == "setup_failed":
                     emit({**base, "status": status, "passed": False, "error": redact(outcome.get("error", ""))})
                     continue
@@ -185,9 +214,12 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
                 passed = bool(scoring.score(case, repo, answer)["official_validator_pass"]) and status == "executed"
                 record = {**base, "status": status, "passed": passed, "tokens": _tokens(run.get("usage")),
                           "duration_s": outcome.get("duration_s"), **metrics(messages)}
+                if status != "executed":
+                    record.update(error_code=run.get("error_code"), error=redact(run.get("error") or "")[:300])
                 _artifact(paths, arm, dataset, repeat, case, record, messages)
                 emit(record)
-                if phase == "learn" and run.get("run_id") and status != "budget_exhausted":
+                breaker.record(status, record.get("error_code"), record.get("error", ""))
+                if phase == "learn" and run.get("run_id") and status not in ERROR_STATUSES:
                     rating, comment = FEEDBACK[passed]
                     sent = await client.put(f"/v1/profiles/{profile_id}/runs/{run['run_id']}/feedback",
                                             json={"rating": rating, "comment": comment})
@@ -217,7 +249,7 @@ async def _play(client, keel, charging: Charging, cases: list[Case], staged, *, 
 
 async def _sequence(client, keel, charging: Charging, cases: list[Case], *, paths: Paths, arm: str, repeat: int,
                     repo: Path, mount_root: Path, image: str, provider: str, model: str, reasoning_effort: str,
-                    timeout_s: float, ledger: Ledger) -> list[dict]:
+                    timeout_s: float, ledger: Ledger, breaker: Breaker) -> list[dict]:
     dataset = cases[0].dataset.name
     profile_id = f"curve-{arm}-{dataset.lower()}-{repeat}"
     log = paths.root / "curve" / "records.jsonl"
@@ -244,7 +276,8 @@ async def _sequence(client, keel, charging: Charging, cases: list[Case], *, path
         try:
             stats = await _play(client, keel, charging, cases, staged, paths=paths, arm=arm, repeat=repeat,
                                 profile_id=profile_id, repo=repo, provider=provider, model=model,
-                                reasoning_effort=reasoning_effort, timeout_s=timeout_s, ledger=ledger, emit=emit)
+                                reasoning_effort=reasoning_effort, timeout_s=timeout_s, ledger=ledger, emit=emit,
+                                breaker=breaker)
         except Exception as exc:  # noqa: BLE001 - keep what ran; the sequence record carries the error
             stats = {"error": _short(exc)}
         try:
@@ -274,6 +307,7 @@ async def execute_curve(cases: list[Case], *, repo: Path, paths: Paths, ledger: 
     if sandbox != "none" and managed_containers():
         raise CurveError("managed sandbox containers already exist; remove them before running the curve")
     records: list[dict] = []
+    breaker = Breaker()
     async with temporary_database(admin_dsn) as database_url:
         settings = replace(_settings(database_url, mount_root=mount_root, docker="docker",
                                      max_iterations=max_iterations, openai_base_url=None, sandbox=sandbox,
@@ -294,16 +328,20 @@ async def execute_curve(cases: list[Case], *, repo: Path, paths: Paths, ledger: 
                         # alternate the arm order so a budget stop cannot fall systematically on one arm
                         order = ARMS if (repeat + index) % 2 == 0 else tuple(reversed(ARMS))
                         for arm in order:
+                            if breaker.tripped is not None:
+                                break
                             records += await _sequence(client, keel, charging, datasets[name], arm=arm,
                                                        repeat=repeat, paths=paths, repo=repo,
                                                        mount_root=mount_root, image=image, provider=provider,
                                                        model=model, reasoning_effort=reasoning_effort,
-                                                       timeout_s=timeout_s, ledger=ledger)
+                                                       timeout_s=timeout_s, ledger=ledger, breaker=breaker)
     if sandbox != "none":
         await _wait_for_cleanup()
         if managed_containers():
             raise CurveError("managed sandbox containers remain after the curve; records are in "
                              f"{paths.root / 'curve' / 'records.jsonl'}")
+    if breaker.tripped is not None:
+        raise ProviderDown(f"{breaker.tripped}; records are in {paths.root / 'curve' / 'records.jsonl'}")
     return records
 
 

@@ -13,6 +13,7 @@ from evals.learning import curve
 from evals.learning.curve import CurveError, _task, execute_curve, metrics, split, summarize_curve
 from evals.learning.report import write_curve
 from keel.models import Completed, TextDelta, Usage
+from keel.providers.base import ModelError
 from keel.providers.base import ProviderRegistry
 from keel.providers.fake import FakeProvider
 
@@ -268,3 +269,30 @@ async def test_a_bedrock_curve_needs_no_openai_key_and_uses_the_region_given(tmp
                                   repeats=1, sandbox="none", timeout_s=60, aws_region="eu-test-1")
     assert seen == ["eu-test-1"]
     assert all(r["passed"] for r in records if r.get("kind") == "task")
+
+
+async def test_a_provider_that_stops_answering_stops_the_curve_as_an_error(tmp_path, pg_dsn):
+    """Expired credentials fail every run before the model answers: those runs are errors, not wrong answers, no
+    feedback is sent for them, and a few in a row stop the curve instead of spending the rest of it."""
+    repo, cases = toy(tmp_path, numbers=("1", "2", "3", "4", "5", "6"))
+    registry = ProviderRegistry()
+    answer = [TextDelta("ANSWER: 42"), Completed(Usage(10, 2, 0, 0))]
+    expired = [ModelError("auth", "The security token included in the request is expired")]
+    registry.register(FakeProvider(script=[answer] + [expired] * 400))
+    paths = inputs.Paths(tmp_path / "eval").ensure()
+    with pytest.raises(CurveError, match="auth"):
+        await execute_curve(cases, repo=repo, paths=paths, ledger=Ledger.grant(paths.budget, 1_000_000),
+                            mount_root=tmp_path / "mounts", admin_dsn=pg_dsn, provider="fake", model="m",
+                            repeats=2, sandbox="none", providers=registry, timeout_s=60)
+    records = [json.loads(line) for line in (paths.root / "curve" / "records.jsonl").read_text().splitlines()]
+    tasks = [r for r in records if r["kind"] == "task"]
+    assert tasks[0]["status"] == "executed"
+    down = tasks[1:]
+    assert len(down) == curve.PROVIDER_DOWN_LIMIT
+    assert all(r["status"] == "provider_failed" and r["error_code"] == "auth" and "expired" in r["error"]
+               for r in down)
+    sequence = next(r for r in records if r["kind"] == "sequence")
+    assert sequence["feedback"] == 1 and "auth" in sequence["error"]  # feedback only for the run that answered
+    assert sequence["retire"]["status"] == "retired"
+    summary = summarize_curve(records)
+    assert not summary["complete"] and summary["errors"] >= curve.PROVIDER_DOWN_LIMIT
