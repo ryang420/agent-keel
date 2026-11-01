@@ -66,6 +66,13 @@ All notable changes to this project are documented here. The format follows
   `.venv/bin/python -m pytest -q -m 'not integration'` runs the unit subset without a database. Docker sandbox and
   live-model suites remain opt-in.
 
+### Fixed
+- A stop that landed while a command was being dispatched, before the sandbox supervisor had reserved it, could not
+  be confirmed: the command ran on and the run's sandbox usage waited for recovery, so the session's next run
+  queued for 30 seconds to over two minutes. A dispatch now completes before the stop acts, and the cancel asks the
+  supervisor again until it has reserved the exec, within the same control budget, so the cleanup is proven and the
+  usage released at once.
+
 ## [0.3.2] - 2026-10-31
 
 A patch on 0.3.1: command runs, one command in a profile's sandbox without a model

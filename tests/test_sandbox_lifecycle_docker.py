@@ -152,6 +152,10 @@ async def exec_state(store, exec_id: str) -> str:
     return (await store.db.fetchrow("SELECT state FROM sandbox_execs WHERE id = ?", exec_id))["state"]
 
 
+async def ticketed(store, exec_id: str) -> bool:
+    return await store.db.fetchrow("SELECT 1 FROM sandbox_execs WHERE id = ?", exec_id) is not None
+
+
 async def sandbox_row(store, deployment: str, profile_id: str = "p1") -> dict:
     return await store.db.fetchrow(
         "SELECT * FROM sandboxes WHERE deployment = ? AND profile_id = ?", deployment, profile_id)
@@ -239,6 +243,28 @@ async def test_a_timeout_and_a_cancellation_end_the_whole_tree_through_the_super
     assert await exec_state(store, "x-cancel") == "finished"  # the supervisor proved the tree gone
     check = await run(coordinator, bound, "sleep 3.5; ls /work")
     assert "late" not in check.output and "cancelled" not in check.output
+    await finish(coordinator, store, claim)
+
+
+async def test_a_cancellation_before_the_supervisor_reserves_the_exec_still_ends_it(single, backend):
+    """A stop right after dispatch reaches the supervisor before `run` has reserved the exec. The control asks
+    again until the exec is reserved and cancelled, so the cleanup is proven and the usage released, instead of the
+    command running on and the usage waiting for recovery."""
+    store, _ = single
+    coordinator = await opened(store, backend)
+    await seed(store, "p1")
+    claim, bound = await claim_and_prepare(coordinator, store, "s1")
+    for attempt in range(3):
+        exec_id = f"x-early-{attempt}"
+        early = asyncio.create_task(run(coordinator, bound, f"sleep 5; touch /work/{exec_id}", exec_id=exec_id))
+        await wait_until(lambda: ticketed(store, exec_id), early, seconds=5,
+                         what="the exec ticket")  # dispatch is under way; the supervisor has not reserved it yet
+        early.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await early
+        assert await exec_state(store, exec_id) == "finished"
+    check = await run(coordinator, bound, "sleep 5.5; ls /work")
+    assert "x-early" not in check.output
     await finish(coordinator, store, claim)
 
 

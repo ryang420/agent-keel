@@ -22,7 +22,7 @@ from keel.sandbox.base import (
 from keel.sandbox.records import (
     BoundSandbox, CleanupReceipt, ContainerObservation, DockerOutcome, ExecTicket, LeaseStamp, LifecycleAttempt,
     RunClaim, SandboxBinding,
-    SandboxBusy, SandboxLeaseLost, SandboxUncertain, UseHandle,
+    SandboxBusy, SandboxLeaseLost, SandboxNotYet, SandboxUncertain, UseHandle,
 )
 from keel.store.deletions import ProfileDeletionAuthority
 from keel.store.base import ProfileDeletionConflict
@@ -33,6 +33,8 @@ from keel.store.sql import SqlStore
 log = logging.getLogger(__name__)
 # Docker transport allowed for one helper control request on top of the TERM grace and the descendant reap timeout.
 CONTROL_TRANSPORT_S = 15.0
+# Pause between cancel requests while the supervisor has not reserved the exec yet (it starts within a second).
+CONTROL_RETRY_S = 0.1
 
 
 def _observe(control: asyncio.Future) -> None:
@@ -281,8 +283,8 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         """Cancel one exec through its supervisor, sending at most one control request for it.
 
         The first request starts a control bounded by `control_budget_s`; concurrent and later requests for the
-        same exec join it and see its outcome, so a repeated stop never restarts the deadline or sends a second
-        request. Cancelling a waiter does not cancel the control; on budget expiry it records the exec uncertain.
+        same exec join it and see its outcome, so a repeated stop never restarts the deadline or starts a second
+        control. Cancelling a waiter does not cancel the control; on budget expiry it records the exec uncertain.
         """
         await self._ready()
         self._require_bound(sandbox)
@@ -304,8 +306,7 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         except Exception as exc:
             raise SandboxUncertain("the sandbox execution authority could not be verified") from exc
         try:
-            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
-            receipt = await asyncio.wait_for(self.backend.control_exec(ticket, cancel=True), remaining)
+            receipt = await self._cancel_exec(ticket, deadline)
             await self._finish_exec(sandbox, ticket, receipt)
         except asyncio.CancelledError:
             await self._try_mark_exec_uncertain(ticket, "control_cancelled")
@@ -313,6 +314,20 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         except Exception as exc:
             await self._try_mark_exec_uncertain(ticket, "control_or_cleanup_unverified")
             raise SandboxUncertain("the sandbox cancellation outcome is uncertain") from exc
+
+    async def _cancel_exec(self, ticket: ExecTicket, deadline: float) -> CleanupReceipt:
+        """Ask the supervisor to cancel; while it has not reserved the exec yet (a stop that lands between dispatch
+        and the helper's start), ask again until the deadline. Asking again is safe: the control token names this
+        one exec, and a cancel of an exec already cancelling or finished returns its terminal receipt."""
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = max(0.0, deadline - loop.time())
+            try:
+                return await asyncio.wait_for(self.backend.control_exec(ticket, cancel=True), remaining)
+            except SandboxNotYet:
+                if deadline - loop.time() <= CONTROL_RETRY_S:
+                    raise
+                await asyncio.sleep(CONTROL_RETRY_S)
 
     async def release(self, use: UseHandle, *, abandon_preparation: bool = False) -> bool:
         """Release only guarded, proven cleanup; terminal run status never supplies execution evidence."""

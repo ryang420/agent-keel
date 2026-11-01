@@ -31,7 +31,7 @@ from keel.sandbox.base import (
     validate_mount_sources,
 )
 from keel.sandbox.records import (
-    ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt, SandboxKey, SandboxUncertain,
+    ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt, SandboxKey, SandboxNotYet, SandboxUncertain,
 )
 from keel.sandbox.runtime import (
     HELPER_PROTOCOL_VERSION, HelperArtifact, artifact_directory, decode_receipt, normalize_architecture,
@@ -751,7 +751,6 @@ class DockerSandbox:
             raise ValueError("the exec identity is invalid")
         if not _TOKEN.fullmatch(ticket.control_token) or not _TOKEN.fullmatch(ticket.use.token):
             raise ValueError("the supervisor tokens must be 32 lowercase hexadecimal characters")
-        await self._require_recorded_key(ticket)
         args = ["exec", "-i"]
         if ticket.binding.policy.user:
             args += ["-u", ticket.binding.policy.user]
@@ -762,7 +761,24 @@ class DockerSandbox:
                      "--exec-id", ticket.exec_id, "--control-token", ticket.control_token,
                      "--usage-token", ticket.use.token, "--grace", str(float(self.kill_grace_s)),
                      "--reap", str(float(self.reap_seconds)), "--", *argv]
-            proc = await self._spawn(args, stdin is not None)
+
+            async def dispatch():
+                await self._require_recorded_key(ticket)
+                return await self._spawn(args, stdin is not None)
+
+            # A stop during dispatch waits for it: interrupted, the helper could still start with no one left to
+            # cancel it, and an exec that never reached the helper has no receipt. Dispatched, the cancel below
+            # and the coordinator's control reach it through the supervisor like any other.
+            dispatching = asyncio.ensure_future(dispatch())
+            stopped = False
+            try:
+                proc = await asyncio.shield(dispatching)
+            except asyncio.CancelledError:
+                stopped = True
+                try:
+                    proc = await dispatching
+                except Exception:
+                    raise asyncio.CancelledError  # the stop stands; the coordinator's control settles the outcome
 
             control_error = None
 
@@ -780,6 +796,8 @@ class DockerSandbox:
                 await self._send_cancel(ticket)
 
             try:
+                if stopped:
+                    raise asyncio.CancelledError
                 output, timed_out = await collect(proc, stdin, timeout_s, cancel)
             except asyncio.CancelledError:
                 await cancel()
@@ -812,7 +830,7 @@ class DockerSandbox:
         if result.code == 4:
             raise SandboxUncertain("the sandbox supervisor rejected the control binding")
         if result.code == 5:
-            raise SandboxUncertain("the sandbox exec endpoint or receipt is unavailable")
+            raise SandboxNotYet("the sandbox exec endpoint or receipt is not available yet")
         raise SandboxUncertain("the sandbox cancellation did not produce a definite result")
 
     async def aclose(self) -> None:
