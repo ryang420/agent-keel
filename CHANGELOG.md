@@ -70,8 +70,10 @@ All notable changes to this project are documented here. The format follows
 - A stop that landed just as a command started could not be confirmed: the command ran on (or, stopped before
   dispatch, was waited for until the control budget ran out), the run's sandbox usage went to recovery, and the
   session's next run queued for 30 seconds to over two minutes. A stop before dispatch now never starts the command
-  and finishes it as `not_dispatched`; a dispatch already under way completes, and the cancel asks the supervisor
-  again until it has reserved the exec, within the same control budget. Either way the usage is released at once.
+  and finishes it as `not_dispatched`; a dispatch already under way completes, the docker client is no longer killed
+  before the supervisor has ended the command (killed right after it started, it could abort the exec before Docker
+  started it), and the cancel asks the supervisor again until it has reserved the exec, within the same control
+  budget. Either way the usage is released at once.
 
 ## [0.3.2] - 2026-10-31
 

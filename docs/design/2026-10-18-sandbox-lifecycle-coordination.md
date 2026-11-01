@@ -171,8 +171,10 @@ A stop can arrive between the `pending` commit and the supervisor reserving the 
 the command must not start: the instance that admitted the ticket is the only one that may dispatch it, so it
 finishes the exec as `not_dispatched` (no receipt exists or is needed) and a later control for it returns at once.
 Once dispatch has begun it is not interrupted (cut short, the helper could still start with no control client
-left), and the control asks the supervisor to cancel again, within its one budget, while the supervisor reports no
-endpoint or receipt for the exec yet (exit 5). The exec then ends with a verified receipt like any other; only a
+left), and the stopped exec's Docker client is not killed until the supervisor has ended it or the kill grace, reap
+and a margin have passed: a client killed right after it started can abort the exec before Docker starts it, which
+leaves an exec the supervisor never reserves and no cancel can confirm. The control asks the supervisor to cancel
+again, within its one budget, while the supervisor reports no endpoint or receipt for the exec yet (exit 5). The exec then ends with a verified receipt like any other; only a
 budget that runs out leaves it uncertain.
 
 The registry includes terminal/execute-code commands, file helpers, skill discovery and reads, and temporary-file
