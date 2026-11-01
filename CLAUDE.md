@@ -88,8 +88,9 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
   background memory reviews, review API) and learned skills (store, `skill_manage`, the `learning` flag and the
   learned-skill API, migration 11) and observations, run feedback and automatic suspension (migration 12) and the
   dream (migration 13: leased profile-level dream jobs with commit gates and the dream routes) are merged
-  (`[Unreleased]`), and cross-session memory was accepted 2026-10-30 (see its acceptance record); next is learning
-  acceptance.
+  (`[Unreleased]`), and cross-session memory was accepted 2026-10-30 (see its acceptance record). Learning's first
+  live gate failed 2026-10-31: the DAB curve learned no skill (see the learning doc's acceptance record); next is a
+  curve protocol whose feedback carries method content, then a rerun.
 - M4 (history import and cutover) is consumer-specific.
 - Deferred items worth picking up next: images are replayed in full on later turns; the final iteration-cap call
   sends no tools (one cache miss); a unique index on (session, tool_call_id) for tool rows; shutdown

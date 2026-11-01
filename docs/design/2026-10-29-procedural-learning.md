@@ -1,6 +1,7 @@
 # Procedural learning: profile-private skills learned across sessions
 
-Date: 2026-10-29. Status: approved 2026-10-29; implemented after the cross-session memory design.
+Date: 2026-10-29. Status: approved 2026-10-29; implemented after the cross-session memory design. Not accepted:
+the first live gate, 2026-10-31, failed (see the acceptance record at the end).
 
 Depends on: `docs/design/2026-10-24-cross-session-memory.md` (cited as "memory §N"), which must be implemented
 first. This design reuses its durable review queue and leases (memory §4), its mutation ledger and provenance
@@ -338,3 +339,40 @@ precedence, atomic commits, and the deletion semantics.
 
 Approve this design, after the memory design it depends on, before an implementation plan or product code. The
 plan stays in `.superpowers/`.
+
+## Acceptance record
+
+Not accepted. The live release gate ran on 2026-10-31 and failed on one check: the learning curve learned no skill.
+Learning stays opt-in (`learning: false` is the default) and is not offered to a cohort.
+
+| Gate | Evidence |
+|---|---|
+| Deterministic matrix | `tests/test_learning_acceptance.py` and `tests/test_learning_isolation_acceptance.py` (each test names its §10 row) with the store, dream and API tests, in CI on PostgreSQL. Passes. |
+| Conversation scenarios | Protocol `learning-eval-v1` (`evals/learning`, 32 scenarios, 16 English and 16 Chinese, suite sha256 `ab9695d831ebc25531584f6b3c088738838ec1140c4a4e90c5a39d9c20bdba86`, keel commit `c825d78`), model `openai.gpt-6-luna` on the `bedrock` provider. Learning arm 27/32 (positive 11/16, negative 16/16), baseline (memory on, learning off) 28/32 (positive 13/16, negative 15/16). User corrections 1 against 3. Skills learned in negative scenarios 0, cross-profile exposure 0, every change attributable and reversible through the API, errors 0. 1,654,858 tokens. The conversation gate passed. The positive score is stricter for the learning arm: it also needs an active learned skill holding the method. Four of its five positive misses answered the probe correctly but learned no skill (two Chinese corrections, two contradictions); the fifth missed in both arms. |
+| Learning curve | Same protocol, model and provider, keel commit `4d0d656`; datasets stockindex, music_brainz_20k, GITHUB_REPOS and stockmarket, 3 repeats. The provider's session credentials expired 27 minutes in, and every later run failed with `auth` before the model answered. The curve then scored those runs as wrong answers and reported itself complete; the harness now records them as `provider_failed` errors and stops (see below). Valid part (repeat 0, and repeat 1 without stockmarket; both arms dropped together, so the comparison stays paired): 7 sequences per arm, held-out pass 58% learning against 42% baseline over 7 tasks each, too few to read a difference; iterations 4.0 against 4.4; 18 dreams completed in the learning arm on 18 observations and **learned 0 skills**. Real spend 1,668,326 tokens; the ledger also charged 1,188,242 tokens of reservations to calls that failed before using any. |
+| Combined gate | `python -m evals.learning gate`: failed on `curve_learned` alone. Correctness, the 10% fewer corrections, exposure, negatives learned, attribution, reversal and completeness passed. |
+
+**Why the curve learned nothing.** A DAB task is a single turn without user corrections, so the only signal is the
+consumer's rating with the comment "Correct." or "Not correct.". That comment names no method, and the dreams
+committed nothing from it; the evidence rule (§5) is doing what it says. The curve's protocol, not the dream, has to
+change before the curve can show learning, for example by a rating comment that states what the task got right or
+wrong. That is a new protocol version and needs approval before it runs. The curve also kept no dream transcripts
+(its database is dropped at the end), so why each dream declined is not recorded.
+
+**Harness change.** A run failed with `auth`, `rate_limited` or `server_error` is the curve error
+`provider_failed`: excluded from every metric, no feedback sent, and three in a row stop the curve with a non-zero
+exit. Every record that did not end `executed` carries the run's error code and redacted error. The conversation
+runner already treated any failed run as an error.
+
+**Deviations from §5 as built.** A merge writes new text on its target, so it needs the create or revise evidence
+rule (the table is silent on merge). The first dream's daily rule needs the oldest pending observation to be 24
+hours old. The dream sees deployment skills by name only. A failed dream does not block the next one. The triggers
+count only evidence newer than the input of the profile's last finished dream.
+
+**Open cost question.** Leftover pending observations make the interval rule start a model call every 24 hours,
+for up to 30 days, with no new evidence; with more than 40 pending, every dream rereads the same oldest 40.
+
+**Gate gaps found.** The gate does not check that a curve is applicable (a subset of datasets or one repeat can
+still be combined; this curve ran 3 repeats, not the default 5). `suite_tracked` compares the working tree, not the
+committed file.
+
