@@ -14,6 +14,7 @@ publication here, and its exact target must be reconciled or removed before anyt
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import logging
 
 from keel.sandbox.base import (
@@ -35,6 +36,14 @@ log = logging.getLogger(__name__)
 CONTROL_TRANSPORT_S = 15.0
 # Pause between cancel requests while the supervisor has not reserved the exec yet (it starts within a second).
 CONTROL_RETRY_S = 0.1
+
+
+@dataclass
+class _Admission:
+    """An exec between `begin_exec` and dispatch. `settled` is set once it is dispatched or abandoned."""
+    stopped: bool = False
+    abandoned: bool = False
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def _observe(control: asyncio.Future) -> None:
@@ -74,6 +83,10 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         # Later requests join it (or read its outcome); entries go when the usage is released.
         self.control_budget_s = getattr(backend, "kill_grace_s", 3.0) + reap_seconds + CONTROL_TRANSPORT_S
         self._controls: dict[tuple[str, str], asyncio.Task] = {}
+        # Execs between their pending record and dispatch, and execs stopped there (never dispatched, finished as
+        # such): a stop in that window must neither start the command nor wait out a control for it.
+        self._admitting: dict[tuple[str, str], _Admission] = {}
+        self._abandoned: set[tuple[str, str]] = set()
 
     async def initialize(self) -> None:
         """Cache the checked daemon identity and helper artifact; fail closed when the deployment cannot be served.
@@ -227,9 +240,14 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
     async def exec(self, sandbox: BoundSandbox, argv: list[str], *, cwd: str, timeout_s: float,
                    exec_id: str, env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:
         """Commit one pending ticket, dispatch it once, and finish only with matching cleanup evidence."""
-        await self._ready()
         self._require_bound(sandbox)
-        ticket = await self.store.begin_exec(sandbox, exec_id)
+        key = (sandbox.use.usage_id, exec_id)
+        admission = self._admitting.setdefault(key, _Admission())
+        try:
+            ticket = await self._admit(sandbox, exec_id, admission)
+        finally:
+            admission.settled.set()
+            self._admitting.pop(key, None)
 
         async def authorize_control() -> None:
             current = await self.store.resolve_exec(sandbox, exec_id)
@@ -251,6 +269,36 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         except Exception as exc:
             await self._try_mark_exec_uncertain(ticket, "dispatch_or_cleanup_unverified")
             raise SandboxUncertain("the sandbox execution outcome is uncertain") from exc
+
+    async def _admit(self, sandbox: BoundSandbox, exec_id: str, admission: _Admission) -> ExecTicket:
+        """Record the pending exec; a stop before dispatch (this task cancelled, or a kill for it) finishes it as
+        never dispatched instead. The record is completed even when the stop lands while it is being written."""
+        await self._ready()
+        self._require_bound(sandbox)
+        begin = asyncio.ensure_future(self.store.begin_exec(sandbox, exec_id))
+        cancelled = False
+        try:
+            ticket = await asyncio.shield(begin)
+        except asyncio.CancelledError:
+            cancelled = admission.stopped = True
+            try:
+                ticket = await begin
+            except Exception:
+                raise asyncio.CancelledError  # nothing was admitted, so nothing can run
+        if not admission.stopped:
+            return ticket
+        try:
+            abandoned = await self.store.abandon_exec(ticket)
+        except Exception:
+            abandoned = False
+        if abandoned:
+            admission.abandoned = True
+            self._abandoned.add((sandbox.use.usage_id, exec_id))
+        else:
+            await self._try_mark_exec_uncertain(ticket, "abandon_unrecorded")
+        if cancelled:
+            raise asyncio.CancelledError
+        raise SandboxError("the command was stopped before it started")
 
     def _require_bound(self, sandbox: BoundSandbox) -> None:
         if not isinstance(sandbox, BoundSandbox):
@@ -289,6 +337,12 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         await self._ready()
         self._require_bound(sandbox)
         key = (sandbox.use.usage_id, exec_id)
+        admission = self._admitting.get(key)
+        if admission is not None and not admission.settled.is_set():
+            admission.stopped = True  # the exec is not dispatched yet: it never will be
+            await asyncio.shield(admission.settled.wait())
+        if key in self._abandoned:
+            return
         control = self._controls.get(key)
         if control is None:
             deadline = asyncio.get_running_loop().time() + self.control_budget_s
@@ -335,6 +389,7 @@ class SandboxCoordinator(SandboxRecoveryMixin, ExecFileIO):
         self._require_handle(use)
         for key in [key for key, control in self._controls.items() if key[0] == use.usage_id and control.done()]:
             del self._controls[key]
+        self._abandoned = {key for key in self._abandoned if key[0] != use.usage_id}
         if abandon_preparation:
             if await self.store.retire_unbound_preparation(use, abandon=True):
                 return True
