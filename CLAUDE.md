@@ -80,14 +80,15 @@ CI (`.github/workflows/ci.yml`) runs the full suite against PostgreSQL 17, Docke
   reliability and fault-injection tests, explicit tenant ownership with independent profiles (§12), complete
   profile deletion, the coordinated sandbox lifecycle, and Claude models on the `bedrock` provider
   (`docs/design/2026-10-23-bedrock-anthropic-messages.md`). 0.3.1 is a patch on 0.3.0: a sandbox command no
-  longer waits out the whole kill grace once its process group is empty.
+  longer waits out the whole kill grace once its process group is empty. 0.3.2 adds command runs (`kind:
+  "command"`: one sandbox command without a model; `docs/design/2026-10-31-command-runs.md`).
 - Open work: cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`) and, on top of it,
   procedural learning (`docs/design/2026-10-29-procedural-learning.md`), both approved 2026-10-29. Memory
-  entries, the change ledger, memory tool v2 and the memory API (migration 8), the history index,
-  `session_search` and per-session tool lists (migration 9), and the durable review queue (migration 10: leased
+  entries, the change ledger, memory tool v2 and the memory API (migration 9), the history index,
+  `session_search` and per-session tool lists (migration 10), and the durable review queue (migration 11: leased
   background memory reviews, review API) and learned skills (store, `skill_manage`, the `learning` flag and the
-  learned-skill API, migration 11) and observations, run feedback and automatic suspension (migration 12) and the
-  dream (migration 13: leased profile-level dream jobs with commit gates and the dream routes) are merged
+  learned-skill API, migration 12) and observations, run feedback and automatic suspension (migration 13) and the
+  dream (migration 14: leased profile-level dream jobs with commit gates and the dream routes) are merged
   (`[Unreleased]`), and cross-session memory was accepted 2026-10-30 (see its acceptance record). Learning's first
   live gate failed 2026-10-31: the DAB curve learned no skill (see the learning doc's acceptance record); next is a
   curve protocol whose feedback carries method content, then a rerun.

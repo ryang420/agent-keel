@@ -184,9 +184,24 @@ ALTER TABLE profiles ADD COLUMN incarnation TEXT;
 ALTER TABLE runs ADD COLUMN profile_incarnation TEXT;
 """
 
+# Command runs (docs/design/2026-10-31-command-runs.md, released in 0.3.2): a run is a model run or one sandbox
+# command, and a command run has no provider or model. The statements are idempotent, so a database whose recorded
+# version was set back can apply them again.
+_V8 = """
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'model';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS command TEXT;
+ALTER TABLE runs ALTER COLUMN provider DROP NOT NULL;
+ALTER TABLE runs ALTER COLUMN model DROP NOT NULL;
+ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_kind_fields;
+ALTER TABLE runs ADD CONSTRAINT runs_kind_fields CHECK (
+    kind IN ('model', 'command')
+    AND (kind <> 'model' OR (provider IS NOT NULL AND model IS NOT NULL))
+    AND (kind <> 'command' OR command IS NOT NULL))
+"""
+
 # Memory entries (cross-session memory design §2): each JSON list item becomes a stable row in its old order,
 # duplicates included, with legacy provenance and no invented source. The old table goes in the same transaction.
-_V8 = """
+_V9 = """
 CREATE TABLE memory_entries (
     id TEXT PRIMARY KEY, profile_id TEXT NOT NULL,
     target TEXT NOT NULL CHECK (target IN ('memory', 'user')),
@@ -223,7 +238,7 @@ DROP TABLE memories
 # History search (cross-session memory design §3): a redacted text row per user/assistant message and unique
 # postings per profile. Existing history is indexed later by a resumable backfill up to each profile's ceiling;
 # newer messages are indexed as they are written. Sessions record the tools their prompt was built with.
-_V9 = """
+_V10 = """
 ALTER TABLE sessions ADD COLUMN tools TEXT;
 CREATE TABLE message_search (
     message_id {bigint} PRIMARY KEY, profile_id TEXT NOT NULL, session_id TEXT NOT NULL, role TEXT NOT NULL,
@@ -245,7 +260,7 @@ INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at)
 # Durable memory review (cross-session memory design §4): per-session review state written with a run's completion,
 # jobs that claim an immutable source range, and a generation per session so a deleted and recreated session id
 # never inherits old work. The old per-session turn counter is retired; existing history is not queued.
-_V10 = """
+_V11 = """
 ALTER TABLE sessions ADD COLUMN generation TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text);
 ALTER TABLE sessions DROP COLUMN turns_since_memory;
 CREATE TABLE memory_reviews (
@@ -273,7 +288,7 @@ CREATE INDEX memory_review_jobs_profile ON memory_review_jobs (profile_id, creat
 # Procedural learning (learning design §2, §3): the profile switch, profile-private learned skills with an immutable
 # version per change, the evidence each version cites, lesson observations (written by skill_manage now, by review
 # and feedback later) and the learned skills each run loaded.
-_V11 = """
+_V12 = """
 ALTER TABLE profiles ADD COLUMN learning INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE learned_skills (
     id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, category TEXT,
@@ -316,7 +331,7 @@ CREATE INDEX skill_loads_session ON skill_loads (profile_id, session_id)
 
 # Procedural learning, observations and feedback (learning design §4, §6): whether a run ended at the iteration cap,
 # which review job or run produced an observation, and one feedback row per run.
-_V12 = """
+_V13 = """
 ALTER TABLE runs ADD COLUMN capped INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE lesson_observations ADD COLUMN review_job_id TEXT;
 ALTER TABLE lesson_observations ADD COLUMN run_id TEXT;
@@ -331,7 +346,7 @@ CREATE INDEX run_feedback_session ON run_feedback (profile_id, session_id)
 
 # Procedural learning, the dream (learning design §5, §7): profile-level dream jobs run on the memory review worker,
 # the start of every dream attempt (a few per profile per day) and the reason a dream dismissed an observation.
-_V13 = """
+_V14 = """
 CREATE TABLE dream_jobs (
     id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, profile_incarnation TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'discarded')),
@@ -350,8 +365,8 @@ ALTER TABLE lesson_observations ADD COLUMN note TEXT
 
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
-    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9),
-    Migration(10, _V10), Migration(11, _V11), Migration(12, _V12), Migration(13, _V13))
+    Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9), Migration(10, _V10),
+    Migration(11, _V11), Migration(12, _V12), Migration(13, _V13), Migration(14, _V14))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 

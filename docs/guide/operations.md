@@ -48,6 +48,18 @@ A missing profile is created empty for `tenant_id`: no models, no skills, an emp
 update through the API (`PUT /v1/profiles/{id}`) fills it in before its first run. The command exits 1 when any line is
 `invalid`.
 
+## Upgrading to command runs
+
+0.3.2 adds command runs (schema version 8: `runs.kind`, `runs.command`, and `runs.provider` and `runs.model` become
+nullable). The change is applied at start like every schema change and alters `runs` in place. A database at schema
+version 8 is refused by 0.3.1, so roll back by restoring the backup. Upgrade every instance before starting the first
+command run: a 0.3.1 instance still running against the upgraded database would claim a command run as a model run
+and fail it.
+
+A command run holds a worker (`KEEL_WORKERS`) and a `KEEL_MAX_RUNNING` slot for up to its `timeout_s`, so long commands
+can delay other runs. A deploy or restart fails in-flight command runs as `worker_lost` after the drain. A consumer must
+treat that as "outcome unknown": the command may have partly run, and keel never runs it again.
+
 ## Upgrading to atomic run termination
 
 This release commits a run's terminal state and its terminal event in one transaction. It needs no schema migration,
@@ -111,7 +123,7 @@ Verification after cutover:
 
 ## History search index
 
-Migration 9 creates the index behind `session_search`. Every instance indexes new messages as they are written and
+Migration 10 creates the index behind `session_search`. Every instance indexes new messages as they are written and
 backfills older ones in the background, 200 messages per batch, so no operator step is needed. Until the backfill
 finishes for a profile, `session_search` reports `index_complete: false` for it. Watch progress with:
 
@@ -139,15 +151,15 @@ are unaffected. Each attempt's token usage is on the job.
 
 Deleting a session removes its review state and jobs; deleting a profile removes all of them and fences any review
 still running. Turning memory off and on again discards the profile's queued, failed and running reviews (a running
-one cannot write afterwards) and starts again from the next completed run. Migration 10 queues nothing for existing
+one cannot write afterwards) and starts again from the next completed run. Migration 11 queues nothing for existing
 conversations. It rewrites the `sessions` table (each row gets its own generation) under an exclusive lock, so
-expect it to take time on large tables. Like migration 9, it needs every instance on this version before runs
+expect it to take time on large tables. Like migration 10, it needs every instance on this version before runs
 start again (no mixed-version rollout): an older binary still counts turns in a column that no longer exists.
 
 ## Learned skills
 
-Profiles with `learning` on keep learned skills in PostgreSQL (migration 11: `learned_skills`, their immutable
-`learned_skill_versions` and `learned_skill_evidence`, `lesson_observations` and `skill_loads`). Migration 11
+Profiles with `learning` on keep learned skills in PostgreSQL (migration 12: `learned_skills`, their immutable
+`learned_skill_versions` and `learned_skill_evidence`, `lesson_observations` and `skill_loads`). Migration 12
 adds a column and tables only, and needs no backfill. Inspect a profile's skills with `GET /v1/profiles/{p}/skills/learned` (state, version, origin and 30-day
 load counts) and one skill's full history with `GET …/skills/learned/{id}`: each version has its source (the run,
 session and message, or `consumer`), evidence and rationale. Act on a bad skill through the same API:
@@ -168,7 +180,7 @@ load counts. Deleting a session removes that session's skill loads, observations
 rows lose their run and session provenance; the skills and their text stay.
 
 Before enabling `learning` on any profile (and before deleting a profile that has learned skills), upgrade every
-serving and worker instance to this version, as for migrations 9 and 10. An instance still on migration 10 deletes
+serving and worker instance to this version, as for migrations 10 and 11. An instance still on migration 11 deletes
 sessions and profiles without touching the learned tables.
 
 ### Observations, feedback and suspension
@@ -189,14 +201,14 @@ suspended again only after 3 new `down` ratings (and more `down` than `up`) on t
 include the earlier ratings, because they cover the whole current text. Ratings are removed with
 `DELETE …/runs/{r}/feedback`, or with the session or profile.
 
-Migration 12 adds `runs.capped`, the observation's review job and run columns, and the `run_feedback` table. It needs
+Migration 13 adds `runs.capped`, the observation's review job and run columns, and the `run_feedback` table. It needs
 no backfill; runs that finished earlier count as not capped. Upgrade every serving and worker instance before relying
-on feedback and observations, as for migration 11: an instance still on migration 11 deletes sessions and profiles
+on feedback and observations, as for migration 12: an instance still on migration 12 deletes sessions and profiles
 without removing feedback, and does not record whether a run reached its cap.
 
 ### Dreams
 
-With `learning` on, the memory review workers also run dreams (migration 13: `dream_jobs` and `dream_attempts`, with
+With `learning` on, the memory review workers also run dreams (migration 14: `dream_jobs` and `dream_attempts`, with
 the observations' `consumed_by` and `note` columns written by the commit). A dream reads the profile's pending
 observations and writes learned skills; no new process or setting turns it on.
 
@@ -262,7 +274,7 @@ with the reason in `note`. Inspect dreams with `GET /v1/profiles/{p}/dreams` and
 change is the consumer's lever (`POST …/skills/learned/{id}/rollback`): consumer precedence keeps a later dream
 from reapplying it from older observations. Deleting a profile removes its dream jobs and fences a running one.
 
-Migration 13 adds tables and columns only and needs no backfill. As for earlier learning migrations, upgrade every
+Migration 14 adds tables and columns only and needs no backfill. As for earlier learning migrations, upgrade every
 serving and worker instance before relying on dreams: an older instance deletes profiles without removing dream
 jobs, and leases memory reviews without checking dream jobs, so a review and a dream of one profile can overlap until
 every instance is upgraded.

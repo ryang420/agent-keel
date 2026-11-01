@@ -38,6 +38,8 @@ def add_feedback_routes(app: FastAPI, k, profile_or_404, run_or_404) -> None:
             raise ApiError(404, "profile_not_found", "No such profile.") from None
         if code == "not_found":
             raise ApiError(404, "run_not_found", "No such run.")
+        if code == "command_run":
+            raise ApiError(400, "invalid_input", "Feedback is accepted on model runs only.")
         if code == "not_terminal":
             raise ApiError(409, "run_not_terminal", "Feedback is accepted once the run has finished.")
         return {**feedback_json(feedback), "suspended": suspended}

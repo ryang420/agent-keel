@@ -113,7 +113,8 @@ def _run(row: dict) -> Run:
         row["reasoning_effort"], json.loads(row["input"]), row["instructions"], row["output"],
         Usage.from_dict(json.loads(row["usage"])), row["error_code"], row["error"], row["lease_owner"],
         row["lease_expires_at"], row["created_at"], row["started_at"], row["finished_at"],
-        row["current_exec_id"],
+        row["current_exec_id"], kind=row["kind"],
+        command=None if row["command"] is None else json.loads(row["command"]),
     )
 
 

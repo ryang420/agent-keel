@@ -337,8 +337,8 @@ class Run:
     profile_id: str
     session_id: str
     status: str
-    provider: str
-    model: str
+    provider: str | None
+    model: str | None
     reasoning_effort: str | None
     input: list[dict]
     instructions: str | None
@@ -354,6 +354,8 @@ class Run:
     current_exec_id: str | None = None
     profile_incarnation: str | None = None
     capped: bool = False
+    kind: str = "model"  # "model", or "command": one sandbox command without a model
+    command: dict | None = None  # a command run's {"argv", "cwd", "timeout_s", "env"}
 
 
 @dataclass(frozen=True)

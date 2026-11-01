@@ -10,7 +10,7 @@ from keel.config import ServiceCredential, Settings
 from keel.service import build
 from keel.sandbox.base import parse_policy, profile_mount_root
 from keel.store import migrations, open_store
-from keel.store.base import OwnershipError, UniqueViolation
+from keel.store.base import OwnershipError, SessionBusy, UniqueViolation
 from keel.store.postgres import PostgresDb
 from keel.store.migrations import LATEST_VERSION, Migration, SchemaTooNew, schema_version
 from keel.store.ownership import require_tenant_ownership
@@ -92,7 +92,7 @@ async def empty_database(url: str) -> str:
 
 
 async def restore_legacy_memories(db) -> None:
-    """Undo migration 8 on a database that is being rewound to an older schema version."""
+    """Undo migration 9 on a database that is being rewound to an older schema version."""
     for table in ("memory_mutations", "memory_changes", "memory_revisions", "memory_entries"):
         await db.execute(f"DROP TABLE {table}")
     await db.execute("CREATE TABLE memories (profile_id TEXT NOT NULL, target TEXT NOT NULL, "
@@ -100,7 +100,7 @@ async def restore_legacy_memories(db) -> None:
 
 
 async def restore_pre_dreams(db) -> None:
-    """Undo migration 13 on a database that is being rewound to an older schema version."""
+    """Undo migration 14 on a database that is being rewound to an older schema version."""
     for table in ("dream_attempts", "dream_jobs"):
         await db.execute(f"DROP TABLE {table}")
     await db.execute("DROP INDEX lesson_observations_pending")
@@ -108,7 +108,7 @@ async def restore_pre_dreams(db) -> None:
 
 
 async def restore_pre_observations(db) -> None:
-    """Undo migrations 13 and 12 on a database that is being rewound to an older schema version."""
+    """Undo migrations 14 and 13 on a database that is being rewound to an older schema version."""
     await restore_pre_dreams(db)
     await db.execute("DROP TABLE run_feedback")
     await db.execute("DROP INDEX lesson_observations_job")
@@ -118,7 +118,7 @@ async def restore_pre_observations(db) -> None:
 
 
 async def restore_pre_learning(db) -> None:
-    """Undo migration 11 on a database that is being rewound to an older schema version."""
+    """Undo migration 12 on a database that is being rewound to an older schema version."""
     for table in ("skill_loads", "lesson_observations", "learned_skill_evidence", "learned_skill_versions",
                   "learned_skills"):
         await db.execute(f"DROP TABLE {table}")
@@ -126,13 +126,13 @@ async def restore_pre_learning(db) -> None:
 
 
 async def insert_old_profile(db, profile_id: str, tenant_id: int) -> None:
-    """Write a profile row into a database older than migration 11, which `upsert_profile` can no longer reach."""
+    """Write a profile row into a database older than migration 12, which `upsert_profile` can no longer reach."""
     await db.execute("INSERT INTO profiles (id, models, sandbox, soul, skills, updated_at, memory, tenant_id, "
                      "incarnation) VALUES (?, '[]', '{}', '', '[]', 1.0, 0, ?, ?)", profile_id, tenant_id, "inc")
 
 
 async def restore_pre_review_queue(db) -> None:
-    """Undo migration 10 on a database that is being rewound to an older schema version."""
+    """Undo migration 11 on a database that is being rewound to an older schema version."""
     for table in ("memory_review_jobs", "memory_reviews"):
         await db.execute(f"DROP TABLE {table}")
     await db.execute("ALTER TABLE sessions DROP COLUMN generation")
@@ -140,7 +140,7 @@ async def restore_pre_review_queue(db) -> None:
 
 
 async def restore_pre_history_index(db) -> None:
-    """Undo migration 9 on a database that is being rewound to an older schema version."""
+    """Undo migration 10 on a database that is being rewound to an older schema version."""
     for table in ("history_backfill", "message_tokens", "message_search"):
         await db.execute(f"DROP TABLE {table}")
     await db.execute("ALTER TABLE sessions DROP COLUMN tools")
@@ -660,7 +660,7 @@ async def test_coordination_time_is_read_at_call_time_inside_a_transaction(db_ur
         await store.close()
 
 
-async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monkeypatch):
+async def test_migration_9_copies_legacy_memory_lists_into_entries(db_url, monkeypatch):
     monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:7])
     monkeypatch.setattr(migrations, "LATEST_VERSION", 7)
     store = await open_store(db_url)
@@ -689,9 +689,9 @@ async def test_migration_8_copies_legacy_memory_lists_into_entries(db_url, monke
         await upgraded.close()
 
 
-async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_tool_list(db_url, monkeypatch):
-    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:8])
-    monkeypatch.setattr(migrations, "LATEST_VERSION", 8)
+async def test_migration_10_records_a_backfill_ceiling_per_profile_and_adds_the_tool_list(db_url, monkeypatch):
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:9])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 9)
     store = await open_store(db_url)
     for profile in ("p1", "p2"):
         await insert_old_profile(store.db, profile, 1)
@@ -724,13 +724,13 @@ async def test_migration_9_records_a_backfill_ceiling_per_profile_and_adds_the_t
         await upgraded.close()
 
 
-async def test_migration_10_adds_review_tables_and_session_generations(db_url):
+async def test_migration_11_adds_review_tables_and_session_generations(db_url):
     store = await open_store(db_url)
     try:
         await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
         await store.ensure_session("p1", "s1")
         await store.ensure_session("p1", "s2")
-        await store.db.execute("UPDATE schema_version SET version = 9")
+        await store.db.execute("UPDATE schema_version SET version = 10")
         await restore_pre_observations(store.db)
         await restore_pre_learning(store.db)
         await restore_pre_review_queue(store.db)
@@ -750,7 +750,7 @@ async def test_migration_10_adds_review_tables_and_session_generations(db_url):
         await upgraded.close()
 
 
-async def test_migration_11_adds_the_learning_flag_and_tables(db_url):
+async def test_migration_12_adds_the_learning_flag_and_tables(db_url):
     store = await open_store(db_url)
     try:
         assert (await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])).learning is False
@@ -761,11 +761,11 @@ async def test_migration_11_adds_the_learning_flag_and_tables(db_url):
         await store.close()
 
 
-async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_url):
+async def test_migration_12_upgrades_a_version_11_database_with_learning_off(db_url):
     store = await open_store(db_url)
     try:
         await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
-        await store.db.execute("UPDATE schema_version SET version = 10")
+        await store.db.execute("UPDATE schema_version SET version = 11")
         await restore_pre_observations(store.db)
         await restore_pre_learning(store.db)
     finally:
@@ -780,7 +780,7 @@ async def test_migration_11_upgrades_a_version_10_database_with_learning_off(db_
         await upgraded.close()
 
 
-async def test_migration_12_adds_capped_runs_feedback_and_observation_sources(db_url):
+async def test_migration_13_adds_capped_runs_feedback_and_observation_sources(db_url):
     store = await open_store(db_url)
     try:
         await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[])
@@ -795,17 +795,92 @@ async def test_migration_12_adds_capped_runs_feedback_and_observation_sources(db
         await store.close()
 
 
-async def test_migration_13_adds_dream_jobs_to_a_version_12_database(db_url):
+async def test_command_runs_upgrade_a_0_3_1_database(db_url, monkeypatch):
+    # A database at schema version 7 (0.3.1) with a finished model run.
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:7])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 7)
+    old = await open_store(db_url)
+    await insert_old_profile(old.db, "p1", 1)
+    await old.ensure_session("p1", "s1")
+    await old.db.execute(
+        "INSERT INTO runs (id, profile_id, session_id, status, provider, model, input, output, created_at, "
+        "finished_at) VALUES ('run_old', 'p1', 's1', 'completed', 'fake', 'm', '[]', 'done', 1, 2)")
+    await old.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION
+        kept = await upgraded.get_run_by_id("run_old")
+        assert (kept.kind, kept.command, kept.provider, kept.model, kept.output) == ("model", None, "fake", "m", "done")
+        await upgraded.ensure_session("p1", "s2")
+        command = {"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}}
+        new = await upgraded.create_command_run(profile_id="p1", session_id="s2", command=command)
+        assert (new.kind, new.command, new.provider, new.model) == ("command", command, None, None)
+        with pytest.raises(SessionBusy):  # the one-run-per-session index survived the upgrade
+            await upgraded.create_command_run(profile_id="p1", session_id="s2", command=command)
+        upgraded_shape = await schema_shape(upgraded.db)
+    finally:
+        await upgraded.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded_shape
+    finally:
+        await fresh.close()
+
+
+async def test_a_0_3_2_database_upgrades_to_the_latest_version_and_matches_a_fresh_one(db_url, monkeypatch):
+    # A database at schema version 8 (0.3.2): a legacy memory list, a finished model run and a finished command run.
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:8])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 8)
+    old = await open_store(db_url)
+    assert await schema_version(old.db) == 8
+    await insert_old_profile(old.db, "p1", 1)
+    await old.db.execute("INSERT INTO memories (profile_id, target, entries, updated_at) VALUES (?, ?, ?, ?)",
+                         "p1", "user", json.dumps(["likes tea", "works late"]), 5.0)
+    await old.ensure_session("p1", "s1")
+    await old.ensure_session("p1", "s2")
+    await old.db.execute(
+        "INSERT INTO runs (id, profile_id, session_id, status, provider, model, input, output, created_at, "
+        "finished_at) VALUES ('run_model', 'p1', 's1', 'completed', 'fake', 'm', '[]', 'done', 1, 2)")
+    command = {"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}}
+    await old.db.execute(
+        "INSERT INTO runs (id, profile_id, session_id, status, kind, command, provider, model, input, output, "
+        "created_at, finished_at) VALUES ('run_command', 'p1', 's2', 'completed', 'command', ?, NULL, NULL, '[]', "
+        "'', 3, 4)", json.dumps(command))
+    await old.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == LATEST_VERSION == 14
+        model = await upgraded.get_run_by_id("run_model")
+        assert (model.kind, model.command, model.provider, model.model) == ("model", None, "fake", "m")
+        ran = await upgraded.get_run_by_id("run_command")
+        assert (ran.kind, ran.command, ran.provider, ran.model) == ("command", command, None, None)
+        assert await upgraded.memory_entries("p1") == {"memory": [], "user": ["likes tea", "works late"]}
+        assert "memories" not in await database_table_names(upgraded.db)
+        upgraded_shape = await schema_shape(upgraded.db)
+    finally:
+        await upgraded.close()
+    fresh = await open_store(await empty_database(db_url))
+    try:
+        assert await schema_shape(fresh.db) == upgraded_shape
+    finally:
+        await fresh.close()
+
+
+async def test_migration_14_adds_dream_jobs_to_a_version_13_database(db_url):
     store = await open_store(db_url)
     try:
         await store.upsert_profile("p1", models=[], sandbox={}, soul="", skills=[], memory=True, learning=True)
-        await store.db.execute("UPDATE schema_version SET version = 12")
+        await store.db.execute("UPDATE schema_version SET version = 13")
         await restore_pre_dreams(store.db)
     finally:
         await store.close()
     store = await open_store(db_url)
     try:
-        assert await schema_version(store.db) == LATEST_VERSION == 13
+        assert await schema_version(store.db) == LATEST_VERSION == 14
         assert await store.db.fetch("SELECT * FROM dream_jobs") == []
         assert await store.db.fetch("SELECT * FROM dream_attempts") == []
         column = await store.db.fetchrow(
