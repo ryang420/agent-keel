@@ -12,23 +12,23 @@ All notable changes to this project are documented here. The format follows
   curve against a learning-off baseline, and the combined release gate.
 - Dreams: with learning on, a profile's pending observations are consolidated into learned skills by a leased,
   budgeted background job behind evidence, duplicate, validation, consumer-precedence and version gates, committed
-  atomically; `GET /v1/profiles/{p}/dreams` and `POST …/dreams/{id}/retry`; `KEEL_DREAM_*` settings (migration 13).
-- Observations and run feedback (schema migration 12): with `learning` on, the memory review records observations
+  atomically; `GET /v1/profiles/{p}/dreams` and `POST …/dreams/{id}/retry`; `KEEL_DREAM_*` settings (migration 14).
+- Observations and run feedback (schema migration 13): with `learning` on, the memory review records observations
   of methods through an `observe` tool, `PUT`, `GET` and `DELETE /v1/profiles/{p}/runs/{r}/feedback` rate finished
   runs, learned-skill `stats` add ratings and run outcomes over 30 days, a skill with repeated `down` ratings is
   suspended automatically, and pending observations expire after 30 days in the worker's maintenance pass.
-- Learned skills (schema migration 11): a profile with the new `learning` flag (which requires `memory`) keeps
+- Learned skills (schema migration 12): a profile with the new `learning` flag (which requires `memory`) keeps
   versioned, text-only skills with provenance and evidence. The `skill_manage` tool creates, revises and retires them
   at the user's explicit request, `skills_list` and `skill_view` show active ones under `learned`, the prompt index
   lists them from the next session, and `GET`, `POST`, `PATCH` and `DELETE /v1/profiles/{p}/skills/learned…` let a
   consumer inspect, edit, roll back, suspend, resume and retire them.
-- Durable background memory review (schema migration 10): a completed run marks its session's new text, which is
+- Durable background memory review (schema migration 11): a completed run marks its session's new text, which is
   reviewed after 10 completed runs, a minute idle, or ten minutes of activity, by a worker loop with database leases,
   one review per profile at a time, staged edits committed atomically with the job, and bounded retries.
   `GET /v1/profiles/{p}/memory/reviews` and `POST …/reviews/{id}/retry` inspect and requeue reviews. Settings:
   `KEEL_MEMORY_REVIEW_IDLE_SECONDS`, `KEEL_MEMORY_REVIEW_MAX_AGE_SECONDS`, `KEEL_MEMORY_REVIEW_WORKERS`.
 - `session_search`: memory-enabled profiles can search and read their earlier conversations (lexical, English and
-  Chinese), with a background index backfill (schema migration 9). Migration 9 adds the search index, so every
+  Chinese), with a background index backfill (schema migration 10). Migration 10 adds the search index, so every
   instance must run this version before messages are written again (no mixed-version rollout): an older binary
   would leave the messages it writes unindexed; a downgrade is not supported.
 - `GET`, `PATCH` and `DELETE /v1/profiles/{p}/memory…` to inspect and correct a profile's memory.
@@ -42,17 +42,21 @@ All notable changes to this project are documented here. The format follows
   outside `src/keel` and changes no runtime behaviour; datasets and reports stay under `.local/evals/`.
 
 ### Changed
+- The unreleased schema migrations are renumbered 9–14 (they were 8–13): 0.3.2 released schema version 8 (command
+  runs). A development database that applied them under the old numbers must be recreated.
+- With command runs, a dream takes its model from the profile's last completed model run (a later command run has no
+  model and no longer leaves the dream without a route), and a command run takes no feedback (400 `invalid_input`).
 - Memory review no longer runs as a best-effort task that a busy or restarting instance could drop, and a foreground
   memory write no longer postpones it. `KEEL_MEMORY_REVIEW_TURNS` is now one of three eligibility rules, and
-  `KEEL_BACKGROUND_LIMIT` covers titles only. Migration 10 drops the old per-session turn counter; every instance
+  `KEEL_BACKGROUND_LIMIT` covers titles only. Migration 11 drops the old per-session turn counter; every instance
   must run this version before runs start again (no mixed-version rollout).
 - A session's tool list is fixed with its prompt and changes only at a compaction; sessions started before this
   release have no stored list: their tools follow the profile, without `session_search`, until they compact.
   Tools now declare whether they need a sandbox, and a call to a tool the session was not offered is refused.
 - Memory entries now have stable ids and versions, and every committed change is recorded with its source (run,
-  user message and tool call, a background review, the API, or `legacy`). Schema migration 8 copies existing
+  user message and tool call, a background review, the API, or `legacy`). Schema migration 9 copies existing
   memory into the new tables in place. The `memory` tool gains a `list` action and `entry_id`/`expected_version`,
-  and a repeated tool call is applied once. Migration 8 drops the old `memories` table, so every instance must run
+  and a repeated tool call is applied once. Migration 9 drops the old `memories` table, so every instance must run
   this version before memory is written again (no mixed-version rollout for memory); a downgrade is not supported.
 - **Breaking:** PostgreSQL is now the only supported database, including local development. `KEEL_DATABASE_URL`
   must use `postgresql://` or `postgres://`; SQLite URLs are rejected. Existing PostgreSQL databases continue to
@@ -61,6 +65,28 @@ All notable changes to this project are documented here. The format follows
   `CREATEDB` user, leaving the supplied base database untouched. `docker-compose.test.yml` provides PostgreSQL 17;
   `.venv/bin/python -m pytest -q -m 'not integration'` runs the unit subset without a database. Docker sandbox and
   live-model suites remain opt-in.
+
+## [0.3.2] - 2026-10-31
+
+A patch on 0.3.1: command runs, one command in a profile's sandbox without a model
+(`docs/design/2026-10-31-command-runs.md`).
+
+### Added
+
+- Command runs: `POST /v1/profiles/{p}/runs` with `"kind": "command"` and `command: {argv, cwd, timeout_s, env}`
+  runs one argv in the profile's sandbox without a model (a profile with no models can start one), under the same
+  supervisor, leases, session rule and stop as a model run. Its `output` is the last 50,000 characters of the
+  command's output and its usage is zero. Exit 0 completes the run; a non-zero exit, a timeout, an unconfirmed
+  cleanup or a missing sandbox fails it as `command_failed`, `command_timed_out`, `sandbox_uncertain` or
+  `sandbox_unavailable`. New events `command.started` and `command.completed`; runs report `kind`, and command runs
+  their `command`. `KEEL_COMMAND_TIMEOUT_MAX_S` (default 3600) caps `timeout_s`. `argv[0]` may not start with `-`, and a command
+  run in a session does not count as a completed run when a later model run's title is decided.
+
+### Changed
+
+- Schema version 8: `runs.kind` (`model` or `command`) and `runs.command`; `runs.provider` and `runs.model` may be
+  null for a command run. PostgreSQL alters `runs` in place; SQLite rebuilds it. A database at this version is refused
+  by 0.3.1.
 
 ## [0.3.1] - 2026-10-31
 
@@ -267,7 +293,8 @@ daemon needs PostgreSQL and the stopped-service cutover in the operations guide.
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ryang420/agent-keel/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ryang420/agent-keel/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0
 [0.3.0-rc.3]: https://github.com/ryang420/agent-keel/compare/v0.3.0-rc.2...v0.3.0-rc.3

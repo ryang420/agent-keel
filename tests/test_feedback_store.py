@@ -1,6 +1,6 @@
 """Run feedback, its observation, outcome statistics and automatic suspension (learning design §6)."""
 
-from keel.models import Message, TextPart
+from keel.models import Message, TextPart, Usage
 from keel.store.base import SkillOutcome, SkillSource
 
 MODELS = [{"provider": "fake", "model": "m"}]
@@ -87,6 +87,17 @@ async def test_the_run_must_exist_belong_to_the_profile_and_be_terminal(store):
     queued = await finished_run(store, session="q", status="queued")
     assert await store.put_feedback("p1", queued.id, "up", None) == (None, "not_terminal", [])
     assert await store.get_feedback("p1", queued.id) is None
+
+
+async def test_a_command_run_takes_no_feedback(store):
+    await profile(store)
+    await store.ensure_session("p1", "c")
+    run = await store.create_command_run(profile_id="p1", session_id="c",
+                                         command={"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}})
+    await store.finish_run(run.id, "completed", output="", usage=Usage(0, 0, 0, 0))
+    assert await store.put_feedback("p1", run.id, "down", None) == (None, "command_run", [])
+    assert await store.get_feedback("p1", run.id) is None
+    assert await store.observations("p1") == []
 
 
 async def test_delete_removes_feedback_and_its_pending_observation(store):

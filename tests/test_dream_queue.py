@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from keel.dream_gates import DreamRules
-from keel.models import Message, TextPart
+from keel.models import Message, TextPart, Usage
 from keel.review_observe import StagedObservation
 from keel.store.base import DreamBusy, DreamNotRetryable
 
@@ -35,6 +35,15 @@ async def completed_run(store, session="s0", profile="p1"):
     await store.append_message(session, run.id, Message("user", (TextPart("hi"),)))
     await store.append_message(session, run.id, Message("assistant", (TextPart("ok"),)))
     await store.finish_run(run.id, "completed", output="ok")
+    return run
+
+
+async def completed_command_run(store, session="c0", profile="p1"):
+    """A completed command run: it has no provider or model, so a dream never takes its route from one."""
+    await store.ensure_session(profile, session)
+    run = await store.create_command_run(profile_id=profile, session_id=session,
+                                         command={"argv": ["true"], "cwd": "/w", "timeout_s": 5, "env": {}})
+    await store.finish_run(run.id, "completed", output="", usage=Usage(0, 0, 0, 0))
     return run
 
 
@@ -251,3 +260,27 @@ async def test_a_model_failure_is_not_requeued_until_the_route_changes(dreams, c
     assert await claim(dreams) is None
     retried = await dreams.retry_dream("p1", again.job.id)  # an operator retry lifts it
     assert retried.status == "pending" and (await claim(dreams)).job.id == again.job.id
+
+
+async def test_a_later_command_run_does_not_take_the_dream_route(dreams, clock):
+    await learning_profile(dreams)
+    await completed_run(dreams)
+    clock.now += 10
+    await completed_command_run(dreams)
+    await observe(dreams, count=8)
+    clock.now += 3600
+    found = await claim(dreams)
+    assert (found.job.provider, found.job.model) == ("fake", "m")
+
+
+async def test_a_parked_profile_is_lifted_by_a_model_run_even_when_a_command_run_finished_later(dreams, clock):
+    await learning_profile(dreams)
+    await observe(dreams, count=8)
+    clock.now += 3600
+    await dreams.fail_dream(await claim(dreams), "no_route", "no run", retry=False)
+    await completed_run(dreams)
+    clock.now += 10
+    await completed_command_run(dreams)
+    clock.now += 60
+    again = await claim(dreams)
+    assert again is not None and (again.job.provider, again.job.model) == ("fake", "m")

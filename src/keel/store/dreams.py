@@ -96,7 +96,8 @@ class DreamStoreMixin:
             "AND NOT EXISTS (SELECT 1 FROM (SELECT j.status, j.error_code, j.provider, j.model FROM dream_jobs j "
             "WHERE j.profile_id = p.id ORDER BY j.created_at DESC, j.id DESC LIMIT 1) prior "
             "LEFT JOIN LATERAL (SELECT r.provider, r.model FROM runs r WHERE r.profile_id = p.id "
-            "AND r.status = 'completed' ORDER BY r.finished_at DESC NULLS LAST, r.created_at DESC LIMIT 1) route "
+            "AND r.status = 'completed' AND r.kind = 'model' ORDER BY r.finished_at DESC NULLS LAST, r.created_at DESC "
+            "LIMIT 1) route "
             "ON TRUE "
             "WHERE prior.status = 'failed' AND prior.error_code IN ('no_route', 'model_unavailable') "
             "AND prior.provider IS NOT DISTINCT FROM route.provider AND prior.model IS NOT DISTINCT FROM route.model) "
@@ -167,9 +168,10 @@ class DreamStoreMixin:
         return None
 
     async def _dream_route(self, profile_id: str) -> tuple[str | None, str | None]:
-        """The model of the profile's most recently completed run; the dreamer revalidates it per attempt."""
+        """The model of the profile's most recently completed model run (a command run has none); the dreamer
+        revalidates it per attempt."""
         row = await self.db.fetchrow(
-            "SELECT provider, model FROM runs WHERE profile_id = ? AND status = 'completed' "
+            "SELECT provider, model FROM runs WHERE profile_id = ? AND status = 'completed' AND kind = 'model' "
             "ORDER BY finished_at DESC NULLS LAST, created_at DESC LIMIT 1", profile_id)
         return (row["provider"], row["model"]) if row else (None, None)
 

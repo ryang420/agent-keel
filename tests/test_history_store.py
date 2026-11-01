@@ -70,7 +70,7 @@ async def test_backfill_indexes_old_messages_in_batches_and_then_reports_complet
     await profile(store)
     await store.ensure_session("p1", "s1")
     old = [await store.append_message("s1", None, Message("user", (TextPart(f"old note {i}"),))) for i in range(5)]
-    # Simulate rows written before migration 9: drop their index rows and record a pending backfill.
+    # Simulate rows written before migration 10: drop their index rows and record a pending backfill.
     await store.db.execute("DELETE FROM message_tokens")
     await store.db.execute("DELETE FROM message_search")
     await store.db.execute("INSERT INTO history_backfill (profile_id, done_through, ceiling, updated_at) "
