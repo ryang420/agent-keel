@@ -31,7 +31,7 @@ from keel.sandbox.base import (
     validate_mount_sources,
 )
 from keel.sandbox.records import (
-    ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt, SandboxKey, SandboxUncertain,
+    ContainerObservation, DockerOutcome, ExecTicket, LifecycleAttempt, SandboxKey, SandboxNotYet, SandboxUncertain,
 )
 from keel.sandbox.runtime import (
     HELPER_PROTOCOL_VERSION, HelperArtifact, artifact_directory, decode_receipt, normalize_architecture,
@@ -42,6 +42,8 @@ log = logging.getLogger(__name__)
 # Coordinated execution: the installed helper, its private runtime root, and the resolved parent path.
 _HELPER_PATH = "/.keel-runtime/keel-supervisor"
 _RUNTIME_ROOT = "/tmp/.keel-exec"
+# After a stop, how long past the kill grace and reap the supervisor gets to end the exec before its client is killed.
+_STOP_SETTLE_S = 2.0
 _RESERVED_RUNTIME = "/.keel-runtime"
 _EXACT_ID = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -706,11 +708,29 @@ class DockerSandbox:
             raise SandboxUncertain("the sandbox cleanup outcome is uncertain")
         return receipt
 
-    async def _send_cancel(self, ticket: ExecTicket) -> None:
-        """Ask the supervisor to cancel; never signal a numeric PID or process group."""
+    async def _send_cancel(self, ticket: ExecTicket) -> int | None:
+        """Ask the supervisor to cancel; never signal a numeric PID or process group. Returns its exit code."""
         result = await self._docker_raw(*self._control_args(ticket, "cancel", include_usage=True), timeout=15)
         if result.timed_out or result.code not in (0, 4, 5):
             log.warning("sandbox cancellation was not acknowledged: %s", result.text[:200])
+        return None if result.timed_out else result.code
+
+    async def _stop_dispatched(self, collecting: asyncio.Future, cancel) -> None:
+        """End a stopped exec through its supervisor and let its client exit by itself. A client killed right after
+        it started can abort the exec before Docker starts it, so the supervisor never reserves it and no cancel is
+        ever confirmed. While the supervisor has not reserved the exec (exit 5), ask again; past the grace, reap and
+        a margin, kill the client as `collect` would."""
+        deadline = time.monotonic() + max(0.0, self.kill_grace_s) + max(0.0, self.reap_seconds) + _STOP_SETTLE_S
+        while not collecting.done() and time.monotonic() < deadline:
+            if await cancel() != 5:
+                break
+            await asyncio.wait({collecting}, timeout=0.1)
+        remaining = deadline - time.monotonic()
+        if not collecting.done() and remaining > 0:
+            await asyncio.wait({collecting}, timeout=remaining)
+        if not collecting.done():
+            collecting.cancel()
+        await asyncio.gather(collecting, return_exceptions=True)
 
     async def _await_receipt(self, ticket: ExecTicket, *, require_success: bool) -> CleanupReceipt:
         if self.receipt_timeout_s is None:
@@ -751,7 +771,6 @@ class DockerSandbox:
             raise ValueError("the exec identity is invalid")
         if not _TOKEN.fullmatch(ticket.control_token) or not _TOKEN.fullmatch(ticket.use.token):
             raise ValueError("the supervisor tokens must be 32 lowercase hexadecimal characters")
-        await self._require_recorded_key(ticket)
         args = ["exec", "-i"]
         if ticket.binding.policy.user:
             args += ["-u", ticket.binding.policy.user]
@@ -762,11 +781,28 @@ class DockerSandbox:
                      "--exec-id", ticket.exec_id, "--control-token", ticket.control_token,
                      "--usage-token", ticket.use.token, "--grace", str(float(self.kill_grace_s)),
                      "--reap", str(float(self.reap_seconds)), "--", *argv]
-            proc = await self._spawn(args, stdin is not None)
+
+            async def dispatch():
+                await self._require_recorded_key(ticket)
+                return await self._spawn(args, stdin is not None)
+
+            # A stop during dispatch waits for it: interrupted, the helper could still start with no one left to
+            # cancel it, and an exec that never reached the helper has no receipt. Dispatched, the cancel below
+            # and the coordinator's control reach it through the supervisor like any other.
+            dispatching = asyncio.ensure_future(dispatch())
+            stopped = False
+            try:
+                proc = await asyncio.shield(dispatching)
+            except asyncio.CancelledError:
+                stopped = True
+                try:
+                    proc = await dispatching
+                except Exception:
+                    raise asyncio.CancelledError  # the stop stands; the coordinator's control settles the outcome
 
             control_error = None
 
-            async def cancel() -> None:
+            async def cancel() -> int | None:
                 nonlocal control_error
                 if authorize_control is not None:
                     try:
@@ -776,13 +812,16 @@ class DockerSandbox:
                         # End only this transport. Without current authority the supervisor cannot be signalled.
                         if proc.returncode is None:
                             proc.kill()
-                        return
-                await self._send_cancel(ticket)
+                        return None
+                return await self._send_cancel(ticket)
 
+            collecting = asyncio.ensure_future(collect(proc, stdin, timeout_s, cancel))
             try:
-                output, timed_out = await collect(proc, stdin, timeout_s, cancel)
+                if stopped:
+                    raise asyncio.CancelledError
+                output, timed_out = await asyncio.shield(collecting)
             except asyncio.CancelledError:
-                await cancel()
+                await self._stop_dispatched(collecting, cancel)
                 raise
             if control_error is not None:
                 raise SandboxUncertain("sandbox cleanup authority is no longer valid") from control_error
@@ -812,7 +851,7 @@ class DockerSandbox:
         if result.code == 4:
             raise SandboxUncertain("the sandbox supervisor rejected the control binding")
         if result.code == 5:
-            raise SandboxUncertain("the sandbox exec endpoint or receipt is unavailable")
+            raise SandboxNotYet("the sandbox exec endpoint or receipt is not available yet")
         raise SandboxUncertain("the sandbox cancellation did not produce a definite result")
 
     async def aclose(self) -> None:

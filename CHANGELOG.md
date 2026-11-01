@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-01
+
+Cross-session memory (`docs/design/2026-10-24-cross-session-memory.md`, accepted 2026-10-30) and procedural learning
+(`docs/design/2026-10-29-procedural-learning.md`), both opt-in per profile, on top of 0.3.2. Learning is experimental:
+its live acceptance gate has not passed (see that design's acceptance record), so leave `learning` off in production.
+Schema migrations 9–14 run at start; they cannot be undone, so back up the database first and upgrade every instance
+before runs start again (no mixed-version rollout).
+
 ### Added
 - Learning acceptance: deterministic §10 acceptance tests, and opt-in evaluations in `evals/learning/` (protocol
   `learning-eval-v1`): 32 conversation scenarios (English and Chinese) against a memory-only baseline, a DAB learning
@@ -65,6 +73,15 @@ All notable changes to this project are documented here. The format follows
   `CREATEDB` user, leaving the supplied base database untouched. `docker-compose.test.yml` provides PostgreSQL 17;
   `.venv/bin/python -m pytest -q -m 'not integration'` runs the unit subset without a database. Docker sandbox and
   live-model suites remain opt-in.
+
+### Fixed
+- A stop that landed just as a command started could not be confirmed: the command ran on (or, stopped before
+  dispatch, was waited for until the control budget ran out), the run's sandbox usage went to recovery, and the
+  session's next run queued for 30 seconds to over two minutes. A stop before dispatch now never starts the command
+  and finishes it as `not_dispatched`; a dispatch already under way completes, the docker client is no longer killed
+  before the supervisor has ended the command (killed right after it started, it could abort the exec before Docker
+  started it), and the cancel asks the supervisor again until it has reserved the exec, within the same control
+  budget. Either way the usage is released at once.
 
 ## [0.3.2] - 2026-10-31
 
@@ -293,7 +310,8 @@ daemon needs PostgreSQL and the stopped-service cutover in the operations guide.
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ryang420/agent-keel/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ryang420/agent-keel/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ryang420/agent-keel/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ryang420/agent-keel/compare/v0.2.0...v0.3.0

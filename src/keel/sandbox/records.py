@@ -37,6 +37,11 @@ class SandboxUncertain(SandboxError):
     """An external sandbox operation has an unknown outcome; recovery must reconcile it before reuse."""
 
 
+class SandboxNotYet(SandboxUncertain):
+    """The supervisor has no endpoint or receipt for the exec yet: it may not have reserved it, or may still be
+    draining it. Uncertain as it stands; a control may ask again within its own deadline."""
+
+
 @dataclass(frozen=True)
 class SandboxKey:
     """The coordination identity of one profile's sandbox on one deployment and Docker daemon."""
