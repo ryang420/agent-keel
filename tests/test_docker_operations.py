@@ -22,7 +22,8 @@ from keel.sandbox import docker as docker_module
 from keel.sandbox.base import TIMEOUT_EXIT_CODE, SandboxError, parse_policy, profile_mount_root
 from keel.sandbox.docker import DockerSandbox, _DockerBinaryResult, _DockerResult, _env_file
 from keel.sandbox.records import (
-    CleanupReceipt, ExecTicket, LifecycleAttempt, SandboxBinding, SandboxKey, SandboxUncertain, UseHandle,
+    CleanupReceipt, ExecTicket, LifecycleAttempt, SandboxBinding, SandboxKey, SandboxNotYet, SandboxUncertain,
+    UseHandle,
 )
 from keel.sandbox import runtime as runtime_module
 from keel.sandbox.runtime import HelperArtifact
@@ -869,6 +870,93 @@ def attach_spawn(backend: DockerSandbox, process: FakeProcess, *, env_capture: d
     return spawned
 
 
+async def test_a_stop_during_dispatch_lets_the_helper_start_then_cancels_it(backend):
+    """Interrupted mid-dispatch, the helper could start with no one left to cancel it: the dispatch completes, the
+    cancel goes to the supervisor, and the stop still surfaces as a cancellation."""
+    ticket = make_ticket()
+    process = FakeProcess([], None)
+    spawning, release = asyncio.Event(), asyncio.Event()
+    spawned: list[list[str]] = []
+
+    async def spawn(args, wants_stdin):
+        spawning.set()
+        await release.wait()
+        spawned.append(list(args))
+        return process
+
+    backend._spawn = spawn
+    fake = attach(backend, lambda args, stdin: (0, ""))
+    task = asyncio.create_task(backend.exec_bound(ticket, ["sleep", "30"], cwd="/w", timeout_s=60))
+    await asyncio.wait_for(spawning.wait(), 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(spawned) == 1
+    assert any("cancel" in args for args in fake.commands())
+
+
+async def test_a_stop_never_kills_the_client_before_the_supervisor_has_ended_the_exec(backend):
+    """Killing the docker client right after it started can abort the exec before Docker starts it: the supervisor
+    then never reserves it and no cancel can ever be confirmed. The stop asks the supervisor (again while it has not
+    reserved the exec) and leaves the client to exit once the command has ended."""
+    ticket = make_ticket()
+    process = FakeProcess([], None)
+    attach_spawn(backend, process)
+    answers = [5, 5, 0]
+
+    def handler(args, stdin):
+        if "cancel" in args:
+            code = answers.pop(0) if answers else 0
+            if code == 0:
+                process.returncode = -15  # the supervisor ended the command, so the client exits
+            return code, "" if code == 0 else "exec identity is not reserved"
+        return 0, receipt_json(ticket)
+
+    fake = attach(backend, handler)
+    task = asyncio.create_task(backend.exec_bound(ticket, ["sleep", "30"], cwd="/w", timeout_s=60))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not process.killed
+    assert sum("cancel" in args for args in fake.commands()) == 3
+
+
+async def test_a_stop_kills_the_client_once_the_supervisor_has_had_its_time(backend):
+    ticket = make_ticket()
+    process = FakeProcess([], None)
+    attach_spawn(backend, process)
+    backend.kill_grace_s, backend.reap_seconds = 0.0, 0.0
+    attach(backend, lambda args, stdin: (5, "exec identity is not reserved") if "cancel" in args
+           else (0, receipt_json(ticket)))
+    task = asyncio.create_task(backend.exec_bound(ticket, ["sleep", "30"], cwd="/w", timeout_s=60))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert process.killed
+
+
+async def test_a_failed_dispatch_after_a_stop_still_surfaces_as_a_cancellation(backend):
+    ticket = make_ticket()
+    spawning = asyncio.Event()
+
+    async def spawn(args, wants_stdin):
+        spawning.set()
+        await asyncio.sleep(0.05)
+        raise OSError("docker is gone")
+
+    backend._spawn = spawn
+    attach(backend, lambda args, stdin: (0, ""))
+    task = asyncio.create_task(backend.exec_bound(ticket, ["sleep", "30"], cwd="/w", timeout_s=60))
+    await asyncio.wait_for(spawning.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def test_exec_bound_dispatches_once_by_exact_id_with_separate_transports(backend):
     ticket = make_ticket()
     secret = "exec-secret-" + uuid.uuid4().hex
@@ -1058,6 +1146,15 @@ async def test_control_exec_reads_the_receipt_command(backend):
     assert receipt.leader_status == 5
     assert len(fake.commands()) == 1 and "receipt" in fake.commands()[0]
     assert ticket.binding.container_name not in fake.commands()[0]
+
+
+async def test_control_exec_reports_an_exec_the_supervisor_has_not_reserved_yet_as_not_yet(backend):
+    """Exit 5 means the supervisor has no endpoint or receipt for the exec yet (a stop can arrive before `run` has
+    reserved it): still uncertain, but a typed outcome the coordinator may ask again about within its budget."""
+    ticket = make_ticket()
+    attach(backend, lambda args, stdin: (5, "exec identity is not reserved"))
+    with pytest.raises(SandboxNotYet):
+        await backend.control_exec(ticket, cancel=True)
 
 
 @pytest.mark.parametrize("result", [

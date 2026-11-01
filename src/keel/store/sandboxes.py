@@ -533,6 +533,25 @@ class SandboxStoreMixin:
             await self._drain_matching_generation(ticket, now)
             return False
 
+    async def abandon_exec(self, ticket: ExecTicket) -> bool:
+        """Finish a pending exec that was stopped before its dispatch began, as `not_dispatched`. Only the call that
+        admitted the ticket dispatches it, and it never will now, so no receipt is needed. True for the transition."""
+        async with self.coordination_guard(ticket.use.key.profile_id):
+            lock = self._lock_suffix()
+            now = await self.coordination_now()
+            await self._lock_sandbox(ticket.use.key, lock)
+            row = await self.db.fetchrow(
+                f"SELECT * FROM sandbox_execs WHERE id = ? AND control_token = ?{lock}",
+                ticket.exec_id, ticket.control_token)
+            if row is None or not self._exec_matches_ticket(row, ticket):
+                return False
+            updated = await self.db.fetchrow(
+                "UPDATE sandbox_execs SET state = 'finished', finished_at = ?, cleanup_outcome = 'not_dispatched', "
+                "uncertainty_reason = NULL, diagnostic = NULL WHERE id = ? AND control_token = ? "
+                "AND state = 'pending' RETURNING id",
+                now, ticket.exec_id, ticket.control_token)
+            return updated is not None
+
     async def mark_exec_uncertain(self, ticket: ExecTicket, reason: str) -> None:
         """Move a pending/running exec to uncertain and drain its exact generation; never downgrade a finish."""
         async with self.coordination_guard(ticket.use.key.profile_id):

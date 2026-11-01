@@ -8,7 +8,8 @@ import pytest
 
 from keel.sandbox.coordinator import SandboxCoordinator
 from keel.sandbox.local import LocalSandbox
-from keel.sandbox.records import CleanupReceipt, SandboxLeaseLost, SandboxUncertain
+from keel.sandbox.records import (CleanupReceipt, SandboxError, SandboxLeaseLost, SandboxNotYet,
+                                  SandboxUncertain)
 from keel.skills import discover_skills
 from keel.tools import run_tool
 from keel.tools.base import ToolContext
@@ -162,6 +163,101 @@ async def test_kill_resolves_durable_ticket_after_coordinator_restart(managed):
     await restarted.kill_tree(bound, 'original')
     assert backend.control_calls == [ticket]
     assert await restarted.release(bound.use) is True
+
+
+async def test_a_stop_before_the_supervisor_reserved_the_exec_asks_again_until_it_is_cancelled(managed):
+    """A stop can land between dispatch and the supervisor reserving the exec; giving up there left the command
+    running and the usage to recovery, so the session's next run waited a minute or more."""
+    facade, backend, store, _, bound, _ = managed
+    await store.begin_exec(bound, 'original')
+    answer = backend.control_exec
+    early = 2
+
+    async def control_exec(ticket, *, cancel):
+        nonlocal early
+        if early:
+            early -= 1
+            backend.control_calls.append(ticket)
+            raise SandboxNotYet('the sandbox exec endpoint or receipt is not available yet')
+        return await answer(ticket, cancel=cancel)
+
+    backend.control_exec = control_exec
+    await facade.kill_tree(bound, 'original')
+    assert len(backend.control_calls) == 3
+    assert (await store.db.fetchrow('SELECT state FROM sandbox_execs WHERE id = ?', 'original'))['state'] == 'finished'
+    assert await facade.release(bound.use) is True
+
+
+async def test_an_exec_the_supervisor_never_reserves_is_uncertain_once_the_budget_is_spent(managed):
+    facade, backend, store, _, bound, _ = managed
+    await store.begin_exec(bound, 'original')
+    facade.control_budget_s = 0.3
+
+    async def control_exec(ticket, *, cancel):
+        backend.control_calls.append(ticket)
+        raise SandboxNotYet('the sandbox exec endpoint or receipt is not available yet')
+
+    backend.control_exec = control_exec
+    with pytest.raises(SandboxUncertain):
+        await facade.kill_tree(bound, 'original')
+    assert len(backend.control_calls) > 1
+    assert (await store.db.fetchrow('SELECT state FROM sandbox_execs WHERE id = ?', 'original'))['state'] == 'uncertain'
+    assert await facade.release(bound.use) is False
+
+
+async def test_a_stop_before_dispatch_never_dispatches_and_settles_the_exec_at_once(managed, monkeypatch):
+    """A stop between the pending record and dispatch must not start the command (the user stopped it) and must
+    not leave it pending for the control to wait out its budget: the exec is finished as never dispatched, the
+    later kill returns at once, and the usage is released."""
+    facade, backend, store, _, bound, _ = managed
+    begin, entered, release = store.begin_exec, asyncio.Event(), asyncio.Event()
+
+    async def slow_begin(*args):
+        ticket = await begin(*args)
+        entered.set()
+        await release.wait()
+        return ticket
+
+    monkeypatch.setattr(store, 'begin_exec', slow_begin)
+    task = asyncio.create_task(facade.exec(bound, ['bash', '-c', 'touch never'], cwd='/', timeout_s=60,
+                                           exec_id='early'))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert backend.exec_calls == [] and backend.control_calls == []
+    row = await store.db.fetchrow('SELECT state, cleanup_outcome FROM sandbox_execs WHERE id = ?', 'early')
+    assert (row['state'], row['cleanup_outcome']) == ('finished', 'not_dispatched')
+    await asyncio.wait_for(facade.kill_tree(bound, 'early'), 1)  # the runner's stop path: no control, no wait
+    assert backend.control_calls == []
+    assert await facade.release(bound.use) is True
+
+
+async def test_a_kill_that_arrives_before_dispatch_stops_the_exec_from_starting(managed, monkeypatch):
+    facade, backend, store, _, bound, _ = managed
+    begin, entered, release = store.begin_exec, asyncio.Event(), asyncio.Event()
+
+    async def slow_begin(*args):
+        ticket = await begin(*args)
+        entered.set()
+        await release.wait()
+        return ticket
+
+    monkeypatch.setattr(store, 'begin_exec', slow_begin)
+    task = asyncio.create_task(facade.exec(bound, ['bash', '-c', 'true'], cwd='/', timeout_s=60, exec_id='early'))
+    await asyncio.wait_for(entered.wait(), 5)
+    kill = asyncio.create_task(facade.kill_tree(bound, 'early'))
+    await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.wait_for(kill, 2)
+    with pytest.raises(SandboxError):
+        await task
+    assert backend.exec_calls == [] and backend.control_calls == []
+    row = await store.db.fetchrow('SELECT state, cleanup_outcome FROM sandbox_execs WHERE id = ?', 'early')
+    assert (row['state'], row['cleanup_outcome']) == ('finished', 'not_dispatched')
+    assert await facade.release(bound.use) is True
 
 
 async def test_signal_without_receipt_marks_uncertain(managed):
