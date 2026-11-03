@@ -99,8 +99,15 @@ async def restore_legacy_memories(db) -> None:
                      "entries TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (profile_id, target))")
 
 
+async def restore_pre_session_kinds(db) -> None:
+    """Undo migration 15 on a database that is being rewound to an older schema version."""
+    await db.execute("DROP INDEX sessions_profile_kind_active")
+    await db.execute("ALTER TABLE sessions DROP COLUMN kind")
+
+
 async def restore_pre_dreams(db) -> None:
-    """Undo migration 14 on a database that is being rewound to an older schema version."""
+    """Undo migrations 15 and 14 on a database that is being rewound to an older schema version."""
+    await restore_pre_session_kinds(db)
     for table in ("dream_attempts", "dream_jobs"):
         await db.execute(f"DROP TABLE {table}")
     await db.execute("DROP INDEX lesson_observations_pending")
@@ -853,7 +860,7 @@ async def test_a_0_3_2_database_upgrades_to_the_latest_version_and_matches_a_fre
 
     upgraded = await open_store(db_url)
     try:
-        assert await schema_version(upgraded.db) == LATEST_VERSION == 14
+        assert await schema_version(upgraded.db) == LATEST_VERSION == 15
         model = await upgraded.get_run_by_id("run_model")
         assert (model.kind, model.command, model.provider, model.model) == ("model", None, "fake", "m")
         ran = await upgraded.get_run_by_id("run_command")
@@ -880,7 +887,7 @@ async def test_migration_14_adds_dream_jobs_to_a_version_13_database(db_url):
         await store.close()
     store = await open_store(db_url)
     try:
-        assert await schema_version(store.db) == LATEST_VERSION == 14
+        assert await schema_version(store.db) == LATEST_VERSION == 15
         assert await store.db.fetch("SELECT * FROM dream_jobs") == []
         assert await store.db.fetch("SELECT * FROM dream_attempts") == []
         column = await store.db.fetchrow(
@@ -890,3 +897,24 @@ async def test_migration_14_adds_dream_jobs_to_a_version_13_database(db_url):
         assert (await store.get_profile("p1")).learning
     finally:
         await store.close()
+
+
+async def test_migration_15_adds_an_unset_session_kind_and_its_list_index(db_url, monkeypatch):
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:14])
+    monkeypatch.setattr(migrations, "LATEST_VERSION", 14)
+    old = await open_store(db_url)
+    await insert_old_profile(old.db, "p1", 1)
+    await old.db.execute("INSERT INTO sessions (id, profile_id, created_at, last_active_at, message_count) "
+                         "VALUES ('s1', 'p1', 1, 1, 0)")
+    await old.close()
+    monkeypatch.undo()
+
+    upgraded = await open_store(db_url)
+    try:
+        assert await schema_version(upgraded.db) == 15
+        assert (await upgraded.get_session("p1", "s1")).kind is None
+        indexes = {row["indexname"]: row["indexdef"] for row in await upgraded.db.fetch(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'sessions'")}
+        assert "(profile_id, kind, last_active_at DESC, id)" in indexes["sessions_profile_kind_active"]
+    finally:
+        await upgraded.close()

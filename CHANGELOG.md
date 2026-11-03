@@ -6,7 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Schema migration 15 runs at start (one column and one index on `sessions`); like earlier migrations it cannot be
+undone, so back up the database first.
+
 ### Added
+- Session kinds and session list paging (`docs/design/2026-11-03-session-kinds.md`): a session has an optional
+  consumer-chosen `kind`, set by a run's `session_kind` or by `PATCH …/sessions/{id}`. `GET …/sessions` takes `kind`
+  and `cursor` and returns `next_cursor`, so a consumer can page through one kind of session however many of other
+  kinds the profile has.
 - The learning curve (`evals/learning`) keeps each dream's model calls and job outcome in `dreams.jsonl` beside its
   sequence, and each sequence record lists its `dream_jobs`, so a curve that learns nothing shows why.
 

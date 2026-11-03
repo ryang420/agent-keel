@@ -26,7 +26,8 @@ from keel.sandbox.base import PolicyError, parse_policy, private_mount_conflict,
 from keel.sandbox.records import SandboxBusy
 from keel.store.base import (
     ACTIVE, TERMINAL, TERMINAL_EVENT, ProfileDeletionBusy, ProfileDeletionConflict, ProfileIncarnationMismatch,
-    ProfileTenantMismatch, MemorySource, ReviewNotRetryable, ReviewSourceGone, SessionBusy, SessionNotFound, TitleInUse,
+    ProfileTenantMismatch, MemorySource, ReviewNotRetryable, ReviewSourceGone, SessionBusy, SessionKindConflict,
+    SessionNotFound, TitleInUse,
 )
 from keel.store.reviews import REVIEW_STATUSES
 from keel.titles import sanitize_title
@@ -34,6 +35,7 @@ from keel.verify import VerifyError, verify_model
 
 log = logging.getLogger(__name__)
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_KIND = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _TERMINAL_EVENTS = frozenset(TERMINAL_EVENT.values())
 _KEEPALIVE_SECONDS = 15.0
 _HEALTH_TIMEOUT_SECONDS = 3.0
@@ -69,6 +71,33 @@ class ApiError(Exception):
 def _error(status: int, code: str, message: str) -> JSONResponse:
     """Build the API's standard JSON error envelope with the given HTTP status."""
     return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
+
+
+def _check_kind(value, what: str) -> str | None:
+    """A session kind, None when absent, or 400 invalid_input."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _KIND.fullmatch(value):
+        raise ApiError(400, "invalid_input", f"{what} must be 1–32 lowercase letters, digits, '_' or '-', "
+                                             "starting with a letter.")
+    return value
+
+
+def _session_cursor(session) -> str:
+    """The opaque list cursor after `session`: its (last_active_at, id)."""
+    raw = json.dumps([session.last_active_at, session.id]).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _parse_session_cursor(value: str) -> tuple[float, str]:
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        decoded = None
+    if (not isinstance(decoded, list) or len(decoded) != 2 or isinstance(decoded[0], bool)
+            or not isinstance(decoded[0], (int, float)) or not isinstance(decoded[1], str)):
+        raise ApiError(400, "invalid_input", "cursor is not a session list cursor.")
+    return float(decoded[0]), decoded[1]
 
 
 def _check_id(value: str, what: str) -> str:
@@ -135,7 +164,7 @@ def session_json(session) -> dict:
     """Serialize a session's identity, title, timestamps and message count."""
     return {"id": session.id, "title": session.title, "title_source": session.title_source,
             "created_at": session.created_at, "last_active_at": session.last_active_at,
-            "message_count": session.message_count}
+            "message_count": session.message_count, "kind": session.kind}
 
 
 def _sse_frame(event) -> str:
@@ -436,16 +465,21 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         except CommandError as exc:
             raise ApiError(400, "invalid_input", str(exc)) from exc
         session_id = _check_id(body.get("session_id") or f"ses_{uuid.uuid4().hex}", "session_id")
+        session_kind = _check_kind(body.get("session_kind"), "session_kind")
         existing = await keel_.store.get_session(profile_id, session_id)
         if existing is not None and await keel_.store.active_run_for_session(session_id) is not None:
             raise ApiError(409, "session_busy", "This session already has a run in progress.")
+        if existing is not None and session_kind is not None and existing.kind not in (None, session_kind):
+            raise ApiError(409, "session_kind_conflict", "This session has a different kind.")
         if await keel_.store.count_in_flight() >= keel_.max_running:
             return JSONResponse({"error": {"code": "at_capacity", "message": "Too many runs in progress."}},
                                 status_code=429, headers={"Retry-After": "1"})
         try:
-            await keel_.store.ensure_session(profile_id, session_id)
+            await keel_.store.ensure_session(profile_id, session_id, kind=session_kind)
         except SessionNotFound:
             raise ApiError(404, "session_not_found", "No such session.")
+        except SessionKindConflict:
+            raise ApiError(409, "session_kind_conflict", "This session has a different kind.")
         try:
             async with keel_.store.profile_guard(profile_id) as exists:
                 # Checked again under the guard against the profile as it is now, as a model run's model is.
@@ -493,18 +527,23 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
             if body.get(field) is not None and not isinstance(body[field], str):
                 raise ApiError(400, "invalid_input", f"{field} must be a string.")
         session_id = _check_id(body.get("session_id") or f"ses_{uuid.uuid4().hex}", "session_id")
+        session_kind = _check_kind(body.get("session_kind"), "session_kind")
         # Refuse what can be checked before creating anything. A rare race with a profile update that disables the
         # model or deletes the profile is refused under the guard below and can leave the new session empty.
         existing = await keel_.store.get_session(profile_id, session_id)
         if existing is not None and await keel_.store.active_run_for_session(session_id) is not None:
             raise ApiError(409, "session_busy", "This session already has a run in progress.")
+        if existing is not None and session_kind is not None and existing.kind not in (None, session_kind):
+            raise ApiError(409, "session_kind_conflict", "This session has a different kind.")
         if await keel_.store.count_in_flight() >= keel_.max_running:
             return JSONResponse({"error": {"code": "at_capacity", "message": "Too many runs in progress."}},
                                 status_code=429, headers={"Retry-After": "1"})
         try:
-            await keel_.store.ensure_session(profile_id, session_id)
+            await keel_.store.ensure_session(profile_id, session_id, kind=session_kind)
         except SessionNotFound:
             raise ApiError(404, "session_not_found", "No such session.")
+        except SessionKindConflict:
+            raise ApiError(409, "session_kind_conflict", "This session has a different kind.")
         blobs = []
         try:
             for index, part in enumerate(parts):
@@ -643,11 +682,19 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         return {"completed": True}
 
     @app.get("/v1/profiles/{profile_id}/sessions")
-    async def list_sessions(request: Request, profile_id: str, limit: int = 100):
-        """List the profile's most recently active sessions, clamping limit to 1–500."""
+    async def list_sessions(request: Request, profile_id: str, limit: int = 100, kind: str | None = None,
+                            cursor: str | None = None):
+        """List the profile's most recently active sessions, clamping limit to 1–500; only `kind` when given, and
+        after `cursor` (a previous page's next_cursor) when given. next_cursor is null on the last page."""
         await profile_or_404(request, profile_id)
-        sessions = await k(request).store.list_sessions(profile_id, max(1, min(limit, 500)))
-        return {"data": [session_json(s) for s in sessions]}
+        kind = _check_kind(kind, "kind")
+        after = _parse_session_cursor(cursor) if cursor is not None else None
+        limit = max(1, min(limit, 500))
+        sessions = await k(request).store.list_sessions(profile_id, limit + 1, kind=kind, after=after)
+        more = len(sessions) > limit
+        sessions = sessions[:limit]
+        return {"data": [session_json(s) for s in sessions],
+                "next_cursor": _session_cursor(sessions[-1]) if more else None}
 
     @app.get("/v1/profiles/{profile_id}/sessions/{session_id}/messages")
     async def session_messages(request: Request, profile_id: str, session_id: str, limit: int = 200,
@@ -678,22 +725,34 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
 
     @app.patch("/v1/profiles/{profile_id}/sessions/{session_id}")
     async def rename(request: Request, profile_id: str, session_id: str):
-        """Set a sanitized, non-empty user title and return the updated session.
+        """Set a sanitized, non-empty user title, a kind, or both, and return the updated session.
 
-        Return 400 for an invalid title, 404 for a missing session or 409 if the profile
-        already has another session with that title.
+        Return 400 for an invalid title or kind or neither, 404 for a missing session, 409 title_in_use if the profile
+        already has another session with that title and 409 session_kind_conflict if the session has another kind.
         """
         await profile_or_404(request, profile_id)
         body = await _json_body(request)
-        title = sanitize_title(body.get("title") or "") if isinstance(body.get("title"), str) else ""
-        if not title:
-            raise ApiError(400, "invalid_input", "A title is required.")
+        if "title" not in body and "kind" not in body:
+            raise ApiError(400, "invalid_input", "A title or a kind is required.")
+        kind = _check_kind(body["kind"], "kind") if "kind" in body else None
+        if "kind" in body and kind is None:
+            raise ApiError(400, "invalid_input", "kind cannot be removed.")
+        title = None
+        if "title" in body:
+            title = sanitize_title(body["title"] or "") if isinstance(body["title"], str) else ""
+            if not title:
+                raise ApiError(400, "invalid_input", "A title is required.")
+        store = k(request).store
         try:
-            session = await k(request).store.set_title(profile_id, session_id, title, "user")
+            session = await store.set_session_kind(profile_id, session_id, kind) if kind is not None else None
+            if title is not None:
+                session = await store.set_title(profile_id, session_id, title, "user")
         except SessionNotFound:
             raise ApiError(404, "session_not_found", "No such session.")
         except TitleInUse:
             raise ApiError(409, "title_in_use", "Another conversation already has that title.")
+        except SessionKindConflict:
+            raise ApiError(409, "session_kind_conflict", "This session has a different kind.")
         return session_json(session)
 
     @app.delete("/v1/profiles/{profile_id}/sessions/{session_id}")

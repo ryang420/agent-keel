@@ -14,7 +14,7 @@ from keel.models import (
 from keel.store.base import (
     TERMINAL, TERMINAL_EVENT, TITLE_RANK, WORKER_LOST_MESSAGE, Event, ImportResult, Profile,
     ProfileIncarnationMismatch, ProfileTenantMismatch, Run, RunTransition, Session, SessionBusy, SessionNotFound,
-    StoredMessage, TerminalEventType, TitleInUse,
+    SessionKindConflict, StoredMessage, TerminalEventType, TitleInUse,
     UniqueViolation, UnknownRun,
 )
 from keel.sandbox.base import SandboxPolicy
@@ -53,7 +53,7 @@ def _session(row: dict) -> Session:
         context_tokens=row["context_tokens"], context_message_id=row["context_message_id"],
         compaction_failed_at=row["compaction_failed_at"], pruned_id=row["pruned_id"],
         tools=tuple(json.loads(row["tools"])) if row.get("tools") is not None else None,
-        generation=row.get("generation"),
+        generation=row.get("generation"), kind=row.get("kind"),
     )
 
 
@@ -213,7 +213,9 @@ class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedS
 
     # sessions
 
-    async def ensure_session(self, profile_id: str, session_id: str) -> Session:
+    async def ensure_session(self, profile_id: str, session_id: str, kind: str | None = None) -> Session:
+        """The session, created when missing; `kind`, when given, is recorded on a session that has none and must
+        match one that has (SessionKindConflict)."""
         async with self.db.transaction():
             await self.lock_profile(profile_id)
             await self.assert_profile_admitted(profile_id)
@@ -221,14 +223,41 @@ class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedS
             if row is None:
                 now = self.clock()
                 try:
+                    # `kind` is named only when given, so a database before migration 15 can still be written.
+                    extra, values = (", kind", ", ?") if kind is not None else ("", "")
                     await self.db.execute(
-                        "INSERT INTO sessions (id, profile_id, created_at, last_active_at, message_count) "
-                        "VALUES (?, ?, ?, ?, 0)", session_id, profile_id, now, now)
+                        f"INSERT INTO sessions (id, profile_id, created_at, last_active_at, message_count{extra}) "
+                        f"VALUES (?, ?, ?, ?, 0{values})", session_id, profile_id, now, now,
+                        *([kind] if kind is not None else []))
                 except UniqueViolation:
                     pass  # created by a concurrent request
                 row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
-        if row["profile_id"] != profile_id:
-            raise SessionNotFound(session_id)
+            if row["profile_id"] != profile_id:
+                raise SessionNotFound(session_id)
+            if kind is not None and row["kind"] != kind:
+                row = await self._record_kind(session_id, kind, row["kind"])
+        return _session(row)
+
+    async def _record_kind(self, session_id: str, kind: str, current: str | None) -> dict:
+        if current is not None:
+            raise SessionKindConflict(session_id)
+        row = await self.db.fetchrow("UPDATE sessions SET kind = ? WHERE id = ? AND kind IS NULL RETURNING *",
+                                     kind, session_id)
+        if row is None:  # labelled by a concurrent request; the same kind is fine
+            row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ?", session_id)
+            if row["kind"] != kind:
+                raise SessionKindConflict(session_id)
+        return row
+
+    async def set_session_kind(self, profile_id: str, session_id: str, kind: str) -> Session:
+        """Label a session that has no kind; the same kind again changes nothing, another is SessionKindConflict."""
+        async with self.db.transaction():
+            row = await self.db.fetchrow("SELECT * FROM sessions WHERE id = ? AND profile_id = ?",
+                                         session_id, profile_id)
+            if row is None:
+                raise SessionNotFound(session_id)
+            if row["kind"] != kind:
+                row = await self._record_kind(session_id, kind, row["kind"])
         return _session(row)
 
     async def import_session(self, *, profile_id: str, tenant_id: int, session_id: str, title: str | None,
@@ -279,10 +308,20 @@ class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedS
                                      session_id, profile_id)
         return _session(row) if row else None
 
-    async def list_sessions(self, profile_id: str, limit: int = 100) -> list[Session]:
+    async def list_sessions(self, profile_id: str, limit: int = 100, *, kind: str | None = None,
+                            after: tuple[float, str] | None = None) -> list[Session]:
+        """Up to `limit` sessions, most recently active first, then by id; only `kind` when given, and only those
+        after the `(last_active_at, id)` of `after` in that order (keyset paging)."""
+        where, args = ["profile_id = ?"], [profile_id]
+        if kind is not None:
+            where.append("kind = ?")
+            args.append(kind)
+        if after is not None:
+            where.append("(last_active_at < ? OR (last_active_at = ? AND id > ?))")
+            args += [after[0], after[0], after[1]]
         rows = await self.db.fetch(
-            "SELECT * FROM sessions WHERE profile_id = ? ORDER BY last_active_at DESC, id LIMIT ?",
-            profile_id, limit)
+            f"SELECT * FROM sessions WHERE {' AND '.join(where)} ORDER BY last_active_at DESC, id LIMIT ?",
+            *args, limit)
         return [_session(row) for row in rows]
 
     async def set_session_prompt(self, session_id: str, system_prompt: str, provider: str, model: str,
