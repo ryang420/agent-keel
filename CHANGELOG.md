@@ -6,7 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Schema migration 15 runs at start (one column and one index on `sessions`); like earlier migrations it cannot be
+## [0.5.0] - 2026-11-03
+
+Session kinds and a keyset-paged session list, on top of 0.4.0. Schema migration 15 runs at start (one column and one index on `sessions`); like earlier migrations it cannot be
 undone, so back up the database first.
 
 ### Added
@@ -321,7 +323,8 @@ daemon needs PostgreSQL and the stopped-service cutover in the operations guide.
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ryang420/agent-keel/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ryang420/agent-keel/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ryang420/agent-keel/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ryang420/agent-keel/compare/v0.3.0...v0.3.1

@@ -1,6 +1,6 @@
 # Session kinds and session list paging
 
-Status: proposed (2026-11-03).
+Status: accepted for 0.5.0 (2026-11-03).
 
 ## Goal
 
