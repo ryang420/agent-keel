@@ -505,3 +505,104 @@ async def test_either_bound_key_is_accepted_and_an_unbound_key_is_not(store):
     assert other.status_code == 404 and other.json()["error"]["code"] == "profile_not_found"
     denied = await call("nope")
     assert denied.status_code == 401 and denied.json()["error"]["code"] == "unauthorized"
+
+
+async def list_page(client, **params):
+    response = await client.get("/v1/profiles/p1/sessions", params=params)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def test_a_run_records_its_session_kind_and_the_list_filters_and_pages_by_it(service, clock):
+    client, _, _ = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    for n in range(5):
+        clock.now += 1
+        await settle(client, (await send(client, session=f"chat-{n}", session_kind="chat")).json()["run_id"])
+        clock.now += 1
+        await settle(client, (await send(client, session=f"job-{n}", session_kind="job")).json()["run_id"])
+    clock.now += 1
+    await settle(client, (await send(client, session="plain")).json()["run_id"])
+
+    everything = await list_page(client)
+    assert len(everything["data"]) == 11 and everything["next_cursor"] is None
+    assert {s["id"]: s["kind"] for s in everything["data"]}["plain"] is None
+
+    first = await list_page(client, kind="chat", limit=2)
+    assert [s["id"] for s in first["data"]] == ["chat-4", "chat-3"]
+    assert {s["kind"] for s in first["data"]} == {"chat"} and first["next_cursor"]
+    second = await list_page(client, kind="chat", limit=2, cursor=first["next_cursor"])
+    assert [s["id"] for s in second["data"]] == ["chat-2", "chat-1"] and second["next_cursor"]
+    last = await list_page(client, kind="chat", limit=2, cursor=second["next_cursor"])
+    assert [s["id"] for s in last["data"]] == ["chat-0"] and last["next_cursor"] is None
+    exact = await list_page(client, kind="chat", limit=5)
+    assert len(exact["data"]) == 5 and exact["next_cursor"] is None
+
+
+async def test_paging_neither_repeats_nor_skips_when_a_session_becomes_active(service, clock):
+    client, _, _ = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    for n in range(4):
+        clock.now += 1
+        await settle(client, (await send(client, session=f"chat-{n}", session_kind="chat")).json()["run_id"])
+    first = await list_page(client, kind="chat", limit=2)
+    assert [s["id"] for s in first["data"]] == ["chat-3", "chat-2"]
+    clock.now += 1  # the oldest conversation moves to the front between pages
+    await settle(client, (await send(client, session="chat-0", session_kind="chat")).json()["run_id"])
+    rest = await list_page(client, kind="chat", limit=2, cursor=first["next_cursor"])
+    assert [s["id"] for s in rest["data"]] == ["chat-1"] and rest["next_cursor"] is None
+
+
+async def test_rows_with_the_same_activity_time_page_by_id(service, clock):
+    client, _, store = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    for name in ("c", "a", "b"):
+        await store.ensure_session("p1", name, kind="chat")
+    first = await list_page(client, kind="chat", limit=2)
+    second = await list_page(client, kind="chat", limit=2, cursor=first["next_cursor"])
+    assert [s["id"] for s in first["data"] + second["data"]] == ["a", "b", "c"]
+
+
+async def test_a_session_kind_is_set_once(service):
+    client, _, _ = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    await settle(client, (await send(client, session="old")).json()["run_id"])
+    # A run labels an existing session that has no kind; the same kind again is fine; another is refused.
+    await settle(client, (await send(client, session="old", session_kind="chat")).json()["run_id"])
+    await settle(client, (await send(client, session="old", session_kind="chat")).json()["run_id"])
+    clash = await send(client, session="old", session_kind="job")
+    assert clash.status_code == 409 and clash.json()["error"]["code"] == "session_kind_conflict"
+    assert [s["id"] for s in (await list_page(client, kind="chat"))["data"]] == ["old"]
+
+
+async def test_patch_labels_a_session_and_renames_it(service):
+    client, _, _ = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    await settle(client, (await send(client, session="old")).json()["run_id"])
+    labelled = await client.patch("/v1/profiles/p1/sessions/old", json={"kind": "chat"})
+    assert labelled.status_code == 200 and labelled.json()["kind"] == "chat"
+    assert labelled.json()["title"] == "Hello there"
+    both = await client.patch("/v1/profiles/p1/sessions/old", json={"kind": "chat", "title": "Renamed"})
+    assert both.status_code == 200 and (both.json()["kind"], both.json()["title"]) == ("chat", "Renamed")
+    clash = await client.patch("/v1/profiles/p1/sessions/old", json={"kind": "job"})
+    assert clash.status_code == 409 and clash.json()["error"]["code"] == "session_kind_conflict"
+    assert (await client.get("/v1/profiles/p1/sessions")).json()["data"][0]["title"] == "Renamed"
+    missing = await client.patch("/v1/profiles/p1/sessions/nope", json={"kind": "chat"})
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "session_not_found"
+    empty = await client.patch("/v1/profiles/p1/sessions/old", json={})
+    assert empty.status_code == 400 and empty.json()["error"]["code"] == "invalid_input"
+
+
+async def test_invalid_kinds_and_cursors_are_refused(service):
+    client, _, _ = service
+    await client.put("/v1/profiles/p1", json=PROFILE)
+    for bad in ("", "Chat", "1chat", "has space", "x" * 33, 5):
+        run = await send(client, session="s", session_kind=bad)
+        assert run.status_code == 400 and run.json()["error"]["code"] == "invalid_input", bad
+        patch = await client.patch("/v1/profiles/p1/sessions/s", json={"kind": bad})
+        assert patch.status_code == 400 and patch.json()["error"]["code"] == "invalid_input", bad
+    assert [s["id"] for s in (await list_page(client))["data"]] == []
+    for params in ({"kind": "Chat"}, {"cursor": "nope"}, {"cursor": "WzFd"}, {"cursor": "WyJ4IiwgMV0"}):
+        listed = await client.get("/v1/profiles/p1/sessions", params=params)
+        assert listed.status_code == 400 and listed.json()["error"]["code"] == "invalid_input", params
+

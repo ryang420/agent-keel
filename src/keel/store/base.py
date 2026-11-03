@@ -37,6 +37,10 @@ class TitleInUse(StoreError):
     pass
 
 
+class SessionKindConflict(StoreError):
+    """The session already has a different kind; a kind is set once."""
+
+
 class ProfileTenantMismatch(StoreError):
     pass
 
@@ -113,6 +117,7 @@ class Session:
     pruned_id: int | None = None
     tools: tuple[str, ...] | None = None
     generation: str | None = None
+    kind: str | None = None
 
 
 @dataclass(frozen=True)

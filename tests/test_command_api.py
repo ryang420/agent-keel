@@ -155,3 +155,15 @@ async def test_another_tenants_key_cannot_start_a_command_run(store, tmp_path, m
         response = await other.post("/v1/profiles/p1/runs", json=command_run(work, "true"))
         assert response.status_code == 404 and response.json()["error"]["code"] == "profile_not_found"
         assert await store.list_runs("p1", ALL) == []
+
+
+async def test_a_command_run_records_its_session_kind(boxed):
+    client, _, work, _ = boxed
+    started = await client.post("/v1/profiles/p1/runs", json={**command_run(work, "true"), "session_kind": "job"})
+    assert started.status_code == 202, started.text
+    await settle(client, started.json()["run_id"])
+    listed = (await client.get("/v1/profiles/p1/sessions", params={"kind": "job"})).json()["data"]
+    assert [(s["id"], s["kind"]) for s in listed] == [("job-1", "job")]
+    bad = await client.post("/v1/profiles/p1/runs", json={**command_run(work, "true", session="j2"),
+                                                           "session_kind": "Job"})
+    assert bad.status_code == 400 and bad.json()["error"]["code"] == "invalid_input"

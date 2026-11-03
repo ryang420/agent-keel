@@ -29,10 +29,10 @@ Errors have one shape, with a machine-readable code:
 | `GET /v1/profiles/{profile_id}/runs/{run_id}` | One run. |
 | `POST /v1/profiles/{profile_id}/runs/{run_id}/stop` | Stop a run. Returns the run. |
 | `GET /v1/profiles/{profile_id}/runs/{run_id}/events?after=` | Server-sent events of a run. |
-| `GET /v1/profiles/{profile_id}/sessions?limit=` | List sessions, most recent first. `limit` 1-500, default 100. |
+| `GET /v1/profiles/{profile_id}/sessions?limit=&kind=&cursor=` | List sessions, most recent first: `{"data", "next_cursor"}`. `limit` 1-500, default 100. See [Sessions and messages](#sessions-and-messages). |
 | `GET /v1/profiles/{profile_id}/sessions/{session_id}/messages` | Messages of a session. |
 | `GET /v1/profiles/{profile_id}/sessions/{session_id}/boundary` | `{"last_message_id": …}`. |
-| `PATCH /v1/profiles/{profile_id}/sessions/{session_id}` | Rename: `{"title": "…"}`. Returns the session. |
+| `PATCH /v1/profiles/{profile_id}/sessions/{session_id}` | Rename or label: `{"title": "…"}`, `{"kind": "…"}` or both. Returns the session. |
 | `DELETE /v1/profiles/{profile_id}/sessions/{session_id}` | Delete a session: `{"deleted": true}`. |
 | `GET /v1/profiles/{profile_id}/memory` | The profile's active memory entries per target, with usage and each entry's source. |
 | `PATCH /v1/profiles/{profile_id}/memory/{entry_id}` | Replace an entry's text: `{"text": "…", "expected_version": n}`. Returns the entry. |
@@ -121,6 +121,9 @@ clears it, and enabling or clearing a sandbox counts as a change.
   base64 (no `data:` prefix, no line breaks). An image-only input is accepted.
 - `session_id` continues a session. If omitted, a new session `ses_<random>` is created; a new id creates the
   session. A session takes one run at a time.
+- `session_kind` (optional) labels the session with a kind (see [Sessions and messages](#sessions-and-messages)):
+  recorded when the run creates the session or the session has no kind yet; a session with another kind is 409
+  `session_kind_conflict`. Command runs take it too.
 - `reasoning_effort` is passed to the provider as is (for example `low`, `medium`, `high`, or `none`).
 - `instructions` apply to this run only.
 
@@ -217,7 +220,19 @@ is unchanged. A client should ignore event types it does not know.
 
 A session is `id`, `title`, `title_source` (`derived` from the first message, then `llm` after the first completed
 run, or `user` after a rename; `user` outranks `llm`, which outranks `derived`), `created_at`, `last_active_at`,
-`message_count`. Setting the model title emits no event; a client reads the title from the session.
+`message_count`, `kind`. Setting the model title emits no event; a client reads the title from the session.
+
+`kind` is a label the consumer chooses, `^[a-z][a-z0-9_-]{0,31}$`, or `null`. keel only stores and filters on it,
+so a consumer can keep, say, conversations apart from sessions its background jobs start. It is set once, by the
+run that creates the session (`session_kind`), by a later run or by `PATCH` while the session has none; repeating the
+same kind is accepted, another kind is 409 `session_kind_conflict`, and it cannot be removed. Sessions created before
+migration 15 have no kind until the consumer labels them.
+
+`GET .../sessions` returns `{"data": [session, …], "next_cursor": "…" | null}`, ordered by `last_active_at`
+descending, then `id`. `kind=<kind>` returns only sessions of that kind. When `next_cursor` is set more sessions
+follow: pass it back as `cursor` for the next page. Paging is by position, not offset: a session that becomes
+active while a client pages moves to the front and is not returned again by later pages; reload the first page to
+see it. A cursor is opaque; a malformed one is 400 `invalid_input`.
 
 `GET .../messages` returns `{"data": [message, …], "pagination": {"limit", "offset", "returned"}}` with `limit`
 (1-500, default 200) and `offset`. With `after_id=<message id>` it returns only the later messages, without
@@ -470,6 +485,7 @@ remove a container by name alone.
 | 409 | `sandbox_busy` | `PUT /v1/profiles/{id}` would change the effective sandbox policy (including enabling or clearing it) while the profile has a queued, running or stopping run, unreleased sandbox usage, or unresolved sandbox work. Nothing in the request is applied. |
 | 409 | `sandbox_requires_migration` | An existing profile's host mounts require an operator migration before its policy can be updated. |
 | 409 | `title_in_use` | Another session already has that title. |
+| 409 | `session_kind_conflict` | The session already has a different `kind`. |
 | 422 | `access_denied`, `not_found`, `unsupported` | `/v1/models/verify`: the model is unusable (no access, unknown id, or the provider refused the test request). |
 | 429 | `at_capacity` | `KEEL_MAX_RUNNING` runs are in flight. Has a `Retry-After: 1` header. |
 | 500 | `internal_error` | An unexpected error. |

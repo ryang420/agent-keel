@@ -363,10 +363,17 @@ CREATE INDEX lesson_observations_pending ON lesson_observations (profile_id, cre
 ALTER TABLE lesson_observations ADD COLUMN note TEXT
 """
 
+# Session kinds (docs/design/2026-11-03-session-kinds.md): a consumer-chosen label per session, unset on existing rows,
+# and the index a filtered, keyset-paged session list scans.
+_V15 = """
+ALTER TABLE sessions ADD COLUMN kind TEXT;
+CREATE INDEX sessions_profile_kind_active ON sessions (profile_id, kind, last_active_at DESC, id)
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _V1), Migration(2, _V2), Migration(3, _V3), Migration(4, _V4), Migration(5, _V5),
     Migration(6, _V6), Migration(7, _V7), Migration(8, _V8), Migration(9, _V9), Migration(10, _V10),
-    Migration(11, _V11), Migration(12, _V12), Migration(13, _V13), Migration(14, _V14))
+    Migration(11, _V11), Migration(12, _V12), Migration(13, _V13), Migration(14, _V14), Migration(15, _V15))
 LATEST_VERSION = MIGRATIONS[-1].version
 
 
