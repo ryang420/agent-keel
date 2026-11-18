@@ -484,6 +484,30 @@ async def test_finish_exec_works_after_profile_deletion(store):
 # ---- recovery planning and commit ------------------------------------------------------------------------------
 
 
+async def _exec_xmax(store) -> dict[str, str]:
+    rows = await store.db.fetch("SELECT id, xmax::text AS xmax FROM sandbox_execs ORDER BY id")
+    return {row["id"]: row["xmax"] for row in rows}
+
+
+async def test_planners_lock_only_unresolved_execs(store):
+    """A finished exec can never change again, so a recovery or idle pass must not write a row lock on it."""
+    claim, generation = await _active_claim(store)
+    done = await store.begin_exec(_bound(claim, generation), "exec-1")
+    assert await store.finish_exec(done, _success(done)) is True
+    await store.begin_exec(_bound(claim, generation), "exec-2")
+    before = await _exec_xmax(store)
+
+    assert await store.plan_recovery(_key(), owner="recovery", lease_seconds=30) == []
+    await store.plan_idle_removal(_key(), owner="recovery", lease_seconds=30, idle_seconds=float("inf"),
+                                  helper_digest="sha256:test-helper")
+
+    after = await _exec_xmax(store)
+    assert after["exec-1"] == before["exec-1"]
+    assert after["exec-2"] != before["exec-2"]  # the unresolved exec is still locked
+
+
+
+
 async def _expired_bound_profile(store, clock, *, with_exec: bool = False):
     claim, generation = await _active_claim(store)
     ticket = await store.begin_exec(_bound(claim, generation), "exec-1") if with_exec else None

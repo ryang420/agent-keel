@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Sandbox recovery and idle passes no longer row-lock a profile's finished and retired exec records. Those records
+  can never change, yet each lock was a database write, repeated every maintenance minute for every exec kept within
+  the retention window. Only unresolved execs are locked now.
+
 ## [0.5.0] - 2026-11-03
 
 Session kinds and a keyset-paged session list, on top of 0.4.0. Schema migration 15 runs at start (one column and one index on `sessions`); like earlier migrations it cannot be

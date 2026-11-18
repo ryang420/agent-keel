@@ -260,9 +260,21 @@ class SandboxStoreMixin:
             key.deployment, key.profile_id)
 
     async def _lock_execs(self, key: SandboxKey, lock: str) -> list[dict]:
-        return await self.db.fetch(
-            f"SELECT * FROM sandbox_execs WHERE deployment = ? AND profile_id = ? ORDER BY id{lock}",
-            key.deployment, key.profile_id)
+        """Every exec of the sandbox, with only the unresolved ones row-locked.
+
+        `finished` and `retired` are terminal: no update matches them, so locking them would protect nothing, yet
+        each row lock is a heap write. They are read unlocked; new execs are serialised by the profile guard.
+        """
+        unresolved = ", ".join("?" for _ in _UNRESOLVED_EXEC_STATES)
+        rows = await self.db.fetch(
+            "SELECT * FROM sandbox_execs WHERE deployment = ? AND profile_id = ? "
+            f"AND state IN ({unresolved}) ORDER BY id{lock}",
+            key.deployment, key.profile_id, *_UNRESOLVED_EXEC_STATES)
+        rows += await self.db.fetch(
+            "SELECT * FROM sandbox_execs WHERE deployment = ? AND profile_id = ? "
+            f"AND state NOT IN ({unresolved})",
+            key.deployment, key.profile_id, *_UNRESOLVED_EXEC_STATES)
+        return sorted(rows, key=lambda row: row["id"])
 
     # admission
 
