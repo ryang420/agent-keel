@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-19
+
+Derived per-tenant service keys, on top of 0.5.1. No schema change.
+
 ### Added
 - Derived per-tenant service keys: with `KEEL_SERVICE_SECRET` (at least 32 bytes) set, a bearer key
   `kk1.<tenant>.<mac>` authenticates as that tenant, with `mac` the unpadded base64url HMAC-SHA256 of `kk1\0<tenant>`
