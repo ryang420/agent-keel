@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import base64
+import hashlib
 import hmac
 import json
 import math
@@ -90,6 +92,41 @@ def tenant_id_for(credentials: tuple[ServiceCredential, ...], authorization: str
     return found
 
 
+_SERVICE_SECRET_MIN_BYTES = 32
+
+
+def derive_service_key(secret: str, tenant_id: int) -> str:
+    """The bearer key `kk1.<tenant>.<mac>` that authenticates as `tenant_id` under a shared service secret."""
+    mac = hmac.new(secret.encode(), f"kk1\0{tenant_id}".encode(), hashlib.sha256).digest()
+    return f"kk1.{tenant_id}.{base64.urlsafe_b64encode(mac).rstrip(b'=').decode()}"
+
+
+def derived_tenant_id(secret: str | None, authorization: str) -> int | None:
+    """The tenant a `Bearer kk1.<tenant>.<mac>` header proves under `secret`, or None."""
+    prefix = "Bearer "
+    if not secret or not authorization.startswith(prefix):
+        return None
+    parts = authorization[len(prefix):].split(".")
+    if len(parts) != 3 or parts[0] != "kk1":
+        return None
+    tenant_text = parts[1]
+    if not _TENANT.fullmatch(tenant_text) or not _TENANT_INT_MIN <= int(tenant_text) <= _TENANT_INT_MAX:
+        return None
+    tenant_id = int(tenant_text)
+    if not hmac.compare_digest(derive_service_key(secret, tenant_id).encode(), authorization[len(prefix):].encode()):
+        return None
+    return tenant_id
+
+
+def _service_secret(env: Mapping[str, str]) -> str | None:
+    secret = (env.get("KEEL_SERVICE_SECRET") or "").strip()
+    if not secret:
+        return None
+    if len(secret.encode()) < _SERVICE_SECRET_MIN_BYTES:
+        raise ValueError(f"KEEL_SERVICE_SECRET must be at least {_SERVICE_SECRET_MIN_BYTES} bytes")
+    return secret
+
+
 def _credential(tenant_id: str, secret: str, source: str) -> ServiceCredential:
     if not _TENANT.fullmatch(tenant_id) or not _TENANT_INT_MIN <= int(tenant_id) <= _TENANT_INT_MAX:
         raise ValueError(f"{source} tenant id must be a 32-bit integer")
@@ -99,7 +136,7 @@ def _credential(tenant_id: str, secret: str, source: str) -> ServiceCredential:
     return ServiceCredential(value, secret)
 
 
-def _credentials(env: Mapping[str, str]) -> tuple[ServiceCredential, ...]:
+def _credentials(env: Mapping[str, str], *, secret_set: bool = False) -> tuple[ServiceCredential, ...]:
     found: list[ServiceCredential] = []
     raw_keys = (env.get("KEEL_API_KEYS") or "").strip()
     if raw_keys:
@@ -117,8 +154,8 @@ def _credentials(env: Mapping[str, str]) -> tuple[ServiceCredential, ...]:
         raise ValueError("KEEL_API_KEY is required")
     if api_key:
         found.append(_credential(tenant, api_key, "KEEL_API_KEY"))
-    if not found:
-        raise ValueError("KEEL_API_KEY or KEEL_API_KEYS is required")
+    if not found and not secret_set:
+        raise ValueError("KEEL_SERVICE_SECRET or KEEL_API_KEYS (or KEEL_API_KEY) is required")
     secrets = [item.secret for item in found]
     if len(set(secrets)) != len(secrets):
         raise ValueError("A service key is bound to more than one tenant")
@@ -146,6 +183,7 @@ def _backfill(env: Mapping[str, str]) -> dict[str, int]:
 class Settings:
     credentials: tuple[ServiceCredential, ...] = field(repr=False)
     database_url: str
+    service_secret: str | None = field(default=None, repr=False)
     workers: int = 4
     max_running: int = 10
     lease_seconds: float = 30.0
@@ -199,7 +237,8 @@ class Settings:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if env is None else env
-        credentials = _credentials(env)
+        service_secret = _service_secret(env)
+        credentials = _credentials(env, secret_set=service_secret is not None)
         backfill = _backfill(env)
         url = (env.get("KEEL_DATABASE_URL") or "").strip()
         if not url.startswith(_DB_SCHEMES):
@@ -220,6 +259,7 @@ class Settings:
             raise ValueError("KEEL_OPENAI_BASE_URL must start with http:// or https://")
         return cls(
             credentials=credentials,
+            service_secret=service_secret,
             database_url=url,
             workers=_positive_int(env, "KEEL_WORKERS", 4),
             max_running=_positive_int(env, "KEEL_MAX_RUNNING", 10),

@@ -211,6 +211,10 @@ class SqlStore(FeedbackStoreMixin, HistoryStoreMixin, MemoryStoreMixin, LearnedS
                 continue
             raise SandboxBusy("the profile has unresolved sandbox lifecycle work")
 
+    async def ensure_tenant(self, tenant_id: int) -> None:
+        """Record a tenant authenticated by a derived service key; an existing one is left as it is."""
+        await self.db.execute("INSERT INTO tenants (id) VALUES (?) ON CONFLICT (id) DO NOTHING", tenant_id)
+
     # sessions
 
     async def ensure_session(self, profile_id: str, session_id: str, kind: str | None = None) -> Session:

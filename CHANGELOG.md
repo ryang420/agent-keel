@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Derived per-tenant service keys: with `KEEL_SERVICE_SECRET` (at least 32 bytes) set, a bearer key
+  `kk1.<tenant>.<mac>` authenticates as that tenant, with `mac` the unpadded base64url HMAC-SHA256 of `kk1\0<tenant>`
+  under the secret. The tenant is created on first use. Static `KEEL_API_KEYS` keep working, and either form alone
+  is enough to start the service.
+
 ## [0.5.1] - 2026-11-19
 
 A patch on 0.5.0 with no schema change.

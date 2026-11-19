@@ -606,3 +606,44 @@ async def test_invalid_kinds_and_cursors_are_refused(service):
         listed = await client.get("/v1/profiles/p1/sessions", params=params)
         assert listed.status_code == 400 and listed.json()["error"]["code"] == "invalid_input", params
 
+
+
+async def _derived_app(store, credentials=()):
+    from keel.config import derive_service_key
+    registry = ProviderRegistry()
+    registry.register(FakeProvider())
+    bus = InMemoryEventBus()
+    keel = Keel(store=store, bus=bus, providers=registry, executor=RunExecutor(store, bus, registry),
+                credentials=credentials, max_running=2, service_secret="k" * 32)
+    app = create_app(keel)
+
+    def client(key):
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://keel",
+                                 headers={"Authorization": f"Bearer {key}"})
+    return client, derive_service_key
+
+
+async def test_derived_key_creates_tenant_and_profile(store):
+    client, derive = await _derived_app(store)
+    async with client(derive("k" * 32, 9)) as http:
+        response = await http.put("/v1/profiles/p1", json=PROFILE)
+        assert response.status_code in (200, 201), response.text
+    assert await store.db.fetchrow("SELECT id FROM tenants WHERE id = ?", 9) is not None
+
+
+async def test_static_key_still_works_beside_secret(store):
+    client, derive = await _derived_app(store, (ServiceCredential(1, "test-key"),))
+    for key in ("test-key", derive("k" * 32, 2)):
+        async with client(key) as http:
+            assert (await http.get("/v1/profiles/p1/sessions")).status_code == 404
+    async with client("wrong") as http:
+        assert (await http.get("/v1/profiles/p1/sessions")).status_code == 401
+
+
+async def test_derived_key_for_other_tenant_cannot_see_profile(store):
+    client, derive = await _derived_app(store)
+    async with client(derive("k" * 32, 9)) as http:
+        assert (await http.put("/v1/profiles/p1", json=PROFILE)).status_code in (200, 201)
+    async with client(derive("k" * 32, 10)) as http:
+        response = await http.get("/v1/profiles/p1/sessions")
+        assert response.status_code == 404
