@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-19
+
+A patch on 0.5.0 with no schema change.
+
 ### Fixed
 - Sandbox recovery and idle passes no longer row-lock a profile's finished and retired exec records. Those records
   can never change, yet each lock was a database write, repeated every maintenance minute for every exec kept within
@@ -328,7 +332,8 @@ daemon needs PostgreSQL and the stopped-service cutover in the operations guide.
 - Bedrock Mantle provider (OpenAI Responses API, SigV4 signing).
 - Profiles, runs with replayable SSE events, and sessions with messages, titles and deletion.
 
-[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ryang420/agent-keel/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ryang420/agent-keel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ryang420/agent-keel/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ryang420/agent-keel/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/ryang420/agent-keel/compare/v0.3.1...v0.3.2
