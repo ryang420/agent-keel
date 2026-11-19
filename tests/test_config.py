@@ -1,6 +1,6 @@
 import pytest
 
-from keel.config import ServiceCredential, Settings
+from keel.config import ServiceCredential, Settings, derive_service_key, derived_tenant_id
 
 BASE = {"KEEL_API_KEY": "secret", "KEEL_API_KEY_TENANT": "1",
         "KEEL_DATABASE_URL": "postgresql://keel@localhost/keel_test"}
@@ -112,7 +112,7 @@ def test_a_key_without_a_tenant_is_refused_and_two_keys_can_share_a_tenant(tmp_p
         Settings.from_env({**BASE, "KEEL_API_KEY_TENANT": ""})
     with pytest.raises(ValueError, match="KEEL_API_KEY"):
         Settings.from_env({"KEEL_API_KEY_TENANT": "1", "KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"]})
-    with pytest.raises(ValueError, match="KEEL_API_KEY or KEEL_API_KEYS"):
+    with pytest.raises(ValueError, match="KEEL_SERVICE_SECRET or KEEL_API_KEYS"):
         Settings.from_env({"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"]})
     path = tmp_path / "tenants.json"
     path.write_text('{"p1": 1, "p2": 2}')
@@ -228,3 +228,34 @@ def test_dream_settings_default_to_the_spec_and_parse_from_the_environment():
     assert (tuned.dream_iterations, tuned.dream_daily_attempts, tuned.dream_debounce_seconds) == (6, 2, 60.0)
     with pytest.raises(ValueError, match="KEEL_DREAM_ITERATIONS"):
         Settings.from_env({**BASE, "KEEL_DREAM_ITERATIONS": "0"})
+
+
+def test_derive_service_key_vector():
+    assert derive_service_key("k" * 32, 7) == "kk1.7.DbOGjffGbAsj7PPC8v-3BMOOb0qjZwmnTwkvFgtxgd0"
+
+
+def test_derived_tenant_id_accepts_only_its_own_mac():
+    secret = "k" * 32
+    key = derive_service_key(secret, 7)
+    assert derived_tenant_id(secret, f"Bearer {key}") == 7
+    assert derived_tenant_id(secret, f"Bearer {derive_service_key(secret, -5)}") == -5
+    assert derived_tenant_id(secret, f"Bearer {key[:-1]}{'A' if key[-1] != 'A' else 'B'}") is None
+    prefix, _tenant, mac = key.split(".")
+    assert derived_tenant_id(secret, f"Bearer {prefix}.8.{mac}") is None
+    assert derived_tenant_id(secret, key) is None
+    assert derived_tenant_id(None, f"Bearer {key}") is None
+    assert derived_tenant_id("j" * 32, f"Bearer {key}") is None
+    for tenant in ("007", "-0", "2147483648"):
+        assert derived_tenant_id(secret, f"Bearer {prefix}.{tenant}.{mac}") is None
+
+
+def test_settings_need_a_secret_or_static_keys():
+    url = {"KEEL_DATABASE_URL": BASE["KEEL_DATABASE_URL"]}
+    only_secret = Settings.from_env({**url, "KEEL_SERVICE_SECRET": "s" * 32})
+    assert only_secret.service_secret == "s" * 32 and only_secret.credentials == ()
+    assert Settings.from_env(BASE).service_secret is None
+    with pytest.raises(ValueError, match="KEEL_SERVICE_SECRET or KEEL_API_KEYS"):
+        Settings.from_env(url)
+    with pytest.raises(ValueError, match="KEEL_SERVICE_SECRET") as excinfo:
+        Settings.from_env({**url, "KEEL_SERVICE_SECRET": "s" * 31})
+    assert "s" * 31 not in str(excinfo.value)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import re
@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from keel.commands import CommandError, parse_command
-from keel.config import tenant_id_for
+from keel.config import derived_tenant_id, tenant_id_for
 from keel.deletion import (
     ProfileDeletionBusyError, ProfileDeletionService, ProfileDeletionUnavailableError,
 )
@@ -59,6 +59,8 @@ class Keel:
     background: object = None
     coordinator: object = None
     command_timeout_max_s: int = 3600
+    service_secret: str | None = field(default=None, repr=False)
+    provisioned_tenants: set = field(default_factory=set, repr=False)
 
 
 class ApiError(Exception):
@@ -301,7 +303,14 @@ def create_app(keel: Keel | None = None, lifespan=None) -> FastAPI:
         if getattr(request.app.state, "keel", None) is None:
             return _error(503, "unavailable", "The service is not ready.")
         if request.url.path != "/healthz":
-            tenant_id = tenant_id_for(tuple(k(request).credentials), request.headers.get("authorization", ""))
+            keel = k(request)
+            header = request.headers.get("authorization", "")
+            tenant_id = tenant_id_for(tuple(keel.credentials), header)
+            if tenant_id is None:
+                tenant_id = derived_tenant_id(keel.service_secret, header)
+                if tenant_id is not None and tenant_id not in keel.provisioned_tenants:
+                    await keel.store.ensure_tenant(tenant_id)
+                    keel.provisioned_tenants.add(tenant_id)
             if tenant_id is None:
                 return _error(401, "unauthorized", "A valid service key is required.")
             request.state.tenant_id = tenant_id
